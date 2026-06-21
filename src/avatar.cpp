@@ -14,3 +14,17 @@ float eye_openness(uint32_t elapsed_ms) {
     }
     return (phase - half) / half;     // 閉 → 開
 }
+
+float mouth_openness(uint32_t elapsed_ms, bool speaking) {
+    if (!speaking) {
+        return 0.0f;
+    }
+
+    // 喋っている間は三角波： 前半で 0.0→1.0、後半で 1.0→0.0。
+    const uint32_t phase = elapsed_ms % kMouthCycleMs;
+    const float half = kMouthCycleMs / 2.0f;
+    if (phase <= half) {
+        return phase / half;          // 閉 → 開
+    }
+    return 1.0f - (phase - half) / half;  // 開 → 閉
+}

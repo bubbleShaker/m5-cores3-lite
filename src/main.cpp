@@ -17,6 +17,16 @@ constexpr int kEyeRx       = kFaceCx + 40;
 constexpr int kEyeHalfW    = 16;  // 横はまばたきで変えない
 constexpr int kEyeHalfHMax = 22;  // 開ききった時の半分の高さ
 
+// 口（中心・最大の半幅・半高）。口パクで高さが変わる。
+constexpr int kMouthCx       = kFaceCx;
+constexpr int kMouthCy       = kFaceCy + 40;
+constexpr int kMouthHalfW    = 30;
+constexpr int kMouthHalfHMax = 14;  // 開ききった時の半分の高さ
+
+// 口パクのデモ用スケジュール（実トリガーは後続の対話レイヤーで差し替え予定）。
+constexpr uint32_t kSpeakPeriodMs = 4000;  // 4秒周期で
+constexpr uint32_t kSpeakOnMs     = 2000;  // 先頭2秒だけ喋る
+
 // 色（M5GFX の RGB565）。
 constexpr uint16_t kColBg    = TFT_BLACK;
 constexpr uint16_t kColFace  = 0xFE19;  // 肌色っぽいピンク
@@ -38,12 +48,27 @@ static void drawEye(int cx, float openness) {
     }
 }
 
-// 変化しない部分（顔の輪郭・口）を一度だけ描く。
+// 口を描く。openness(0.0..1.0) に応じて口の高さを変える。
+// まず口の最大領域を顔色でクリアしてから、開いている分だけ口を描く（ちらつき抑制）。
+static void drawMouth(float openness) {
+    M5.Display.fillRect(kMouthCx - kMouthHalfW, kMouthCy - kMouthHalfHMax,
+                        kMouthHalfW * 2, kMouthHalfHMax * 2, kColFace);
+
+    const int halfH = static_cast<int>(kMouthHalfHMax * openness);
+    if (halfH <= 1) {
+        // ほぼ閉じている → 横一本の線
+        M5.Display.fillRect(kMouthCx - kMouthHalfW, kMouthCy - 1,
+                            kMouthHalfW * 2, 2, kColMouth);
+    } else {
+        // 開いている → 楕円で口の中を表現
+        M5.Display.fillEllipse(kMouthCx, kMouthCy, kMouthHalfW, halfH, kColMouth);
+    }
+}
+
+// 変化しない部分（顔の輪郭）を一度だけ描く。
 static void drawStaticFace() {
     M5.Display.fillScreen(kColBg);
     M5.Display.fillCircle(kFaceCx, kFaceCy, kFaceR, kColFace);
-    // 口：横長の角丸矩形
-    M5.Display.fillRoundRect(kFaceCx - 30, kFaceCy + 35, 60, 10, 5, kColMouth);
 }
 
 void setup() {
@@ -55,9 +80,17 @@ void setup() {
 
 void loop() {
     M5.update();
-    // テスト済みの純粋関数で開き具合を求め、目だけ再描画する。
-    const float openness = eye_openness(millis());
-    drawEye(kEyeLx, openness);
-    drawEye(kEyeRx, openness);
+    const uint32_t now = millis();
+
+    // まばたき：テスト済みの純粋関数で開き具合を求め、目だけ再描画。
+    const float eye = eye_openness(now);
+    drawEye(kEyeLx, eye);
+    drawEye(kEyeRx, eye);
+
+    // 口パク：デモ用スケジュールで speaking を決め、口を再描画。
+    // speaking の実トリガー（マイク/対話）は後続 Issue で差し替える。
+    const bool speaking = (now % kSpeakPeriodMs) < kSpeakOnMs;
+    drawMouth(mouth_openness(now, speaking));
+
     delay(33);  // 約30fps
 }
