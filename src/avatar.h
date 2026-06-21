@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 
 // まばたきアニメーションのタイミング定数（ハード非依存・テストからも参照する）。
 //   kBlinkIntervalMs … まばたき1周期の長さ（この周期の先頭でだけ瞬きする）
@@ -20,3 +21,19 @@ float eye_openness(uint32_t elapsed_ms);
 //   speaking == true  → kMouthCycleMs 周期の「閉→開→閉」三角波で開閉
 // speaking を引数にすることで、後段の対話レイヤーが応答中だけ true を渡せる。
 float mouth_openness(uint32_t elapsed_ms, bool speaking);
+
+// アバターが取りうる表情の語彙（単一の真実）。API・描画はこの enum に依存する。
+enum class Expression { Neutral, Happy, Thinking, Sad, Surprised };
+
+// 一時的な表情をこの時間だけ保ち、過ぎたら Neutral に戻す。
+constexpr uint32_t kExpressionHoldMs = 4000;
+
+// API の "expression" 文字列を Expression に変換する純粋関数。
+// 未知の文字列は Neutral にフォールバックする（堅牢性）。
+Expression parse_expression(const std::string& name);
+
+// 要求された表情を、要求からの経過時間に応じて返す純粋関数（自動復帰の状態機械）。
+//   requested == Neutral        → 常に Neutral
+//   elapsed < kExpressionHoldMs → requested を保持
+//   elapsed >= kExpressionHoldMs → Neutral に戻る
+Expression active_expression(Expression requested, uint32_t elapsed_since_request_ms);
