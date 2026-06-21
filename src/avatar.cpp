@@ -28,3 +28,21 @@ float mouth_openness(uint32_t elapsed_ms, bool speaking) {
     }
     return 1.0f - (phase - half) / half;  // 開 → 閉
 }
+
+Expression parse_expression(const std::string& name) {
+    if (name == "happy")     return Expression::Happy;
+    if (name == "thinking")  return Expression::Thinking;
+    if (name == "sad")       return Expression::Sad;
+    if (name == "surprised") return Expression::Surprised;
+    return Expression::Neutral;  // "neutral" と未知の値はここに集約
+}
+
+Expression active_expression(Expression requested, uint32_t elapsed_since_request_ms) {
+    if (requested == Expression::Neutral) {
+        return Expression::Neutral;
+    }
+    if (elapsed_since_request_ms < kExpressionHoldMs) {
+        return requested;
+    }
+    return Expression::Neutral;  // ホールド時間を過ぎたら自然な顔に戻す
+}

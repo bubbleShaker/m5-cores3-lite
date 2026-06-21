@@ -1,4 +1,5 @@
 #include <unity.h>
+#include <string>
 #include "avatar.h"
 
 void setUp(void) {}
@@ -47,6 +48,41 @@ void test_mouth_openness_is_periodic() {
                              mouth_openness(q + kMouthCycleMs, true));
 }
 
+// 既知の表情文字列は対応する enum に変換される
+void test_parse_known_expressions() {
+    TEST_ASSERT_TRUE(parse_expression("happy") == Expression::Happy);
+    TEST_ASSERT_TRUE(parse_expression("thinking") == Expression::Thinking);
+    TEST_ASSERT_TRUE(parse_expression("sad") == Expression::Sad);
+    TEST_ASSERT_TRUE(parse_expression("surprised") == Expression::Surprised);
+    TEST_ASSERT_TRUE(parse_expression("neutral") == Expression::Neutral);
+}
+
+// 未知の文字列は Neutral にフォールバックする
+void test_parse_unknown_falls_back_to_neutral() {
+    TEST_ASSERT_TRUE(parse_expression("???") == Expression::Neutral);
+    TEST_ASSERT_TRUE(parse_expression("") == Expression::Neutral);
+}
+
+// ホールド時間内は要求された表情を保つ
+void test_active_expression_holds_within_window() {
+    TEST_ASSERT_TRUE(active_expression(Expression::Happy, 0) == Expression::Happy);
+    TEST_ASSERT_TRUE(active_expression(Expression::Happy, kExpressionHoldMs - 1)
+                     == Expression::Happy);
+}
+
+// ホールド時間を過ぎたら Neutral に戻る
+void test_active_expression_returns_to_neutral_after_hold() {
+    TEST_ASSERT_TRUE(active_expression(Expression::Happy, kExpressionHoldMs)
+                     == Expression::Neutral);
+}
+
+// Neutral 要求は経過時間によらず常に Neutral
+void test_active_expression_neutral_stays_neutral() {
+    TEST_ASSERT_TRUE(active_expression(Expression::Neutral, 0) == Expression::Neutral);
+    TEST_ASSERT_TRUE(active_expression(Expression::Neutral, kExpressionHoldMs + 10)
+                     == Expression::Neutral);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_eye_open_at_cycle_start);
@@ -56,5 +92,10 @@ int main(int, char**) {
     RUN_TEST(test_mouth_closed_when_not_speaking);
     RUN_TEST(test_mouth_opens_while_speaking);
     RUN_TEST(test_mouth_openness_is_periodic);
+    RUN_TEST(test_parse_known_expressions);
+    RUN_TEST(test_parse_unknown_falls_back_to_neutral);
+    RUN_TEST(test_active_expression_holds_within_window);
+    RUN_TEST(test_active_expression_returns_to_neutral_after_hold);
+    RUN_TEST(test_active_expression_neutral_stays_neutral);
     return UNITY_END();
 }
