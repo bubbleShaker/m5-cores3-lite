@@ -300,12 +300,19 @@ static void drawSheepEye(int ex, int ey, float openness) {
     }
 }
 
-// 全身ドット羊を1フレーム描く。bob で上下に揺れ、目はまばたきする。
+// 「メェ」をトーン合成で鳴らす（下降2音でそれっぽさを出す。WAVアセット不要）。
+static void playBleat() {
+    M5.Speaker.setVolume(180);
+    M5.Speaker.tone(760, 110);  // メ
+    M5.Speaker.tone(560, 190);  // ェ（少し下げる）
+}
+
+// 全身ドット羊を1フレーム描く。bob で上下に、shakeX で左右（タップ反応）に揺れ、目はまばたきする。
 // 重なり描画なので、固定枠を背景色でクリアしてから毎フレーム全体を描き直す（最小実装）。
-static void drawSheep(uint32_t now) {
+static void drawSheep(uint32_t now, int shakeX) {
     const int bob = sheep_bob_offset(now);
-    const int cx  = kSheepCx;
-    const int cy  = kSheepCy + bob;  // 揺れで全体を上下させる
+    const int cx  = kSheepCx + shakeX;       // タップ反応で左右に揺らす
+    const int cy  = kSheepCy + bob;          // bob で全体を上下させる
 
     M5.Display.fillRect(kSheepClipX, kSheepClipY, kSheepClipW, kSheepClipH, kColBg);
 
@@ -363,9 +370,23 @@ void loop() {
     M5.update();
     const uint32_t now = millis();
 
-    // 羊シーン：まばたき＋揺れだけの自己完結ループ（フェイス用の対話処理は走らせない）。
+    // 羊シーン：まばたき＋揺れ＋タップ反応の自己完結ループ（フェイス用の対話処理は走らせない）。
     if (kScene == Scene::Sheep) {
-        drawSheep(now);
+        // タッチの立ち上がりエッジ（押した瞬間だけ true）で反応を開始する。
+        static bool sheepWasTouched = false;
+        static bool sheepTapped     = false;  // 一度でもタップされたか（起動直後の誤発火を防ぐ）
+        static uint32_t sheepTapMs  = 0;       // 直近タップの時刻（横揺れの起点）
+        const bool touched = (M5.Touch.getCount() > 0);
+        if (touched && !sheepWasTouched) {
+            sheepTapMs  = now;
+            sheepTapped = true;
+            playBleat();  // タップで「メェ」と鳴く
+        }
+        sheepWasTouched = touched;
+
+        // タップ前は揺らさない。タップ後は経過時間から横揺れを求める（反応が切れたら 0 に戻る）。
+        const int shakeX = sheepTapped ? sheep_shake_offset(now - sheepTapMs) : 0;
+        drawSheep(now, shakeX);
         delay(33);  // 約30fps
         return;
     }

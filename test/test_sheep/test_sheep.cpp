@@ -36,6 +36,34 @@ void test_bob_stays_within_amplitude() {
     }
 }
 
+// タップ直後（t=0）は中心から始まる（急に飛ばない）
+void test_shake_starts_at_center() {
+    TEST_ASSERT_EQUAL_INT(0, sheep_shake_offset(0));
+}
+
+// 反応時間を過ぎたら揺れは止まる（0 に戻る）
+void test_shake_stops_after_duration() {
+    TEST_ASSERT_EQUAL_INT(0, sheep_shake_offset(kShakeDurationMs));
+    TEST_ASSERT_EQUAL_INT(0, sheep_shake_offset(kShakeDurationMs + 100));
+}
+
+// 反応中は常に振幅の範囲内（クリア枠をはみ出さない保証）
+void test_shake_stays_within_amplitude() {
+    for (uint32_t t = 0; t < kShakeDurationMs; t += 3) {
+        const int v = sheep_shake_offset(t);
+        TEST_ASSERT_TRUE(v >= -kShakeAmplitudePx && v <= kShakeAmplitudePx);
+    }
+}
+
+// 反応中のどこかで実際に揺れる（非ゼロになる瞬間がある＝動いている証拠）
+void test_shake_is_nonzero_somewhere() {
+    bool moved = false;
+    for (uint32_t t = 0; t < kShakeDurationMs; t += 3) {
+        if (sheep_shake_offset(t) != 0) { moved = true; break; }
+    }
+    TEST_ASSERT_TRUE(moved);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_bob_at_cycle_start_is_bottom);
@@ -43,5 +71,9 @@ int main(int, char**) {
     RUN_TEST(test_bob_passes_center_at_quarters);
     RUN_TEST(test_bob_is_periodic);
     RUN_TEST(test_bob_stays_within_amplitude);
+    RUN_TEST(test_shake_starts_at_center);
+    RUN_TEST(test_shake_stops_after_duration);
+    RUN_TEST(test_shake_stays_within_amplitude);
+    RUN_TEST(test_shake_is_nonzero_somewhere);
     return UNITY_END();
 }
