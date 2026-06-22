@@ -52,6 +52,9 @@ bool g_hasReply = false;
 std::string g_reply;                              // 画面下部に出す返答文
 Expression g_requestedExpr = Expression::Neutral;  // 中継サーバが要求した表情
 uint32_t g_exprRequestMs = 0;                      // 表情を要求された時刻（自動復帰の起点）
+// 再問い合わせ直後の「強制再描画」フラグ。同じ表情が返った時でも返答文を必ず更新するために使う
+// （描画は通常「表情が変わった時だけ」最適化されているので、それを1フレームだけ上書きする）。
+bool g_replyDirty = false;
 
 // 色（M5GFX の RGB565）。
 constexpr uint16_t kColBg    = TFT_BLACK;
@@ -249,6 +252,7 @@ static void fetchGreeting() {
     http.end();
     g_exprRequestMs = millis();
     g_hasReply = true;
+    g_replyDirty = true;  // 新しい返答が来たので、次フレームでダイアログと表情を必ず描き直す
 }
 
 // 実際の WiFi 接続状態を、表示用の WifiState に変換する（実機依存部）。
@@ -287,8 +291,16 @@ void loop() {
         lastWifi = wifi;
     }
 
-    // 起動後、Wi-Fi 接続できたら一度だけ中継サーバへ挨拶を問い合わせる（最小トリガ）。
-    if (wifi == WifiState::Connected && !g_hasReply) {
+    // 画面タッチの「立ち上がりエッジ」を検出する（押した瞬間だけ true）。
+    // M5.Touch.getCount() は今フレームで触れている点の数。前フレーム0→今1 の瞬間だけ拾うことで、
+    // 押しっぱなし・連打でも 1タッチ＝1リクエスト に抑える（簡易デバウンス）。
+    static bool wasTouched = false;
+    const bool touched = (M5.Touch.getCount() > 0);
+    const bool touchEdge = touched && !wasTouched;
+    wasTouched = touched;
+
+    // Wi-Fi 接続後、初回（!g_hasReply）またはタッチのたびに中継サーバへ挨拶を問い合わせる。
+    if (wifi == WifiState::Connected && (!g_hasReply || touchEdge)) {
         fetchGreeting();  // ブロッキング HTTP（この最小構成では許容）
     }
 
@@ -297,25 +309,27 @@ void loop() {
         active_expression(g_requestedExpr, now - g_exprRequestMs);
     const FaceStyle fs = face_style(activeExpr);
 
-    // 眉：アニメしないので、表情が変わった時（と初回）だけ描き直す。
+    // 眉：アニメしないので、表情が変わった時（と初回、そして再問い合わせ直後）だけ描き直す。
     static bool faceInit = false;
     static Expression lastFaceExpr = Expression::Neutral;
-    if (!faceInit || activeExpr != lastFaceExpr) {
+    if (!faceInit || activeExpr != lastFaceExpr || g_replyDirty) {
         drawBrows(fs.brow);
         faceInit = true;
         lastFaceExpr = activeExpr;
     }
 
-    // 対話描画：到着時に一度、その後は表情の自動復帰(active_expression)で変化した時だけ描き直す。
+    // 対話描画：到着時に一度、その後は表情の自動復帰(active_expression)で変化した時、
+    // および再問い合わせ直後(g_replyDirty)に描き直す（同じ表情が返っても返答文を更新するため）。
     if (g_hasReply) {
         static bool dialogDrawn = false;
         static Expression lastDlgExpr = Expression::Neutral;
-        if (!dialogDrawn || activeExpr != lastDlgExpr) {
+        if (!dialogDrawn || activeExpr != lastDlgExpr || g_replyDirty) {
             drawDialog(g_reply, activeExpr);
             dialogDrawn = true;
             lastDlgExpr = activeExpr;
         }
     }
+    g_replyDirty = false;  // 強制再描画は1フレームで完了。以降は通常の差分描画に戻す
 
     // まばたき：テスト済みの純粋関数で開き具合を求め、目スタイルの寸法で再描画。
     int eyeMaxH, eyeMaxW;
