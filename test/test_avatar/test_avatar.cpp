@@ -83,6 +83,38 @@ void test_active_expression_neutral_stays_neutral() {
                      == Expression::Neutral);
 }
 
+// 各表情が想定の見た目スタイルへ写像される
+void test_face_style_neutral() {
+    FaceStyle s = face_style(Expression::Neutral);
+    TEST_ASSERT_TRUE(s.eye == EyeStyle::Normal);
+    TEST_ASSERT_TRUE(s.brow == BrowShape::Flat);
+    TEST_ASSERT_TRUE(s.mouth == MouthShape::Line);
+}
+
+void test_face_style_happy() {
+    FaceStyle s = face_style(Expression::Happy);
+    TEST_ASSERT_TRUE(s.eye == EyeStyle::Squint);
+    TEST_ASSERT_TRUE(s.brow == BrowShape::Raised);
+    TEST_ASSERT_TRUE(s.mouth == MouthShape::Smile);
+}
+
+void test_face_style_sad() {
+    FaceStyle s = face_style(Expression::Sad);
+    TEST_ASSERT_TRUE(s.brow == BrowShape::Worried);
+    TEST_ASSERT_TRUE(s.mouth == MouthShape::Frown);
+}
+
+void test_face_style_surprised() {
+    FaceStyle s = face_style(Expression::Surprised);
+    TEST_ASSERT_TRUE(s.eye == EyeStyle::Wide);
+    TEST_ASSERT_TRUE(s.mouth == MouthShape::Round);
+}
+
+void test_face_style_thinking() {
+    FaceStyle s = face_style(Expression::Thinking);
+    TEST_ASSERT_TRUE(s.brow == BrowShape::Quizzical);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_eye_open_at_cycle_start);
@@ -97,5 +129,10 @@ int main(int, char**) {
     RUN_TEST(test_active_expression_holds_within_window);
     RUN_TEST(test_active_expression_returns_to_neutral_after_hold);
     RUN_TEST(test_active_expression_neutral_stays_neutral);
+    RUN_TEST(test_face_style_neutral);
+    RUN_TEST(test_face_style_happy);
+    RUN_TEST(test_face_style_sad);
+    RUN_TEST(test_face_style_surprised);
+    RUN_TEST(test_face_style_thinking);
     return UNITY_END();
 }

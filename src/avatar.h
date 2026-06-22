@@ -37,3 +37,21 @@ Expression parse_expression(const std::string& name);
 //   elapsed < kExpressionHoldMs → requested を保持
 //   elapsed >= kExpressionHoldMs → Neutral に戻る
 Expression active_expression(Expression requested, uint32_t elapsed_since_request_ms);
+
+// 表情の「見た目スタイル」（パラメトリック・ドット絵）。描画はこの値に従う。
+//   EyeStyle  … 目の形（通常 / 見開き / 細め）
+//   BrowShape … 眉の形（水平 / 上げ / ハの字 / 片眉上げ）
+//   MouthShape… 口の形（横線 / 笑顔 / 口角下 / 丸）
+enum class EyeStyle   { Normal, Wide, Squint };
+enum class BrowShape  { Flat, Raised, Worried, Quizzical };
+enum class MouthShape { Line, Smile, Frown, Round };
+
+struct FaceStyle {
+    EyeStyle   eye;
+    BrowShape  brow;
+    MouthShape mouth;
+};
+
+// Expression を見た目スタイルに変換する純粋関数（単一の真実）。
+// 「どんな形にするか」だけ決め、「何ピクセルで描くか」は main.cpp の責務に分離する。
+FaceStyle face_style(Expression e);

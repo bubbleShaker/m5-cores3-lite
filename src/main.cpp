@@ -21,7 +21,17 @@ constexpr int kEyeY        = kFaceCy - 20;
 constexpr int kEyeLx       = kFaceCx - 40;
 constexpr int kEyeRx       = kFaceCx + 40;
 constexpr int kEyeHalfW    = 16;  // 横はまばたきで変えない
-constexpr int kEyeHalfHMax = 22;  // 開ききった時の半分の高さ
+constexpr int kEyeHalfHMax = 22;  // 開ききった時の半分の高さ（Normal）
+// 目領域のクリア範囲（表情で目の大きさが変わっても前フレームを確実に消すため、最大値で固定）。
+constexpr int kEyeClearHalfW = 20;
+constexpr int kEyeClearHalfH = 26;
+
+// 眉（目の上に描く線）。表情で形が変わる。アニメしないので表情変化時だけ描く。
+constexpr int kBrowBaseY = kEyeY - 40;  // 眉の基準Y
+constexpr int kBrowHalfW = 18;          // 眉の半幅
+constexpr int kBrowRaise = 7;           // 「上げ眉」の持ち上げ量
+constexpr int kBrowSlant = 4;           // 「ハの字」等の傾き量
+constexpr int kBrowThick = 3;           // 眉の太さ(px)
 
 // 口（中心・最大の半幅・半高）。口パクで高さが変わる。
 constexpr int kMouthCx       = kFaceCx;
@@ -49,34 +59,79 @@ constexpr uint16_t kColFace  = 0xFE19;  // 肌色っぽいピンク
 constexpr uint16_t kColEye   = TFT_BLACK;
 constexpr uint16_t kColMouth = 0x8000;  // 暗い赤
 
-// 目を1つ描く。openness(0.0..1.0) に応じて目の高さを変える。
-// まず目の最大領域を顔色で塗りつぶしてから、開いている分だけ黒目を描く（ちらつき抑制）。
-static void drawEye(int cx, float openness) {
-    M5.Display.fillRect(cx - kEyeHalfW, kEyeY - kEyeHalfHMax,
-                        kEyeHalfW * 2, kEyeHalfHMax * 2, kColFace);
-
-    const int halfH = static_cast<int>(kEyeHalfHMax * openness);
-    if (halfH <= 1) {
-        // ほぼ閉じている → 横一本の線で「とじ目」を表現
-        M5.Display.fillRect(cx - kEyeHalfW, kEyeY - 1, kEyeHalfW * 2, 2, kColEye);
-    } else {
-        M5.Display.fillRect(cx - kEyeHalfW, kEyeY - halfH, kEyeHalfW * 2, halfH * 2, kColEye);
+// 目スタイルから「最大半高・半幅」を決める（描画の寸法は main の責務）。
+//   Normal … 既定 / Wide … 見開き(大きく) / Squint … 細め(低く)
+static void eyeMetrics(EyeStyle style, int& maxHalfH, int& maxHalfW) {
+    switch (style) {
+        case EyeStyle::Wide:   maxHalfH = 25; maxHalfW = 18; break;
+        case EyeStyle::Squint: maxHalfH = 10; maxHalfW = 16; break;
+        case EyeStyle::Normal:
+        default:               maxHalfH = kEyeHalfHMax; maxHalfW = kEyeHalfW; break;
     }
 }
 
-// 口を描く。openness(0.0..1.0) に応じて口の高さを変える。
-// まず口の最大領域を顔色でクリアしてから、開いている分だけ口を描く（ちらつき抑制）。
-static void drawMouth(float openness) {
+// 目を1つ描く。openness(0.0..1.0) と目スタイルの最大寸法から高さを決める。
+// クリアは固定の最大領域(kEyeClearHalf*)で行い、表情が変わっても前フレームを消し残さない。
+static void drawEye(int cx, float openness, int maxHalfH, int maxHalfW) {
+    M5.Display.fillRect(cx - kEyeClearHalfW, kEyeY - kEyeClearHalfH,
+                        kEyeClearHalfW * 2, kEyeClearHalfH * 2, kColFace);
+
+    const int halfH = static_cast<int>(maxHalfH * openness);
+    if (halfH <= 1) {
+        // ほぼ閉じている → 横一本の線で「とじ目」を表現
+        M5.Display.fillRect(cx - maxHalfW, kEyeY - 1, maxHalfW * 2, 2, kColEye);
+    } else {
+        M5.Display.fillRect(cx - maxHalfW, kEyeY - halfH, maxHalfW * 2, halfH * 2, kColEye);
+    }
+}
+
+// 太い線分を描く（眉・口角に使う。drawLine を縦にずらして太さを出す）。
+static void drawThickLine(int x0, int y0, int x1, int y1, int thick, uint16_t col) {
+    for (int dy = 0; dy < thick; ++dy) {
+        M5.Display.drawLine(x0, y0 + dy, x1, y1 + dy, col);
+    }
+}
+
+// 閉じている口の「形」を表情ごとに描く。
+//   Line  … 横一文字 / Smile … 口角を上げた笑顔(‿) / Frown … 口角を下げた(⌒) / Round … 丸い口(o)
+static void drawRestingMouth(MouthShape shape) {
+    const int xl = kMouthCx - kMouthHalfW;
+    const int xr = kMouthCx + kMouthHalfW;
+    const int y  = kMouthCy;
+    switch (shape) {
+        case MouthShape::Smile:
+            // 中央を下げ両端を上げる V字2本（下に凸＝笑顔）
+            drawThickLine(xl, y - 6, kMouthCx, y + 4, kBrowThick, kColMouth);
+            drawThickLine(kMouthCx, y + 4, xr, y - 6, kBrowThick, kColMouth);
+            break;
+        case MouthShape::Frown:
+            // 中央を上げ両端を下げる（上に凸＝への字）
+            drawThickLine(xl, y + 4, kMouthCx, y - 6, kBrowThick, kColMouth);
+            drawThickLine(kMouthCx, y - 6, xr, y + 4, kBrowThick, kColMouth);
+            break;
+        case MouthShape::Round:
+            // 驚きの丸い口
+            M5.Display.fillCircle(kMouthCx, y, 9, kColMouth);
+            break;
+        case MouthShape::Line:
+        default:
+            M5.Display.fillRect(xl, y - 1, kMouthHalfW * 2, 2, kColMouth);
+            break;
+    }
+}
+
+// 口を描く。喋っている間(openness>0)は楕円で開閉、閉じている時は表情ごとの形を描く。
+// まず口の最大領域を顔色でクリアしてから描く（ちらつき抑制）。
+static void drawMouth(float openness, MouthShape shape) {
     M5.Display.fillRect(kMouthCx - kMouthHalfW, kMouthCy - kMouthHalfHMax,
                         kMouthHalfW * 2, kMouthHalfHMax * 2, kColFace);
 
     const int halfH = static_cast<int>(kMouthHalfHMax * openness);
     if (halfH <= 1) {
-        // ほぼ閉じている → 横一本の線
-        M5.Display.fillRect(kMouthCx - kMouthHalfW, kMouthCy - 1,
-                            kMouthHalfW * 2, 2, kColMouth);
+        // ほぼ閉じている → 表情ごとの口の形
+        drawRestingMouth(shape);
     } else {
-        // 開いている → 楕円で口の中を表現
+        // 開いている（喋り中） → 楕円で口の中を表現
         M5.Display.fillEllipse(kMouthCx, kMouthCy, kMouthHalfW, halfH, kColMouth);
     }
 }
@@ -85,6 +140,43 @@ static void drawMouth(float openness) {
 static void drawStaticFace() {
     M5.Display.fillScreen(kColBg);
     M5.Display.fillCircle(kFaceCx, kFaceCy, kFaceR, kColFace);
+}
+
+// 片方の眉を描く。isLeft で左右を区別し、ハの字/片眉上げの向きを決める。
+static void drawBrow(int cx, BrowShape shape, bool isLeft) {
+    const int xl = cx - kBrowHalfW;
+    const int xr = cx + kBrowHalfW;
+    int yl = kBrowBaseY;  // 外側(左端)のY
+    int yr = kBrowBaseY;  // 内側寄り(右端)のY
+    switch (shape) {
+        case BrowShape::Raised:
+            yl -= kBrowRaise; yr -= kBrowRaise;
+            break;
+        case BrowShape::Worried:
+            // ハの字：内側を上げる。内側は左目なら右端、右目なら左端。
+            if (isLeft) { yl += kBrowSlant; yr -= kBrowSlant; }
+            else        { yl -= kBrowSlant; yr += kBrowSlant; }
+            break;
+        case BrowShape::Quizzical:
+            // 片眉だけ上げる（右目側を上げて「？」感を出す）。
+            if (!isLeft) { yl -= kBrowRaise; yr -= kBrowRaise; }
+            break;
+        case BrowShape::Flat:
+        default:
+            break;  // 水平のまま
+    }
+    drawThickLine(xl, yl, xr, yr, kBrowThick, kColEye);
+}
+
+// 両眉を描く。アニメしないので表情変化時にだけ呼ぶ。
+// 先に眉領域を顔色でクリアしてから描き直す（前の形を消す）。
+static void drawBrows(BrowShape shape) {
+    const int y0 = kBrowBaseY - kBrowRaise - 2;
+    const int h  = kBrowRaise + kBrowSlant + kBrowThick + 6;
+    M5.Display.fillRect(kEyeLx - kBrowHalfW - 2, y0,
+                        (kEyeRx - kEyeLx) + 2 * kBrowHalfW + 4, h, kColFace);
+    drawBrow(kEyeLx, shape, true);
+    drawBrow(kEyeRx, shape, false);
 }
 
 // 画面上部に Wi-Fi 接続状態の文言を描く。状態が変わった時だけ呼ぶ。
@@ -200,28 +292,42 @@ void loop() {
         fetchGreeting();  // ブロッキング HTTP（この最小構成では許容）
     }
 
+    // 現在の表情と、その見た目スタイル（目/眉/口の形）を決める（自動復帰込み）。
+    const Expression activeExpr =
+        active_expression(g_requestedExpr, now - g_exprRequestMs);
+    const FaceStyle fs = face_style(activeExpr);
+
+    // 眉：アニメしないので、表情が変わった時（と初回）だけ描き直す。
+    static bool faceInit = false;
+    static Expression lastFaceExpr = Expression::Neutral;
+    if (!faceInit || activeExpr != lastFaceExpr) {
+        drawBrows(fs.brow);
+        faceInit = true;
+        lastFaceExpr = activeExpr;
+    }
+
     // 対話描画：到着時に一度、その後は表情の自動復帰(active_expression)で変化した時だけ描き直す。
     if (g_hasReply) {
         static bool dialogDrawn = false;
-        static Expression lastExpr = Expression::Neutral;
-        const Expression activeExpr =
-            active_expression(g_requestedExpr, now - g_exprRequestMs);
-        if (!dialogDrawn || activeExpr != lastExpr) {
+        static Expression lastDlgExpr = Expression::Neutral;
+        if (!dialogDrawn || activeExpr != lastDlgExpr) {
             drawDialog(g_reply, activeExpr);
             dialogDrawn = true;
-            lastExpr = activeExpr;
+            lastDlgExpr = activeExpr;
         }
     }
 
-    // まばたき：テスト済みの純粋関数で開き具合を求め、目だけ再描画。
+    // まばたき：テスト済みの純粋関数で開き具合を求め、目スタイルの寸法で再描画。
+    int eyeMaxH, eyeMaxW;
+    eyeMetrics(fs.eye, eyeMaxH, eyeMaxW);
     const float eye = eye_openness(now);
-    drawEye(kEyeLx, eye);
-    drawEye(kEyeRx, eye);
+    drawEye(kEyeLx, eye, eyeMaxH, eyeMaxW);
+    drawEye(kEyeRx, eye, eyeMaxH, eyeMaxW);
 
-    // 口パク：デモ用スケジュールで speaking を決め、口を再描画。
+    // 口パク：デモ用スケジュールで speaking を決め、閉じ口は表情ごとの形で再描画。
     // speaking の実トリガー（マイク/対話）は後続 Issue で差し替える。
     const bool speaking = (now % kSpeakPeriodMs) < kSpeakOnMs;
-    drawMouth(mouth_openness(now, speaking));
+    drawMouth(mouth_openness(now, speaking), fs.mouth);
 
     delay(33);  // 約30fps
 }
