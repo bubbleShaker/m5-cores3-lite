@@ -46,3 +46,19 @@ Expression active_expression(Expression requested, uint32_t elapsed_since_reques
     }
     return Expression::Neutral;  // ホールド時間を過ぎたら自然な顔に戻す
 }
+
+FaceStyle face_style(Expression e) {
+    switch (e) {
+        case Expression::Happy:
+            return {EyeStyle::Squint, BrowShape::Raised,    MouthShape::Smile};
+        case Expression::Thinking:
+            return {EyeStyle::Normal, BrowShape::Quizzical, MouthShape::Line};
+        case Expression::Sad:
+            return {EyeStyle::Normal, BrowShape::Worried,   MouthShape::Frown};
+        case Expression::Surprised:
+            return {EyeStyle::Wide,   BrowShape::Raised,    MouthShape::Round};
+        case Expression::Neutral:
+            return {EyeStyle::Normal, BrowShape::Flat,      MouthShape::Line};
+    }
+    return {EyeStyle::Normal, BrowShape::Flat, MouthShape::Line};  // 安全側
+}
