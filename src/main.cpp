@@ -1,8 +1,11 @@
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <HTTPClient.h>   // 中継サーバへの HTTP POST（ESP32 標準）
+#include <ArduinoJson.h>  // リクエスト body の安全な組み立て
+#include <string>
 #include "avatar.h"
 #include "net.h"
-#include "secrets.h"  // WIFI_SSID / WIFI_PASS（git管理外。secrets.h.example を参照）
+#include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
 constexpr int kScreenW = 320;
@@ -33,6 +36,12 @@ constexpr uint32_t kSpeakOnMs     = 2000;  // 先頭2秒だけ喋る
 // Wi-Fi 接続を諦めるまでの時間（これを超えたら Failed 表示にする）。
 constexpr uint32_t kWifiTimeoutMs = 15000;
 uint32_t g_wifiBeginMs = 0;  // WiFi.begin を呼んだ時刻
+
+// 対話状態：Wi-Fi 接続後に一度だけ中継サーバへ問い合わせる（最小トリガ。実トリガは②-3）。
+bool g_hasReply = false;
+std::string g_reply;                              // 画面下部に出す返答文
+Expression g_requestedExpr = Expression::Neutral;  // 中継サーバが要求した表情
+uint32_t g_exprRequestMs = 0;                      // 表情を要求された時刻（自動復帰の起点）
 
 // 色（M5GFX の RGB565）。
 constexpr uint16_t kColBg    = TFT_BLACK;
@@ -82,10 +91,72 @@ static void drawStaticFace() {
 static void drawWifiStatus(WifiState state) {
     // 上部の帯（顔は y=30 付近から始まるので 0..18 は被らない）をクリアして描き直す
     M5.Display.fillRect(0, 0, kScreenW, 18, kColBg);
+    M5.Display.setFont(&fonts::Font0);  // ASCII 既定フォント（対話描画で和文に切替えるため明示）
     M5.Display.setTextColor(TFT_WHITE, kColBg);
     M5.Display.setTextSize(2);
     M5.Display.setCursor(4, 2);
     M5.Display.print(wifi_status_text(state).c_str());
+}
+
+// Expression を画面表示用の短いラベルに変換する（表情の見える化・暫定。本格描画は① スプライト）。
+static const char* expressionLabel(Expression e) {
+    switch (e) {
+        case Expression::Happy:     return "happy";
+        case Expression::Thinking:  return "thinking";
+        case Expression::Sad:       return "sad";
+        case Expression::Surprised: return "surprised";
+        case Expression::Neutral:   return "neutral";
+    }
+    return "neutral";
+}
+
+// 画面下部に「現在の表情ラベル＋返答文」を描く。
+// 和文は既定フォントで出ないので lgfxJapanGothic_16 に切り替える。
+static void drawDialog(const std::string& reply, Expression expr) {
+    M5.Display.fillRect(0, 190, kScreenW, kScreenH - 190, kColBg);
+
+    // 表情ラベル（ASCII・小）
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_CYAN, kColBg);
+    M5.Display.setCursor(4, 192);
+    M5.Display.printf("[%s]", expressionLabel(expr));
+
+    // 返答文（和文フォント。setTextWrap 既定 true で画面端折り返し）
+    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setCursor(4, 206);
+    M5.Display.print(reply.c_str());
+
+    M5.Display.setFont(&fonts::Font0);  // 既定に戻す（他描画への影響回避）
+}
+
+// 中継サーバ(/chat)へ一度だけ問い合わせ、結果を g_reply / g_requestedExpr に格納する（実機依存部）。
+static void fetchGreeting() {
+    HTTPClient http;
+    http.begin(RELAY_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    // リクエスト body を ArduinoJson で組み立て（特殊文字も安全にエスケープ）。
+    JsonDocument req;
+    req["message"] = "起動したよ。ひとこと挨拶して。";
+    std::string body;
+    serializeJson(req, body);
+
+    const int code = http.POST(String(body.c_str()));
+    if (code == 200) {
+        const String payload = http.getString();
+        const ReplyMessage m = parse_relay_reply(payload.c_str());
+        g_reply = m.reply;
+        g_requestedExpr = m.expression;
+    } else {
+        // 失敗時も画面で分かるように（sad 表情でエラーコード表示）。
+        g_reply = std::string("relay error: ") + std::to_string(code);
+        g_requestedExpr = Expression::Sad;
+    }
+    http.end();
+    g_exprRequestMs = millis();
+    g_hasReply = true;
 }
 
 // 実際の WiFi 接続状態を、表示用の WifiState に変換する（実機依存部）。
@@ -122,6 +193,24 @@ void loop() {
     if (wifi != lastWifi) {
         drawWifiStatus(wifi);
         lastWifi = wifi;
+    }
+
+    // 起動後、Wi-Fi 接続できたら一度だけ中継サーバへ挨拶を問い合わせる（最小トリガ）。
+    if (wifi == WifiState::Connected && !g_hasReply) {
+        fetchGreeting();  // ブロッキング HTTP（この最小構成では許容）
+    }
+
+    // 対話描画：到着時に一度、その後は表情の自動復帰(active_expression)で変化した時だけ描き直す。
+    if (g_hasReply) {
+        static bool dialogDrawn = false;
+        static Expression lastExpr = Expression::Neutral;
+        const Expression activeExpr =
+            active_expression(g_requestedExpr, now - g_exprRequestMs);
+        if (!dialogDrawn || activeExpr != lastExpr) {
+            drawDialog(g_reply, activeExpr);
+            dialogDrawn = true;
+            lastExpr = activeExpr;
+        }
     }
 
     // まばたき：テスト済みの純粋関数で開き具合を求め、目だけ再描画。
