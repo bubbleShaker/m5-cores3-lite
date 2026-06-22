@@ -1,5 +1,8 @@
 #include <M5Unified.h>
+#include <WiFi.h>
 #include "avatar.h"
+#include "net.h"
+#include "secrets.h"  // WIFI_SSID / WIFI_PASS（git管理外。secrets.h.example を参照）
 
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
 constexpr int kScreenW = 320;
@@ -26,6 +29,10 @@ constexpr int kMouthHalfHMax = 14;  // 開ききった時の半分の高さ
 // 口パクのデモ用スケジュール（実トリガーは後続の対話レイヤーで差し替え予定）。
 constexpr uint32_t kSpeakPeriodMs = 4000;  // 4秒周期で
 constexpr uint32_t kSpeakOnMs     = 2000;  // 先頭2秒だけ喋る
+
+// Wi-Fi 接続を諦めるまでの時間（これを超えたら Failed 表示にする）。
+constexpr uint32_t kWifiTimeoutMs = 15000;
+uint32_t g_wifiBeginMs = 0;  // WiFi.begin を呼んだ時刻
 
 // 色（M5GFX の RGB565）。
 constexpr uint16_t kColBg    = TFT_BLACK;
@@ -71,16 +78,51 @@ static void drawStaticFace() {
     M5.Display.fillCircle(kFaceCx, kFaceCy, kFaceR, kColFace);
 }
 
+// 画面上部に Wi-Fi 接続状態の文言を描く。状態が変わった時だけ呼ぶ。
+static void drawWifiStatus(WifiState state) {
+    // 上部の帯（顔は y=30 付近から始まるので 0..18 は被らない）をクリアして描き直す
+    M5.Display.fillRect(0, 0, kScreenW, 18, kColBg);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(4, 2);
+    M5.Display.print(wifi_status_text(state).c_str());
+}
+
+// 実際の WiFi 接続状態を、表示用の WifiState に変換する（実機依存部）。
+static WifiState currentWifiState(uint32_t now) {
+    if (WiFi.status() == WL_CONNECTED) {
+        return WifiState::Connected;
+    }
+    if (now - g_wifiBeginMs > kWifiTimeoutMs) {
+        return WifiState::Failed;
+    }
+    return WifiState::Connecting;
+}
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
     M5.Display.setRotation(1);
     drawStaticFace();
+
+    // Wi-Fi 接続を開始（非同期。完了は loop でポーリングする）。
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    g_wifiBeginMs = millis();
+    drawWifiStatus(WifiState::Connecting);
 }
 
 void loop() {
     M5.update();
     const uint32_t now = millis();
+
+    // Wi-Fi 状態：変化した時だけ文言を描き直す（ちらつき・無駄描画を抑制）。
+    static WifiState lastWifi = WifiState::Connecting;
+    const WifiState wifi = currentWifiState(now);
+    if (wifi != lastWifi) {
+        drawWifiStatus(wifi);
+        lastWifi = wifi;
+    }
 
     // まばたき：テスト済みの純粋関数で開き具合を求め、目だけ再描画。
     const float eye = eye_openness(now);

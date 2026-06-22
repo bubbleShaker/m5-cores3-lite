@@ -17,3 +17,6 @@ Thumbs.db
 *.bin
 *.elf
 *.log
+
+# Secrets (Wi-Fi 認証情報など。secrets.h.example をコピーして使う)
+src/secrets.h
