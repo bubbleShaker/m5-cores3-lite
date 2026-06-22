@@ -20,3 +20,7 @@ Thumbs.db
 
 # Secrets (Wi-Fi 認証情報など。secrets.h.example をコピーして使う)
 src/secrets.h
+
+# relay (中継サーバ)
+relay/node_modules/
+relay/.env
