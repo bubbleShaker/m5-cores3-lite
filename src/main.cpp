@@ -491,6 +491,10 @@ struct SceneDef {
 bool     g_sheepTapped = false;  // 一度でもタップされたか（起動直後の誤発火を防ぐ）
 uint32_t g_sheepTapMs  = 0;      // 直近タップの時刻（横揺れの起点）
 
+// 発話状態（②-3a / Issue #23）。喋っている間だけ「喋り揺れ」を出すための起点と見積もり時間。
+uint32_t g_sheepSpeakStart = 0;  // 喋り始めた時刻
+uint32_t g_sheepSpeakDur   = 0;  // speaking_duration_ms の見積もり（0 なら喋っていない）
+
 static void sheepEnter() {
     M5.Display.fillScreen(kColBg);
     // キャンバスは初回だけ確保（クリップ枠サイズ・約70KB）。getBuffer() が未確保なら作る。
@@ -500,18 +504,33 @@ static void sheepEnter() {
     g_sheepTapped = false;  // シーンに入り直したら揺れ状態をリセット
 }
 static void sheepUpdate(uint32_t now) {
-    // タップ前は揺らさない。タップ後は経過時間から横揺れを求める（反応が切れたら 0 に戻る）。
-    const int shakeX = g_sheepTapped ? sheep_shake_offset(now - g_sheepTapMs) : 0;
+    // 喋っている間は減衰しない「喋り揺れ」、喋り終えたらタップ反応の余韻、どちらも無ければ静止。
+    int shakeX;
+    if (is_speaking(now, g_sheepSpeakStart, g_sheepSpeakDur)) {
+        shakeX = sheep_talk_offset(now - g_sheepSpeakStart);
+    } else if (g_sheepTapped) {
+        shakeX = sheep_shake_offset(now - g_sheepTapMs);
+    } else {
+        shakeX = 0;
+    }
     drawSheep(now, shakeX);
 }
 static void sheepOnTap(uint32_t now) {
     g_sheepTapMs  = now;
     g_sheepTapped = true;
-    // タップで鳴く。Wi-Fi があればクラウド TTS（ずんだもん）で喋り、
-    // 失敗時は自前合成のメェにフォールバックする（オフラインでも必ず鳴る）。
-    if (!speakTts("メェ")) {
+
+    // タップで鳴く。Wi-Fi があればクラウド TTS（ずんだもん）で喋り、失敗時は自前メェにフォールバック。
+    // 「喋っている間だけ揺れる」ため、再生したものに応じて発話時間を見積もる（#23）。
+    const std::string text = "メェ";
+    if (speakTts(text)) {
+        // クラウド TTS：実音長は不明なので返答(text)の長さから粗く見積もる。
+        g_sheepSpeakDur = speaking_duration_ms(text.size());
+    } else {
         playBleat();
+        // フォールバックのメェ：実際の再生長（サンプル数 / サンプルレート）に合わせる。
+        g_sheepSpeakDur = static_cast<uint32_t>(kBaaSamples) * 1000u / kVoiceSampleRate;
     }
+    g_sheepSpeakStart = now;
 }
 
 // --- アートシーンの状態とアダプタ（フローフィールド・アニメ） ---

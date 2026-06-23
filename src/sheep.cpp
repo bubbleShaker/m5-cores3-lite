@@ -32,3 +32,13 @@ int sheep_shake_offset(uint32_t elapsed_since_tap_ms) {
 
     return static_cast<int>(off >= 0.0f ? off + 0.5f : off - 0.5f);
 }
+
+int sheep_talk_offset(uint32_t elapsed_since_speak_ms) {
+    // 減衰しない横揺れ： 一定振幅で sin に左右に振る（喋りのリズム）。
+    //   t=0 では sin(0)=0 なので中心から始まる。停止は呼び出し側(is_speaking)が担う。
+    const float t    = elapsed_since_speak_ms / 1000.0f;  // 秒
+    const float wave = std::sin(2.0f * 3.14159265f * kTalkFreqHz * t);
+    const float off  = kTalkAmplitudePx * wave;
+
+    return static_cast<int>(off >= 0.0f ? off + 0.5f : off - 0.5f);
+}

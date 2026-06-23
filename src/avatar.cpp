@@ -29,6 +29,20 @@ float mouth_openness(uint32_t elapsed_ms, bool speaking) {
     return 1.0f - (phase - half) / half;  // 開 → 閉
 }
 
+uint32_t speaking_duration_ms(size_t reply_bytes) {
+    // バイト長に比例させた見積もり。size_t→uint32_t は下のクランプで安全側に収まる。
+    const uint64_t raw = static_cast<uint64_t>(reply_bytes) * kSpeakMsPerByte;
+    if (raw < kSpeakMinMs) return kSpeakMinMs;
+    if (raw > kSpeakMaxMs) return kSpeakMaxMs;
+    return static_cast<uint32_t>(raw);
+}
+
+bool is_speaking(uint32_t now_ms, uint32_t start_ms, uint32_t duration_ms) {
+    // 開始前は false。経過が duration 未満なら喋っている最中。
+    if (now_ms < start_ms) return false;
+    return (now_ms - start_ms) < duration_ms;
+}
+
 Expression parse_expression(const std::string& name) {
     if (name == "happy")     return Expression::Happy;
     if (name == "thinking")  return Expression::Thinking;

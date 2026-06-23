@@ -27,3 +27,15 @@ constexpr float    kShakeFreqHz      = 12.0f;
 //   elapsed >= kShakeDurationMs → 0（反応終了。揺れない）
 //   それ以外 → 振幅が時間とともに 0 へ減衰する横揺れ（t=0 では中心=0 から始まる）。
 int sheep_shake_offset(uint32_t elapsed_since_tap_ms);
+
+// 発話中の「喋り揺れ」のタイミング定数（②-3a / Issue #23）。
+//   kTalkAmplitudePx … 片振幅（shake より小さめ＝喋りのリズム感）
+//   kTalkFreqHz      … 揺れの速さ（Hz）
+constexpr int   kTalkAmplitudePx = 5;
+constexpr float kTalkFreqHz      = 8.0f;
+
+// 発話開始からの経過時間(ms)から羊の左右オフセット(px)を返す純粋関数。
+// shake と違い「減衰しない」＝喋っている間ずっと一定振幅で揺れる。
+// on/off は呼び出し側が is_speaking() で制御する（この関数は時間→揺れだけに責務を絞る）。
+//   t=0 では sin(0)=0 なので中心から始まり、急に飛ばない。
+int sheep_talk_offset(uint32_t elapsed_since_speak_ms);

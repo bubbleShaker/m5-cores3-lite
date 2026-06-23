@@ -64,6 +64,29 @@ void test_shake_is_nonzero_somewhere() {
     TEST_ASSERT_TRUE(moved);
 }
 
+// ── 発話揺れ（②-3a / Issue #23） ──
+// t=0 は中心から始まる（急に飛ばない）
+void test_talk_starts_at_center() {
+    TEST_ASSERT_EQUAL_INT(0, sheep_talk_offset(0));
+}
+
+// shake と違い減衰しない：時間が経っても止まらず、後半でも揺れる瞬間がある
+void test_talk_does_not_decay() {
+    bool moved_late = false;
+    for (uint32_t t = 3000; t < 4000; t += 3) {  // 十分経過した後でも
+        if (sheep_talk_offset(t) != 0) { moved_late = true; break; }
+    }
+    TEST_ASSERT_TRUE(moved_late);
+}
+
+// 常に振幅の範囲内（クリア枠をはみ出さない保証）
+void test_talk_stays_within_amplitude() {
+    for (uint32_t t = 0; t < 4000; t += 3) {
+        const int v = sheep_talk_offset(t);
+        TEST_ASSERT_TRUE(v >= -kTalkAmplitudePx && v <= kTalkAmplitudePx);
+    }
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_bob_at_cycle_start_is_bottom);
@@ -75,5 +98,8 @@ int main(int, char**) {
     RUN_TEST(test_shake_stops_after_duration);
     RUN_TEST(test_shake_stays_within_amplitude);
     RUN_TEST(test_shake_is_nonzero_somewhere);
+    RUN_TEST(test_talk_starts_at_center);
+    RUN_TEST(test_talk_does_not_decay);
+    RUN_TEST(test_talk_stays_within_amplitude);
     return UNITY_END();
 }
