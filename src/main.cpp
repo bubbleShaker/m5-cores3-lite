@@ -10,6 +10,7 @@
 #include "art.h"      // art_generate（幾何学アートの図形プリミティブ生成・純粋ロジック）
 #include "gesture.h"  // touch_update（短タップ/長押し検出・純粋ロジック）
 #include "scene.h"    // next_scene（シーン巡回・純粋ロジック）
+#include "voice.h"    // voice_baa_pcm（メェの PCM 合成・純粋ロジック）
 #include "net.h"
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
@@ -304,11 +305,15 @@ static void drawSheepEye(M5Canvas& cv, int ex, int ey, float openness) {
     }
 }
 
-// 「メェ」をトーン合成で鳴らす（下降2音でそれっぽさを出す。WAVアセット不要）。
+// メェの合成 PCM（自前生成）。setup で一度だけ作り、playRaw で鳴らす（P2 M1 / Issue #44）。
+static int16_t g_baaPcm[kBaaSamples];
+static int     g_baaLen = 0;
+
+// 「メェ」を鳴らす。tone() の単音ではなく、合成した波形(PCM)を playRaw で再生する
+// （クラウド TTS でもサーバが返す PCM をこの経路で鳴らす＝同じ playRaw を先に通す）。
 static void playBleat() {
     M5.Speaker.setVolume(180);
-    M5.Speaker.tone(760, 110);  // メ
-    M5.Speaker.tone(560, 190);  // ェ（少し下げる）
+    M5.Speaker.playRaw(g_baaPcm, g_baaLen, kVoiceSampleRate, false);  // false = モノラル
 }
 
 // 全身ドット羊を1フレーム描く。bob で上下に、shakeX で左右（タップ反応）に揺れ、目はまばたきする。
@@ -469,6 +474,10 @@ void setup() {
     M5.begin(cfg);
     M5.Display.setRotation(1);
     M5.Display.fillScreen(kColBg);
+
+    // メェの PCM を一度だけ合成しておく（毎タップで作り直さない）。
+    g_baaLen = voice_baa_pcm(g_baaPcm, kBaaSamples);
+
     kScenes[g_sceneIdx].enter();  // 初期シーンを描き始める
 }
 
