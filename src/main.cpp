@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>  // リクエスト body の安全な組み立て
 #include <string>
 #include <vector>
+#include <math.h>     // cosf / sinf（流れ場に沿った曲線の積分に使う）
 #include "avatar.h"
 #include "sheep.h"
 #include "art.h"      // art_generate（幾何学アートの図形プリミティブ生成・純粋ロジック）
@@ -354,32 +355,46 @@ static void drawSheep(uint32_t now, int shakeX) {
     cv.pushSprite(&M5.Display, kSheepClipX, kSheepClipY);
 }
 
-// ───────── アートシーン（Issue #34 M2：純粋生成ロジックの実機描画） ─────────
-// 1画面に置く図形数。多すぎると重なりで潰れるので適度に。
-constexpr int kArtShapeCount = 28;
+// ───────── アートシーン（Issue #42 / #34 M3：フローフィールド曲線のアニメ） ─────────
+// ノイズの流れ場(art_flow_angle)に沿って細い曲線を多数流す（Tyler Hobbs "Fidenza" 系）。
+// 毎フレーム全描画してもちらつかないよう、フルスクリーンの M5Canvas に描いてから一括転送する。
+constexpr int   kFlowLines = 120;    // 曲線の本数
+constexpr int   kFlowSteps = 34;     // 1本あたりの積分ステップ数（曲線の長さ）
+constexpr float kFlowStep  = 7.0f;   // 1ステップの進み(px)
+constexpr float kFlowDt    = 0.005f; // 1フレームで時間 t を進める量（流れの変形速度）
 
-// art_generate() が返す図形プリミティブ列を M5.Display で実際に描く（実機専用の描画責務）。
-// 「何を・どこに・何色で」は純粋ロジックに委ね、ここは enum で描画 API を呼び分けるだけ。
-static void drawArt(uint32_t seed) {
-    M5.Display.fillScreen(kColBg);
-    const std::vector<Shape> shapes = art_generate(seed, kArtShapeCount);
-    for (const auto& s : shapes) {
-        switch (s.kind) {
-            case ShapeKind::Circle:
-                M5.Display.fillCircle(s.cx, s.cy, s.size, s.color);
-                break;
-            case ShapeKind::Rect:
-                M5.Display.fillRect(s.cx - s.size, s.cy - s.size,
-                                    s.size * 2, s.size * 2, s.color);
-                break;
-            case ShapeKind::Triangle:
-                // 中心基準で上向き三角形を描く（生成ロジックが画面内に収めている）。
-                M5.Display.fillTriangle(s.cx, s.cy - s.size,
-                                        s.cx - s.size, s.cy + s.size,
-                                        s.cx + s.size, s.cy + s.size, s.color);
-                break;
+// アート用フルスクリーンキャンバス。サイズが大きい(320x240x2≒150KB)ので PSRAM に確保する。
+static M5Canvas g_artCanvas(&M5.Display);
+
+// 1フレーム分のフローフィールドを描く。seed が配色と流れ、t が時間（変形）を決める。
+static void drawFlowField(uint32_t seed, float t) {
+    M5Canvas& cv = g_artCanvas;
+    cv.fillScreen(art_flow_background(seed));
+
+    // 始点は seed から決定的にばらまく（軽量 LCG）。各始点から角度場に沿って積分し細線で描く。
+    uint32_t rng = seed * 2654435761u + 1u;
+    auto nextf = [&rng]() {                 // [0,1) の擬似乱数を返すローカル関数
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<float>(rng >> 8) / 16777216.0f;
+    };
+    for (int i = 0; i < kFlowLines; ++i) {
+        float x = nextf() * kArtScreenW;
+        float y = nextf() * kArtScreenH;
+        const uint16_t col = art_flow_color(seed, i);
+        for (int s = 0; s < kFlowSteps; ++s) {
+            const float ang = art_flow_angle(x, y, t, seed);  // その地点で進む向き
+            const float nx  = x + cosf(ang) * kFlowStep;
+            const float ny  = y + sinf(ang) * kFlowStep;
+            // 1px だと細すぎるので2本重ねて約2pxの繊細な線にする。
+            cv.drawLine(static_cast<int>(x), static_cast<int>(y),
+                        static_cast<int>(nx), static_cast<int>(ny), col);
+            cv.drawLine(static_cast<int>(x), static_cast<int>(y) + 1,
+                        static_cast<int>(nx), static_cast<int>(ny) + 1, col);
+            x = nx; y = ny;
+            if (x < 0 || x >= kArtScreenW || y < 0 || y >= kArtScreenH) break;  // 画面外で打ち切り
         }
     }
+    cv.pushSprite(&M5.Display, 0, 0);
 }
 
 // ───────── シーン状態機械（Issue #33：実行時シーン切替の基盤） ─────────
@@ -419,24 +434,26 @@ static void sheepOnTap(uint32_t now) {
     playBleat();  // タップで「メェ」と鳴く
 }
 
-// --- アートシーンの状態とアダプタ ---
-// 静止画なので毎フレーム描き直さない。enter / onTap で dirty を立て、その時だけ1回描く。
-uint32_t g_artSeed  = 1;
-bool     g_artDirty = true;
+// --- アートシーンの状態とアダプタ（フローフィールド・アニメ） ---
+uint32_t g_artSeed = 1;     // 配色と流れを決めるシード
+float    g_artT    = 0.0f;  // アニメ時間（毎フレーム進める＝流れがゆっくり変形）
 
 static void artEnter() {
-    g_artSeed  = millis();  // 入るたびに違うアート（時刻をシードに）
-    g_artDirty = true;
-}
-static void artUpdate(uint32_t /*now*/) {
-    if (g_artDirty) {
-        drawArt(g_artSeed);
-        g_artDirty = false;
+    g_artSeed = millis();  // 入るたびに違う作品（時刻をシードに）
+    g_artT    = 0.0f;
+    // フルスクリーンキャンバスを初回だけ PSRAM に確保（約150KB）。
+    if (!g_artCanvas.getBuffer()) {
+        g_artCanvas.setPsram(true);  // 内部RAMを圧迫しないよう PSRAM を使う
+        g_artCanvas.createSprite(kArtScreenW, kArtScreenH);
     }
 }
+static void artUpdate(uint32_t /*now*/) {
+    g_artT += kFlowDt;                 // 時間を進めて流れをゆっくり変形させる
+    drawFlowField(g_artSeed, g_artT);
+}
 static void artOnTap(uint32_t /*now*/) {
-    g_artSeed  = millis();  // タップで新しいアートを生成
-    g_artDirty = true;
+    g_artSeed = millis();  // タップで配色・流れを一新
+    g_artT    = 0.0f;
 }
 
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。

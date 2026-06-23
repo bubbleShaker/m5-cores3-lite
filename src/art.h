@@ -32,3 +32,22 @@ struct Shape {
 // millis() 等に依存させず seed を引数で受けることで、実機なしで単体テストできる。
 // count <= 0 のときは空のリストを返す。
 std::vector<Shape> art_generate(uint32_t seed, int count);
+
+// ───────── フローフィールド曲線（Issue #42 / #34 M3・Tyler Hobbs "Fidenza" 系） ─────────
+// ノイズの流れ場に沿って無数の細い曲線を流す。ここでは「角度場」と「配色」だけを純粋関数で
+// 決め、曲線の積分と実描画は main.cpp（M5.Display/M5Canvas）の責務に分離する＝ハード非依存で
+// テストできる（M2 の図形生成と同じ責務分離）。
+
+// なめらかな3D値ノイズ。戻り値はおよそ [-1, 1]。決定論的（同じ引数 → 必ず同じ値）。
+//   z（時間軸）を少しずつ進めると場が連続的に変形する＝アニメーションの素になる。
+//   ※ 値ノイズ＝格子点の擬似乱数値を 5次スムーズステップで補間する手法（Perlin の簡易版）。
+float art_value_noise(float x, float y, float z);
+
+// 流れ場の「その地点で曲線が進む向き（ラジアン）」を返す純粋関数。
+//   ノイズを角度へ写像し、seed で場全体をずらす（作品ごとに別の流れ）。t は時間（z 軸へ流す）。
+float art_flow_angle(float x, float y, float t, uint32_t seed);
+
+// 配色：手選びの調和パレットを seed で選ぶ（ランダム多色にせず少数色＝「おしゃれ」の肝）。
+constexpr int kFlowPaletteSize = 5;                 // 1パレットの線色数
+uint16_t art_flow_background(uint32_t seed);        // 背景色（RGB565）
+uint16_t art_flow_color(uint32_t seed, int index);  // index 本目の線色（パレットを巡回）
