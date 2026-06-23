@@ -11,6 +11,7 @@
 #include "gesture.h"  // touch_update（短タップ/長押し検出・純粋ロジック）
 #include "scene.h"    // next_scene（シーン巡回・純粋ロジック）
 #include "voice.h"    // voice_baa_pcm（メェの PCM 合成・純粋ロジック）
+#include "wav.h"      // parse_wav_header（/tts の WAV から PCM を取り出す・純粋ロジック）
 #include "net.h"
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
@@ -316,6 +317,76 @@ static void playBleat() {
     M5.Speaker.playRaw(g_baaPcm, g_baaLen, kVoiceSampleRate, false);  // false = モノラル
 }
 
+// 中継サーバの /tts エンドポイント URL を RELAY_URL（…/chat）から導出する。
+// secrets に専用定義を増やさず、末尾 /chat を /tts に置換するだけ（無ければそのまま）。
+static std::string ttsUrlFromRelay() {
+    std::string u = RELAY_URL;
+    const std::string chat = "/chat";
+    if (u.size() >= chat.size() &&
+        u.compare(u.size() - chat.size(), chat.size(), chat) == 0) {
+        u.replace(u.size() - chat.size(), chat.size(), "/tts");
+    }
+    return u;
+}
+
+// 受信した WAV を置くバッファ。playRaw 再生中も生かしておく必要があるため static で保持し、
+// 次回呼び出しの先頭で解放する（再生中に free しない）。容量が読めないので PSRAM を使う。
+static uint8_t* g_ttsBuf = nullptr;
+
+// 中継 /tts に text を投げ、返ってきた WAV を playRaw で鳴らす（実機依存部・P2 M2b / Issue #48）。
+// 成否を返し、失敗時は呼び出し側で自前メェにフォールバックさせる（オフラインでも必ず鳴る）。
+static bool speakTts(const std::string& text) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    http.begin(ttsUrlFromRelay().c_str());
+    http.addHeader("Content-Type", "application/json");
+
+    // body は ArduinoJson で組み立て（特殊文字を安全にエスケープ）。
+    JsonDocument req;
+    req["text"] = text.c_str();
+    std::string body;
+    serializeJson(req, body);
+
+    const int code = http.POST(String(body.c_str()));
+    if (code != 200) { http.end(); return false; }
+
+    // Content-Length。不明(-1)や中継方針(<=500KB)超過は安全側に弾く。
+    const int len = http.getSize();
+    constexpr size_t kMaxWav = 512 * 1024;
+    if (len <= 0 || static_cast<size_t>(len) > kMaxWav) { http.end(); return false; }
+
+    // 前回バッファを解放してから確保（PSRAM）。確保失敗もフォールバックへ。
+    if (g_ttsBuf) { free(g_ttsBuf); g_ttsBuf = nullptr; }
+    g_ttsBuf = static_cast<uint8_t*>(ps_malloc(static_cast<size_t>(len)));
+    if (!g_ttsBuf) { http.end(); return false; }
+
+    // ストリームから len バイトを読み切る（available() を見ながら詰める）。
+    WiFiClient* stream = http.getStreamPtr();
+    size_t got = 0;
+    while (got < static_cast<size_t>(len) && (http.connected() || stream->available())) {
+        const size_t avail = stream->available();
+        if (avail) {
+            size_t want = static_cast<size_t>(len) - got;
+            if (avail < want) want = avail;
+            got += stream->readBytes(g_ttsBuf + got, want);
+        } else {
+            delay(1);  // まだ届いていない。少し待って再試行。
+        }
+    }
+    http.end();
+    if (got != static_cast<size_t>(len)) return false;
+
+    // WAV ヘッダを剥がして PCM 本体を得る（純粋ロジック・native テスト済み）。
+    WavInfo info;
+    if (!parse_wav_header(g_ttsBuf, got, &info)) return false;
+
+    const int16_t* pcm = reinterpret_cast<const int16_t*>(g_ttsBuf + info.data_offset);
+    const size_t samples = info.data_bytes / 2;  // 16bit = 2byte / サンプル
+    M5.Speaker.setVolume(180);
+    return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
+}
+
 // 全身ドット羊を1フレーム描く。bob で上下に、shakeX で左右（タップ反応）に揺れ、目はまばたきする。
 // 重なり描画なので、固定枠を背景色でクリアしてから毎フレーム全体を描き直す（最小実装）。
 static void drawSheep(uint32_t now, int shakeX) {
@@ -436,7 +507,11 @@ static void sheepUpdate(uint32_t now) {
 static void sheepOnTap(uint32_t now) {
     g_sheepTapMs  = now;
     g_sheepTapped = true;
-    playBleat();  // タップで「メェ」と鳴く
+    // タップで鳴く。Wi-Fi があればクラウド TTS（ずんだもん）で喋り、
+    // 失敗時は自前合成のメェにフォールバックする（オフラインでも必ず鳴る）。
+    if (!speakTts("メェ")) {
+        playBleat();
+    }
 }
 
 // --- アートシーンの状態とアダプタ（フローフィールド・アニメ） ---
@@ -477,6 +552,12 @@ void setup() {
 
     // メェの PCM を一度だけ合成しておく（毎タップで作り直さない）。
     g_baaLen = voice_baa_pcm(g_baaPcm, kBaaSamples);
+
+    // Wi-Fi 接続をノンブロッキングで開始する（待たない）。
+    // タップ時点で繋がっていればクラウド TTS、未接続なら自前メェにフォールバックする。
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    g_wifiBeginMs = millis();
 
     kScenes[g_sceneIdx].enter();  // 初期シーンを描き始める
 }
