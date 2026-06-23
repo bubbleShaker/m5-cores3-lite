@@ -8,10 +8,12 @@
 | メソッド | パス | リクエスト | レスポンス |
 |---------|------|-----------|-----------|
 | `POST` | `/chat` | `{ "message": "..." }` | `{ "reply", "expression", "action" }` |
+| `POST` | `/tts` | `{ "text": "...", "voice_id"?: 3 }` | `audio/wav`（16kHz/モノラル） |
 | `GET`  | `/health` | — | `{ "ok": true }` |
 
 - `expression`: `neutral` / `happy` / `thinking` / `sad` / `surprised`（アバターの語彙と一致）
 - `action`: `none` / `notify`
+- `/tts` の `voice_id` は VOICEVOX の話者 ID（既定 `3` = ずんだもんノーマル）
 
 ## セットアップ（初回のみ）
 
@@ -38,10 +40,27 @@ curl -s -X POST localhost:3000/chat \
   -d '{"message":"おはよう"}'
 ```
 
+## 動作確認 `/tts`（要 VOICEVOX、API キー不要）
+
+```sh
+# 別ターミナルで VOICEVOX ENGINE を起動
+docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+
+# WAV を取得して再生できることを確認
+curl -s -X POST localhost:3000/tts \
+  -H 'content-type: application/json' \
+  -d '{"text":"こんにちは"}' -o out.wav
+```
+
+VOICEVOX が別ホスト/ポートなら `VOICEVOX_URL`（既定 `http://localhost:50021`）で上書きする。
+
 ## 設計
 
 - `src/chat.ts` — 純粋ロジック（プロンプト組み立て・応答パース＆検証）。ネットワーク非依存で単体テスト可能。
-- `src/server.ts` — Hono サーバ。環境変数読込→Claude 呼び出し→整形のみ。
+- `src/tts.ts` — 純粋ロジック（入力検証・話者解決・audio_query 整形・URL 組み立て）。
+- `src/server.ts` — Hono サーバ。環境変数読込→Claude / VOICEVOX 呼び出し→整形のみ。
+
+VOICEVOX 生成音声は話者ごとの規約に従い、配布時は「VOICEVOX:ずんだもん」等のクレジットを明記すること。音声アセットはコミットしない（実行時生成）。
 
 ## スコープ外（後続）
 
