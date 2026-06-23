@@ -3,8 +3,12 @@
 #include <HTTPClient.h>   // 中継サーバへの HTTP POST（ESP32 標準）
 #include <ArduinoJson.h>  // リクエスト body の安全な組み立て
 #include <string>
+#include <vector>
 #include "avatar.h"
 #include "sheep.h"
+#include "art.h"      // art_generate（幾何学アートの図形プリミティブ生成・純粋ロジック）
+#include "gesture.h"  // touch_update（短タップ/長押し検出・純粋ロジック）
+#include "scene.h"    // next_scene（シーン巡回・純粋ロジック）
 #include "net.h"
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
@@ -268,12 +272,6 @@ static WifiState currentWifiState(uint32_t now) {
 }
 
 // ───────── 羊シーン（Issue #28 / epic #27） ─────────
-// このビルドで表示するシーン。最小のシーン切替（将来はタッチ等で動的に切替える）。
-//   Scene::Face  … 従来の表情フェイスアバター（中継サーバ対話）
-//   Scene::Sheep … 全身ドット絵の羊キャラ（まばたき＋揺れ。Wi-Fi 不要）
-enum class Scene { Face, Sheep };
-constexpr Scene kScene = Scene::Sheep;
-
 // 羊の配置（rotation(1) の 320x240・中央）。bob で全体が上下する。
 constexpr int kSheepCx = kScreenW / 2;
 constexpr int kSheepCy = kScreenH / 2 + 4;
@@ -346,110 +344,121 @@ static void drawSheep(uint32_t now, int shakeX) {
     M5.Display.fillTriangle(cx - 4, cy + 13, cx + 4, cy + 13, cx, cy + 18, kColSheepEye);
 }
 
+// ───────── アートシーン（Issue #34 M2：純粋生成ロジックの実機描画） ─────────
+// 1画面に置く図形数。多すぎると重なりで潰れるので適度に。
+constexpr int kArtShapeCount = 28;
+
+// art_generate() が返す図形プリミティブ列を M5.Display で実際に描く（実機専用の描画責務）。
+// 「何を・どこに・何色で」は純粋ロジックに委ね、ここは enum で描画 API を呼び分けるだけ。
+static void drawArt(uint32_t seed) {
+    M5.Display.fillScreen(kColBg);
+    const std::vector<Shape> shapes = art_generate(seed, kArtShapeCount);
+    for (const auto& s : shapes) {
+        switch (s.kind) {
+            case ShapeKind::Circle:
+                M5.Display.fillCircle(s.cx, s.cy, s.size, s.color);
+                break;
+            case ShapeKind::Rect:
+                M5.Display.fillRect(s.cx - s.size, s.cy - s.size,
+                                    s.size * 2, s.size * 2, s.color);
+                break;
+            case ShapeKind::Triangle:
+                // 中心基準で上向き三角形を描く（生成ロジックが画面内に収めている）。
+                M5.Display.fillTriangle(s.cx, s.cy - s.size,
+                                        s.cx - s.size, s.cy + s.size,
+                                        s.cx + s.size, s.cy + s.size, s.color);
+                break;
+        }
+    }
+}
+
+// ───────── シーン状態機械（Issue #33：実行時シーン切替の基盤） ─────────
+// 各シーンを「enter/update/onTap」の関数ポインタに揃え、配列で持つ。
+// マネージャは現在の index を1つだけ握り、長押し(LongPress)で next_scene により次へ巡回、
+// 短タップ(Tap)を現シーンの onTap に委譲する。
+// シーンを増やすのは「配列に1個足すだけ」＝開放閉鎖の原則(SOLID)を満たす。
+//
+// ※ Face（中継サーバ対話）は Wi-Fi 依存で update(now) 内に非同期接続/HTTP を抱えるため、
+//   本巡回には未組み込み。Face のシーン化は後続 Issue で扱う（描画関数群は温存）。
+struct SceneDef {
+    void (*enter)();              // 切替時に1回（背景クリア・初期描画）
+    void (*update)(uint32_t now); // 毎フレーム描画
+    void (*onTap)(uint32_t now);  // 短タップ反応
+};
+
+// --- 羊シーンの状態とアダプタ ---
+bool     g_sheepTapped = false;  // 一度でもタップされたか（起動直後の誤発火を防ぐ）
+uint32_t g_sheepTapMs  = 0;      // 直近タップの時刻（横揺れの起点）
+
+static void sheepEnter() {
+    M5.Display.fillScreen(kColBg);
+    g_sheepTapped = false;  // シーンに入り直したら揺れ状態をリセット
+}
+static void sheepUpdate(uint32_t now) {
+    // タップ前は揺らさない。タップ後は経過時間から横揺れを求める（反応が切れたら 0 に戻る）。
+    const int shakeX = g_sheepTapped ? sheep_shake_offset(now - g_sheepTapMs) : 0;
+    drawSheep(now, shakeX);
+}
+static void sheepOnTap(uint32_t now) {
+    g_sheepTapMs  = now;
+    g_sheepTapped = true;
+    playBleat();  // タップで「メェ」と鳴く
+}
+
+// --- アートシーンの状態とアダプタ ---
+// 静止画なので毎フレーム描き直さない。enter / onTap で dirty を立て、その時だけ1回描く。
+uint32_t g_artSeed  = 1;
+bool     g_artDirty = true;
+
+static void artEnter() {
+    g_artSeed  = millis();  // 入るたびに違うアート（時刻をシードに）
+    g_artDirty = true;
+}
+static void artUpdate(uint32_t /*now*/) {
+    if (g_artDirty) {
+        drawArt(g_artSeed);
+        g_artDirty = false;
+    }
+}
+static void artOnTap(uint32_t /*now*/) {
+    g_artSeed  = millis();  // タップで新しいアートを生成
+    g_artDirty = true;
+}
+
+// シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
+const SceneDef kScenes[] = {
+    { sheepEnter, sheepUpdate, sheepOnTap },
+    { artEnter,   artUpdate,   artOnTap   },
+};
+constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
+int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
     M5.Display.setRotation(1);
-
-    if (kScene == Scene::Sheep) {
-        // 羊シーンは Wi-Fi も中継サーバも不要。背景だけ用意して loop で描く。
-        M5.Display.fillScreen(kColBg);
-        return;
-    }
-
-    drawStaticFace();
-
-    // Wi-Fi 接続を開始（非同期。完了は loop でポーリングする）。
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    g_wifiBeginMs = millis();
-    drawWifiStatus(WifiState::Connecting);
+    M5.Display.fillScreen(kColBg);
+    kScenes[g_sceneIdx].enter();  // 初期シーンを描き始める
 }
 
 void loop() {
     M5.update();
     const uint32_t now = millis();
 
-    // 羊シーン：まばたき＋揺れ＋タップ反応の自己完結ループ（フェイス用の対話処理は走らせない）。
-    if (kScene == Scene::Sheep) {
-        // タッチの立ち上がりエッジ（押した瞬間だけ true）で反応を開始する。
-        static bool sheepWasTouched = false;
-        static bool sheepTapped     = false;  // 一度でもタップされたか（起動直後の誤発火を防ぐ）
-        static uint32_t sheepTapMs  = 0;       // 直近タップの時刻（横揺れの起点）
-        const bool touched = (M5.Touch.getCount() > 0);
-        if (touched && !sheepWasTouched) {
-            sheepTapMs  = now;
-            sheepTapped = true;
-            playBleat();  // タップで「メェ」と鳴く
-        }
-        sheepWasTouched = touched;
+    // タッチ系列をジェスチャ検出に流し、短タップ/長押しを判定する（純粋ロジック）。
+    static TouchTracker tracker;
+    const bool touching = (M5.Touch.getCount() > 0);
+    const TouchEvent ev = touch_update(tracker, touching, now);
 
-        // タップ前は揺らさない。タップ後は経過時間から横揺れを求める（反応が切れたら 0 に戻る）。
-        const int shakeX = sheepTapped ? sheep_shake_offset(now - sheepTapMs) : 0;
-        drawSheep(now, shakeX);
-        delay(33);  // 約30fps
-        return;
+    if (ev == TouchEvent::LongPress) {
+        // 長押し → 次シーンへ巡回し、新シーンを初期描画する。
+        g_sceneIdx = next_scene(g_sceneIdx, kSceneCount);
+        kScenes[g_sceneIdx].enter();
+    } else if (ev == TouchEvent::Tap) {
+        // 短タップ → 現シーンの反応に委譲（羊のメェ／アート再生成など）。
+        kScenes[g_sceneIdx].onTap(now);
     }
 
-    // Wi-Fi 状態：変化した時だけ文言を描き直す（ちらつき・無駄描画を抑制）。
-    static WifiState lastWifi = WifiState::Connecting;
-    const WifiState wifi = currentWifiState(now);
-    if (wifi != lastWifi) {
-        drawWifiStatus(wifi);
-        lastWifi = wifi;
-    }
-
-    // 画面タッチの「立ち上がりエッジ」を検出する（押した瞬間だけ true）。
-    // M5.Touch.getCount() は今フレームで触れている点の数。前フレーム0→今1 の瞬間だけ拾うことで、
-    // 押しっぱなし・連打でも 1タッチ＝1リクエスト に抑える（簡易デバウンス）。
-    static bool wasTouched = false;
-    const bool touched = (M5.Touch.getCount() > 0);
-    const bool touchEdge = touched && !wasTouched;
-    wasTouched = touched;
-
-    // Wi-Fi 接続後、初回（!g_hasReply）またはタッチのたびに中継サーバへ挨拶を問い合わせる。
-    if (wifi == WifiState::Connected && (!g_hasReply || touchEdge)) {
-        fetchGreeting();  // ブロッキング HTTP（この最小構成では許容）
-    }
-
-    // 現在の表情と、その見た目スタイル（目/眉/口の形）を決める（自動復帰込み）。
-    const Expression activeExpr =
-        active_expression(g_requestedExpr, now - g_exprRequestMs);
-    const FaceStyle fs = face_style(activeExpr);
-
-    // 眉：アニメしないので、表情が変わった時（と初回、そして再問い合わせ直後）だけ描き直す。
-    static bool faceInit = false;
-    static Expression lastFaceExpr = Expression::Neutral;
-    if (!faceInit || activeExpr != lastFaceExpr || g_replyDirty) {
-        drawBrows(fs.brow);
-        faceInit = true;
-        lastFaceExpr = activeExpr;
-    }
-
-    // 対話描画：到着時に一度、その後は表情の自動復帰(active_expression)で変化した時、
-    // および再問い合わせ直後(g_replyDirty)に描き直す（同じ表情が返っても返答文を更新するため）。
-    if (g_hasReply) {
-        static bool dialogDrawn = false;
-        static Expression lastDlgExpr = Expression::Neutral;
-        if (!dialogDrawn || activeExpr != lastDlgExpr || g_replyDirty) {
-            drawDialog(g_reply, activeExpr);
-            dialogDrawn = true;
-            lastDlgExpr = activeExpr;
-        }
-    }
-    g_replyDirty = false;  // 強制再描画は1フレームで完了。以降は通常の差分描画に戻す
-
-    // まばたき：テスト済みの純粋関数で開き具合を求め、目スタイルの寸法で再描画。
-    int eyeMaxH, eyeMaxW;
-    eyeMetrics(fs.eye, eyeMaxH, eyeMaxW);
-    const float eye = eye_openness(now);
-    drawEye(kEyeLx, eye, eyeMaxH, eyeMaxW);
-    drawEye(kEyeRx, eye, eyeMaxH, eyeMaxW);
-
-    // 口パク：デモ用スケジュールで speaking を決め、閉じ口は表情ごとの形で再描画。
-    // speaking の実トリガー（マイク/対話）は後続 Issue で差し替える。
-    const bool speaking = (now % kSpeakPeriodMs) < kSpeakOnMs;
-    drawMouth(mouth_openness(now, speaking), fs.mouth);
-
+    kScenes[g_sceneIdx].update(now);  // 毎フレーム描画
     delay(33);  // 約30fps
 }
