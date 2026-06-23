@@ -22,6 +22,25 @@ float eye_openness(uint32_t elapsed_ms);
 // speaking を引数にすることで、後段の対話レイヤーが応答中だけ true を渡せる。
 float mouth_openness(uint32_t elapsed_ms, bool speaking);
 
+// 口パクを「応答を喋っている間だけ」動かすための時間モデル（②-3a / Issue #23）。
+//   kSpeakMsPerByte … 返答1バイトあたりの喋り時間の見積もり係数
+//   kSpeakMinMs / kSpeakMaxMs … 見積もりの下限・上限（極端な長さでも妥当な範囲に収める）
+// UTF-8 日本語は1文字3バイト程度。実音(TTS/メェ)と厳密同期はしないが、体感が合う粗い見積もり。
+constexpr uint32_t kSpeakMsPerByte = 25;
+constexpr uint32_t kSpeakMinMs     = 600;
+constexpr uint32_t kSpeakMaxMs     = 8000;
+
+// 返答のバイト長から「喋っている時間(ms)」を見積もる純粋関数。
+//   reply_bytes に比例させ、kSpeakMinMs〜kSpeakMaxMs にクランプする。
+//   空文字(0)でも口パクが一瞬出るよう下限を保証する。
+uint32_t speaking_duration_ms(size_t reply_bytes);
+
+// 今が「喋っている最中か」を判定する純粋関数。
+//   start_ms … 喋り始めた時刻 / duration_ms … speaking_duration_ms の見積もり
+//   now が [start, start+duration) の範囲内なら true。
+//   millis() に依存させず引数で時間を渡すことで実機なしで単体テストできる。
+bool is_speaking(uint32_t now_ms, uint32_t start_ms, uint32_t duration_ms);
+
 // アバターが取りうる表情の語彙（単一の真実）。API・描画はこの enum に依存する。
 enum class Expression { Neutral, Happy, Thinking, Sad, Surprised };
 

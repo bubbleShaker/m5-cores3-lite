@@ -115,6 +115,38 @@ void test_face_style_thinking() {
     TEST_ASSERT_TRUE(s.brow == BrowShape::Quizzical);
 }
 
+// ── 発話時間の見積もり（②-3a / Issue #23） ──
+void test_speaking_duration_scales_with_length() {
+    // 中くらいの長さは下限と上限の間で、長いほど長くなる。
+    const uint32_t shortD = speaking_duration_ms(60);
+    const uint32_t longD  = speaking_duration_ms(120);
+    TEST_ASSERT_TRUE(shortD < longD);
+    TEST_ASSERT_TRUE(shortD >= kSpeakMinMs);
+    TEST_ASSERT_TRUE(longD  <= kSpeakMaxMs);
+}
+
+void test_speaking_duration_clamps_min() {
+    // 空文字でも下限を保証（口パクが一瞬は出る）。
+    TEST_ASSERT_EQUAL_UINT32(kSpeakMinMs, speaking_duration_ms(0));
+}
+
+void test_speaking_duration_clamps_max() {
+    // 極端に長くても上限で頭打ち。
+    TEST_ASSERT_EQUAL_UINT32(kSpeakMaxMs, speaking_duration_ms(100000));
+}
+
+// ── 発話中かの判定（②-3a / Issue #23） ──
+void test_is_speaking_within_window() {
+    TEST_ASSERT_TRUE(is_speaking(1000, 1000, 500));   // 開始ちょうど
+    TEST_ASSERT_TRUE(is_speaking(1499, 1000, 500));   // 終了直前
+}
+
+void test_is_speaking_outside_window() {
+    TEST_ASSERT_FALSE(is_speaking(999, 1000, 500));   // 開始前
+    TEST_ASSERT_FALSE(is_speaking(1500, 1000, 500));  // 終了ちょうど（範囲外）
+    TEST_ASSERT_FALSE(is_speaking(5000, 1000, 500));  // 十分過ぎた後
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_eye_open_at_cycle_start);
@@ -134,5 +166,10 @@ int main(int, char**) {
     RUN_TEST(test_face_style_sad);
     RUN_TEST(test_face_style_surprised);
     RUN_TEST(test_face_style_thinking);
+    RUN_TEST(test_speaking_duration_scales_with_length);
+    RUN_TEST(test_speaking_duration_clamps_min);
+    RUN_TEST(test_speaking_duration_clamps_max);
+    RUN_TEST(test_is_speaking_within_window);
+    RUN_TEST(test_is_speaking_outside_window);
     return UNITY_END();
 }
