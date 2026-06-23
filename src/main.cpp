@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>  // リクエスト body の安全な組み立て
 #include <string>
 #include "avatar.h"
+#include "sheep.h"
 #include "net.h"
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
@@ -266,10 +267,89 @@ static WifiState currentWifiState(uint32_t now) {
     return WifiState::Connecting;
 }
 
+// ───────── 羊シーン（Issue #28 / epic #27） ─────────
+// このビルドで表示するシーン。最小のシーン切替（将来はタッチ等で動的に切替える）。
+//   Scene::Face  … 従来の表情フェイスアバター（中継サーバ対話）
+//   Scene::Sheep … 全身ドット絵の羊キャラ（まばたき＋揺れ。Wi-Fi 不要）
+enum class Scene { Face, Sheep };
+constexpr Scene kScene = Scene::Sheep;
+
+// 羊の配置（rotation(1) の 320x240・中央）。bob で全体が上下する。
+constexpr int kSheepCx = kScreenW / 2;
+constexpr int kSheepCy = kScreenH / 2 + 4;
+// 毎フレーム全体を描き直すための固定クリア枠（bob の振れ幅・足まで含む）。
+constexpr int kSheepClipX = 56;
+constexpr int kSheepClipY = 44;
+constexpr int kSheepClipW = 208;
+constexpr int kSheepClipH = 170;
+
+// 羊の色（RGB565）。
+constexpr uint16_t kColWool      = TFT_WHITE;
+constexpr uint16_t kColSheepFace = 0xF7BB;  // クリーム色の顔
+constexpr uint16_t kColSheepLeg  = 0x4208;  // 暗いグレーの足
+constexpr uint16_t kColEar       = 0x8410;  // グレーの耳
+constexpr uint16_t kColSheepEye  = TFT_BLACK;
+
+// 羊の目を1つ描く。まばたきは既存のテスト済み eye_openness をそのまま流用する。
+static void drawSheepEye(int ex, int ey, float openness) {
+    const int halfH = static_cast<int>(7 * openness);
+    if (halfH <= 1) {
+        M5.Display.fillRect(ex - 4, ey - 1, 8, 2, kColSheepEye);  // ほぼ閉じ＝とじ目
+    } else {
+        M5.Display.fillEllipse(ex, ey, 4, halfH, kColSheepEye);
+    }
+}
+
+// 全身ドット羊を1フレーム描く。bob で上下に揺れ、目はまばたきする。
+// 重なり描画なので、固定枠を背景色でクリアしてから毎フレーム全体を描き直す（最小実装）。
+static void drawSheep(uint32_t now) {
+    const int bob = sheep_bob_offset(now);
+    const int cx  = kSheepCx;
+    const int cy  = kSheepCy + bob;  // 揺れで全体を上下させる
+
+    M5.Display.fillRect(kSheepClipX, kSheepClipY, kSheepClipW, kSheepClipH, kColBg);
+
+    // 足（胴体の後ろに先に描く）。
+    const int legY = cy + 26;
+    for (int i = 0; i < 4; ++i) {
+        M5.Display.fillRect(cx - 30 + i * 20, legY, 8, 22, kColSheepLeg);
+    }
+
+    // モコモコ胴毛：白い円を重ねて雲状の輪郭を作り、中央を楕円で埋める。
+    static const int8_t bumps[][2] = {
+        {-46, -14}, {-26, -32}, {0, -38}, {26, -32}, {46, -14},
+        {-52,   8}, { 52,   8}, {-30, 26}, {0, 32}, {30, 26},
+    };
+    for (auto& b : bumps) {
+        M5.Display.fillCircle(cx + b[0], cy + b[1], 22, kColWool);
+    }
+    M5.Display.fillEllipse(cx, cy - 2, 52, 38, kColWool);
+
+    // 耳（顔の左右、胴毛の前面）。
+    M5.Display.fillEllipse(cx - 26, cy + 8, 8, 11, kColEar);
+    M5.Display.fillEllipse(cx + 26, cy + 8, 8, 11, kColEar);
+
+    // 顔（前面の下中央。胴毛の上に重ねる）。
+    M5.Display.fillEllipse(cx, cy + 8, 24, 20, kColSheepFace);
+
+    // 目（まばたき）と鼻。
+    const float eyeOpen = eye_openness(now);
+    drawSheepEye(cx - 9, cy + 3, eyeOpen);
+    drawSheepEye(cx + 9, cy + 3, eyeOpen);
+    M5.Display.fillTriangle(cx - 4, cy + 13, cx + 4, cy + 13, cx, cy + 18, kColSheepEye);
+}
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
     M5.Display.setRotation(1);
+
+    if (kScene == Scene::Sheep) {
+        // 羊シーンは Wi-Fi も中継サーバも不要。背景だけ用意して loop で描く。
+        M5.Display.fillScreen(kColBg);
+        return;
+    }
+
     drawStaticFace();
 
     // Wi-Fi 接続を開始（非同期。完了は loop でポーリングする）。
@@ -282,6 +362,13 @@ void setup() {
 void loop() {
     M5.update();
     const uint32_t now = millis();
+
+    // 羊シーン：まばたき＋揺れだけの自己完結ループ（フェイス用の対話処理は走らせない）。
+    if (kScene == Scene::Sheep) {
+        drawSheep(now);
+        delay(33);  // 約30fps
+        return;
+    }
 
     // Wi-Fi 状態：変化した時だけ文言を描き直す（ちらつき・無駄描画を抑制）。
     static WifiState lastWifi = WifiState::Connecting;
