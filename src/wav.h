@@ -25,3 +25,20 @@ struct WavInfo {
 //   返り値 false … マジック不一致・16bit PCM 以外・チャンクが境界外、等（info は未定義扱い）
 // 壊れた入力でも領域外アクセスしないこと（バッファは信用しない）を最優先に実装する。
 bool parse_wav_header(const uint8_t* data, size_t len, WavInfo* info);
+
+// ---- P2 音声 M3b-1（Issue #53）: WAV を「書く」純粋ロジック ----
+// 録音した 16bit モノラル PCM を中継 /stt に送るため、標準44byteヘッダで WAV にラップする。
+// 上の parse_wav_header（読む）の対称で、write→parse が往復一致するのが設計のゴール。
+
+// 出力 WAV の総バイト数。標準44byteヘッダ + PCM 本体。
+// pcm_bytes はサンプル数 * 2（16bit）。呼び出し側がバッファ確保の見積りに使う。
+size_t wav_size(size_t pcm_bytes);
+
+// 16bit モノラル PCM を WAV バイト列として out に書く純粋関数。
+//   out / cap     … 書き込み先と容量（cap 不足なら何も書かず false＝領域外を書かない）
+//   pcm / samples … int16 PCM 配列とサンプル数（samples=0 は空 data の正当な WAV）
+//   sample_rate   … 例: 16000
+//   返り値 true … wav_size(samples*2) バイトを out に書けた
+// parse_wav_header と往復一致する標準フォーマットのみ出力する。
+bool write_wav(uint8_t* out, size_t cap, const int16_t* pcm, size_t samples,
+               uint32_t sample_rate);
