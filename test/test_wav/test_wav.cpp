@@ -156,6 +156,58 @@ void test_rejects_missing_fmt() {
     TEST_ASSERT_FALSE(parse_wav_header(w.data(), w.size(), &info));
 }
 
+// ---- M3b-1（Issue #53）: write_wav（書く側）----
+
+// wav_size は 44byte ヘッダ + PCM 本体。
+void test_wav_size() {
+    TEST_ASSERT_EQUAL_UINT32(44, wav_size(0));
+    TEST_ASSERT_EQUAL_UINT32(44 + 8, wav_size(8));
+}
+
+// write→parse の往復一致。録音PCMをラップして自前パーサで矛盾なく読めること。
+void test_write_then_parse_roundtrip() {
+    const int16_t pcm[] = {0, 1000, -1000, 32767, -32768};
+    const size_t  samples = sizeof(pcm) / sizeof(pcm[0]);
+    std::vector<uint8_t> buf(wav_size(samples * 2));
+
+    TEST_ASSERT_TRUE(write_wav(buf.data(), buf.size(), pcm, samples, 16000));
+
+    WavInfo info;
+    TEST_ASSERT_TRUE(parse_wav_header(buf.data(), buf.size(), &info));
+    TEST_ASSERT_EQUAL_UINT32(16000, info.sample_rate);
+    TEST_ASSERT_EQUAL_UINT16(1, info.channels);
+    TEST_ASSERT_EQUAL_UINT16(16, info.bits_per_sample);
+    TEST_ASSERT_EQUAL_UINT32(samples * 2, info.data_bytes);
+
+    // data 本体が LE int16 でそのまま並んでいること。
+    const uint8_t* d = buf.data() + info.data_offset;
+    for (size_t i = 0; i < samples; ++i) {
+        const uint16_t got = d[i * 2] | (d[i * 2 + 1] << 8);
+        TEST_ASSERT_EQUAL_UINT16(static_cast<uint16_t>(pcm[i]), got);
+    }
+}
+
+// samples=0 は「空 data の正当な WAV」として書け、parse も通る。
+void test_write_empty_pcm() {
+    std::vector<uint8_t> buf(wav_size(0));
+    TEST_ASSERT_TRUE(write_wav(buf.data(), buf.size(), nullptr, 0, 16000));
+    WavInfo info;
+    TEST_ASSERT_TRUE(parse_wav_header(buf.data(), buf.size(), &info));
+    TEST_ASSERT_EQUAL_UINT32(0, info.data_bytes);
+}
+
+// 容量不足・null では 1byte も書かず false（領域外を書かない）。
+void test_write_rejects_small_cap_and_null() {
+    const int16_t pcm[] = {1, 2, 3};
+    std::vector<uint8_t> buf(wav_size(6));
+    // cap が総バイトに 1 足りない → false。
+    TEST_ASSERT_FALSE(write_wav(buf.data(), buf.size() - 1, pcm, 3, 16000));
+    // out が null → false。
+    TEST_ASSERT_FALSE(write_wav(nullptr, 100, pcm, 3, 16000));
+    // pcm が null で samples>0 → false。
+    TEST_ASSERT_FALSE(write_wav(buf.data(), buf.size(), nullptr, 3, 16000));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_parses_standard_wav);
@@ -166,5 +218,9 @@ int main(int, char**) {
     RUN_TEST(test_rejects_truncated_data);
     RUN_TEST(test_rejects_too_short_and_null);
     RUN_TEST(test_rejects_missing_fmt);
+    RUN_TEST(test_wav_size);
+    RUN_TEST(test_write_then_parse_roundtrip);
+    RUN_TEST(test_write_empty_pcm);
+    RUN_TEST(test_write_rejects_small_cap_and_null);
     return UNITY_END();
 }
