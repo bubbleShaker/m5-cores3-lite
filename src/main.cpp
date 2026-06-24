@@ -387,6 +387,90 @@ static bool speakTts(const std::string& text) {
     return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
 }
 
+// ───────── 音声入力（録音→中継 /stt で文字起こし・P2 M3b-2 / Issue #55） ─────────
+// 中継サーバの /stt エンドポイント URL を RELAY_URL（…/chat）から導出する（/tts と同じ作法）。
+static std::string sttUrlFromRelay() {
+    std::string u = RELAY_URL;
+    const std::string chat = "/chat";
+    if (u.size() >= chat.size() &&
+        u.compare(u.size() - chat.size(), chat.size(), chat) == 0) {
+        u.replace(u.size() - chat.size(), chat.size(), "/stt");
+    }
+    return u;
+}
+
+// 録音設定。16kHz/16bit/モノラルで固定長を録る（Whisper・/stt 推奨に合わせる）。
+constexpr uint32_t kSttSampleRate    = 16000;
+constexpr size_t   kSttRecordSamples = kSttSampleRate * 5 / 2;  // 2.5 秒ぶん
+
+// 録音/送信で使い回すバッファ（PSRAM）。確保コストを避けるため一度だけ確保して保持する。
+static int16_t* g_recPcm = nullptr;  // 録音した int16 PCM
+static uint8_t* g_recWav = nullptr;  // write_wav 出力（44byteヘッダ + PCM）
+
+// マイクで一定時間録音し、中継 /stt へ送って文字起こしを得る（実機依存部）。
+// 成功時 true で out に認識テキスト（無音なら空文字もありうる）。失敗時 false（呼び出し側でフォールバック）。
+static bool recordAndTranscribe(std::string& out) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    // PCM と WAV のバッファを一度だけ PSRAM に確保する。確保失敗は安全側に false。
+    const size_t wavCap = wav_size(kSttRecordSamples * sizeof(int16_t));
+    if (!g_recPcm) g_recPcm = static_cast<int16_t*>(ps_malloc(kSttRecordSamples * sizeof(int16_t)));
+    if (!g_recWav) g_recWav = static_cast<uint8_t*>(ps_malloc(wavCap));
+    if (!g_recPcm || !g_recWav) return false;
+
+    // マイクとスピーカーは I2S を共有するため、録音前にスピーカーを止めてマイクを起こす。
+    // ※ M5.Mic.begin / M5.Mic.end … 内部マイク(ES7210)の I2S を開始/停止する M5Unified の API。
+    M5.Speaker.end();
+    if (!M5.Mic.begin()) { M5.Speaker.begin(); return false; }
+
+    // 固定長を録音し、録り終わるまで同期待ちする（record は非同期に走るので isRecording で待つ）。
+    M5.Mic.record(g_recPcm, kSttRecordSamples, kSttSampleRate);
+    while (M5.Mic.isRecording()) { delay(1); }
+
+    // マイクを閉じてスピーカーを戻す（次のメェ/発話のため I2S を返す）。
+    M5.Mic.end();
+    M5.Speaker.begin();
+
+    // 録音 PCM を WAV にラップする（純粋ロジック・native テスト済み / Issue #53）。
+    if (!write_wav(g_recWav, wavCap, g_recPcm, kSttRecordSamples, kSttSampleRate)) return false;
+
+    // /stt へ raw WAV を POST。言語/タスクはサーバ既定（ja / transcribe）に委ねる。
+    HTTPClient http;
+    http.begin(sttUrlFromRelay().c_str());
+    http.addHeader("Content-Type", "audio/wav");
+    const int code = http.POST(g_recWav, wavCap);
+    if (code != 200) { http.end(); return false; }
+
+    const String payload = http.getString();
+    http.end();
+
+    // 応答 JSON {text} を解析。壊れていれば false（フォールバックへ）。
+    JsonDocument res;
+    if (deserializeJson(res, payload.c_str())) return false;
+    out = std::string(res["text"] | "");
+    return true;
+}
+
+// 認識テキストの簡易バナー（画面上部）。録音→STT の結果を数秒だけ見せるデバッグ表示（M3b-2）。
+// 羊のクリップ枠は y>=44 なので、上部 y=8..34 に出せば描画が重ならない。
+constexpr int      kSttBannerY  = 8;
+constexpr int      kSttBannerH  = 26;
+constexpr uint32_t kSttShowMs   = 4000;  // 表示してから消すまで
+static uint32_t    g_sttShownMs = 0;     // バナーを出した時刻（0=非表示）
+
+// バナーを描く/消す。和文を出すため drawDialog と同じ lgfxJapanGothic_16 を使う。
+static void drawSttBanner(const std::string& text) {
+    M5.Display.fillRect(0, kSttBannerY, kScreenW, kSttBannerH, kColBg);
+    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+    M5.Display.setTextColor(TFT_CYAN, kColBg);
+    M5.Display.setCursor(4, kSttBannerY + 4);
+    M5.Display.print(text.empty() ? "（聞き取れなかったのだ）" : text.c_str());
+    M5.Display.setFont(&fonts::Font0);  // 既定に戻す（他描画への影響回避）
+}
+static void clearSttBanner() {
+    M5.Display.fillRect(0, kSttBannerY, kScreenW, kSttBannerH, kColBg);
+}
+
 // 全身ドット羊を1フレーム描く。bob で上下に、shakeX で左右（タップ反応）に揺れ、目はまばたきする。
 // 重なり描画なので、固定枠を背景色でクリアしてから毎フレーム全体を描き直す（最小実装）。
 static void drawSheep(uint32_t now, int shakeX) {
@@ -504,6 +588,12 @@ static void sheepEnter() {
     g_sheepTapped = false;  // シーンに入り直したら揺れ状態をリセット
 }
 static void sheepUpdate(uint32_t now) {
+    // 認識バナーの寿命管理：表示から一定時間が過ぎたら消す（一度だけ消去して描き直さない）。
+    if (g_sttShownMs && now - g_sttShownMs > kSttShowMs) {
+        clearSttBanner();
+        g_sttShownMs = 0;
+    }
+
     // 喋っている間は減衰しない「喋り揺れ」、喋り終えたらタップ反応の余韻、どちらも無ければ静止。
     int shakeX;
     if (is_speaking(now, g_sheepSpeakStart, g_sheepSpeakDur)) {
@@ -531,6 +621,15 @@ static void sheepOnTap(uint32_t now) {
         g_sheepSpeakDur = static_cast<uint32_t>(kBaaSamples) * 1000u / kVoiceSampleRate;
     }
     g_sheepSpeakStart = now;
+
+    // メェの後にマイク録音→中継 /stt で文字起こしし、結果を上部バナーに出す（P2 M3b-2 / Issue #55）。
+    // ここでスピーカー→マイクの I2S 切替を一度通す。失敗（オフライン等）なら何も表示しない。
+    std::string heard;
+    if (recordAndTranscribe(heard)) {
+        Serial.printf("[stt] heard: %s\n", heard.c_str());
+        drawSttBanner(heard);
+        g_sttShownMs = millis();  // 録音に数秒かかるので now ではなく現在時刻を起点にする
+    }
 }
 
 // --- アートシーンの状態とアダプタ（フローフィールド・アニメ） ---
