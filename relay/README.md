@@ -9,11 +9,13 @@
 |---------|------|-----------|-----------|
 | `POST` | `/chat` | `{ "message": "..." }` | `{ "reply", "expression", "action" }` |
 | `POST` | `/tts` | `{ "text": "...", "voice_id"?: 3 }` | `audio/wav`（16kHz/モノラル） |
+| `POST` | `/stt` | raw WAV body（`?language=ja&task=transcribe`） | `{ "text": "..." }` |
 | `GET`  | `/health` | — | `{ "ok": true }` |
 
 - `expression`: `neutral` / `happy` / `thinking` / `sad` / `surprised`（アバターの語彙と一致）
 - `action`: `none` / `notify`
 - `/tts` の `voice_id` は VOICEVOX の話者 ID（既定 `3` = ずんだもんノーマル）
+- `/stt` は音声を raw WAV body で受け取る。`language`（既定 `ja`）/ `task`（`transcribe` 既定・`translate` 可）はクエリで指定
 
 ## セットアップ（初回のみ）
 
@@ -54,11 +56,27 @@ curl -s -X POST localhost:3000/tts \
 
 VOICEVOX が別ホスト/ポートなら `VOICEVOX_URL`（既定 `http://localhost:50021`）で上書きする。
 
+## 動作確認 `/stt`（要 Whisper、API キー不要・実機不要）
+
+```sh
+# 別ターミナルで自前ホスト Whisper を起動
+docker run -d -p 9000:9000 onerahmet/openai-whisper-asr-webservice:latest
+
+# WAV を文字起こしできることを確認（sample.wav は任意の音声 WAV）
+curl -s -X POST localhost:3000/stt \
+  -H 'content-type: audio/wav' \
+  --data-binary @sample.wav
+# => {"text":"..."}
+```
+
+Whisper が別ホスト/ポートなら `STT_URL`（既定 `http://localhost:9000`）で上書きする。
+
 ## 設計
 
 - `src/chat.ts` — 純粋ロジック（プロンプト組み立て・応答パース＆検証）。ネットワーク非依存で単体テスト可能。
 - `src/tts.ts` — 純粋ロジック（入力検証・話者解決・audio_query 整形・URL 組み立て）。
-- `src/server.ts` — Hono サーバ。環境変数読込→Claude / VOICEVOX 呼び出し→整形のみ。
+- `src/stt.ts` — 純粋ロジック（オプション検証・WAV 検証・/asr URL 組み立て・レスポンス解析）。
+- `src/server.ts` — Hono サーバ。環境変数読込→Claude / VOICEVOX / Whisper 呼び出し→整形のみ。
 
 VOICEVOX 生成音声は話者ごとの規約に従い、配布時は「VOICEVOX:ずんだもん」等のクレジットを明記すること。音声アセットはコミットしない（実行時生成）。
 
@@ -66,3 +84,4 @@ VOICEVOX 生成音声は話者ごとの規約に従い、配布時は「VOICEVOX
 
 - クラウドデプロイ（AWS Lambda / Cloudflare Workers）
 - デバイス側 HTTP クライアント＆応答表示（②-2c）
+- M3b（実機）: M5.Mic 録音→WAV→`/stt`→`/chat`→`/tts` の一巡（聞いて→考えて→喋る）

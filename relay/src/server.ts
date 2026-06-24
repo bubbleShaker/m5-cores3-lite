@@ -10,6 +10,7 @@ import {
   parseTtsRequest,
   synthesisUrl,
 } from "./tts";
+import { asrUrl, parseAsrText, parseSttOptions, validateAudio } from "./stt";
 
 // Node 22+ 標準機能で .env を読み込む（dotenv 依存を増やさない）。
 // 無ければ実環境の環境変数をそのまま使う。
@@ -99,6 +100,46 @@ app.post("/tts", async (c) => {
   } catch (err) {
     console.error("voicevox call failed:", err);
     return c.json({ error: "upstream VOICEVOX call failed" }, 502);
+  }
+});
+
+// 自前ホスト Whisper(docker) の所在。
+// docker run -d -p 9000:9000 onerahmet/openai-whisper-asr-webservice:latest を想定。
+const STT_URL = process.env.STT_URL ?? "http://localhost:9000";
+
+app.post("/stt", async (c) => {
+  // オプション（language/task）はクエリ文字列から拾う。音声本体は raw body で来るため。
+  let opts: ReturnType<typeof parseSttOptions>;
+  try {
+    opts = parseSttOptions(c.req.query());
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+
+  // raw WAV body を読み、純粋ロジックで WAV ヘッダ/容量を検証してから上流へ。
+  const audio = new Uint8Array(await c.req.arrayBuffer());
+  try {
+    validateAudio(audio);
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+
+  try {
+    // Whisper ASR webservice は multipart の audio_file フィールドで音声を受け取る。
+    const form = new FormData();
+    form.append("audio_file", new Blob([audio], { type: "audio/wav" }), "audio.wav");
+
+    const res = await fetch(asrUrl(STT_URL, opts), { method: "POST", body: form });
+    if (!res.ok) {
+      console.error("whisper /asr failed:", res.status);
+      return c.json({ error: "whisper /asr failed" }, 502);
+    }
+    // output=json なので JSON で受ける。壊れていても parseAsrText が空文字に丸める。
+    const json = await res.json().catch(() => null);
+    return c.json({ text: parseAsrText(json) });
+  } catch (err) {
+    console.error("whisper call failed:", err);
+    return c.json({ error: "upstream Whisper call failed" }, 502);
   }
 });
 
