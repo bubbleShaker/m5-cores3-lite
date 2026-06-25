@@ -421,10 +421,17 @@ static bool recordAndTranscribe(std::string& out) {
     // マイクとスピーカーは I2S を共有するため、録音前にスピーカーを止めてマイクを起こす。
     // ※ M5.Mic.begin / M5.Mic.end … 内部マイク(ES7210)の I2S を開始/停止する M5Unified の API。
     M5.Speaker.end();
+    auto micCfg = M5.Mic.config();
+    micCfg.sample_rate = kSttSampleRate;  // 16kHz をマイクにも明示（begin 前に渡す）
+    M5.Mic.config(micCfg);
     if (!M5.Mic.begin()) { M5.Speaker.begin(); return false; }
+    delay(150);  // 起動直後の飽和トランジェントを避けるための整定待ち
 
-    // 固定長を録音し、録り終わるまで同期待ちする（record は非同期に走るので isRecording で待つ）。
+    // 録音は I2S 実時間で進む。record() は非同期にスロットへ積むだけで、isRecording() の
+    // 立ち上がりにレースがある（呼んだ直後は 0 を返しうる＝録り切る前に読んでしまう）。
+    // そこで「サンプル数÷サンプルレート」ぶん必ず待ってから、残りを isRecording() で排出する。
     M5.Mic.record(g_recPcm, kSttRecordSamples, kSttSampleRate);
+    delay((uint32_t)kSttRecordSamples * 1000u / kSttSampleRate + 200);
     while (M5.Mic.isRecording()) { delay(1); }
 
     // マイクを閉じてスピーカーを戻す（次のメェ/発話のため I2S を返す）。
@@ -438,6 +445,8 @@ static bool recordAndTranscribe(std::string& out) {
     HTTPClient http;
     http.begin(sttUrlFromRelay().c_str());
     http.addHeader("Content-Type", "audio/wav");
+    // Whisper の CPU 推論は数秒かかることがあるため、既定5秒では読み取りタイムアウト(-11)する。
+    http.setTimeout(20000);  // 20秒まで待つ
     const int code = http.POST(g_recWav, wavCap);
     if (code != 200) { http.end(); return false; }
 
@@ -589,7 +598,10 @@ static void sheepEnter() {
 }
 static void sheepUpdate(uint32_t now) {
     // 認識バナーの寿命管理：表示から一定時間が過ぎたら消す（一度だけ消去して描き直さない）。
-    if (g_sttShownMs && now - g_sttShownMs > kSttShowMs) {
+    // ※ 引数 now は loop 先頭で取得した値で、録音＋通信で数秒ブロックした後はここに来る頃には
+    //    古くなっている。g_sttShownMs（millis() で記録）との比較に古い now を使うと符号無し演算で
+    //    桁あふれし、描いた直後に即消去されてしまうため、ここでは必ず最新の millis() で判定する。
+    if (g_sttShownMs && millis() - g_sttShownMs > kSttShowMs) {
         clearSttBanner();
         g_sttShownMs = 0;
     }
@@ -665,6 +677,8 @@ int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
+    Serial.begin(115200);  // 診断ログ用（M3b-2 デバッグ）
+    Serial.println("\n[boot] m5-cores3-lite up");
     M5.Display.setRotation(1);
     M5.Display.fillScreen(kColBg);
 
