@@ -234,30 +234,41 @@ static void drawDialog(const std::string& reply, Expression expr) {
     M5.Display.setFont(&fonts::Font0);  // 既定に戻す（他描画への影響回避）
 }
 
-// 中継サーバ(/chat)へ一度だけ問い合わせ、結果を g_reply / g_requestedExpr に格納する（実機依存部）。
-static void fetchGreeting() {
+// 中継 /chat(Claude) に message を投げ、返答を out に格納する（実機依存部）。成否を返す。
+// 起動挨拶(fetchGreeting)と対話ループ(sheepOnTap)の両方から使う共通の問い合わせ部。
+// ※ Claude の推論は数秒かかるため、/stt と同様に既定5秒のタイムアウトを延ばす（既定だと -11）。
+static bool fetchChatReply(const std::string& message, ReplyMessage& out) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
     HTTPClient http;
     http.begin(RELAY_URL);
     http.addHeader("Content-Type", "application/json");
+    http.setTimeout(20000);  // Claude 推論待ち（読み取りタイムアウト回避）
 
     // リクエスト body を ArduinoJson で組み立て（特殊文字も安全にエスケープ）。
     JsonDocument req;
-    req["message"] = "起動したよ。ひとこと挨拶して。";
+    req["message"] = message.c_str();
     std::string body;
     serializeJson(req, body);
 
     const int code = http.POST(String(body.c_str()));
-    if (code == 200) {
-        const String payload = http.getString();
-        const ReplyMessage m = parse_relay_reply(payload.c_str());
+    if (code != 200) { http.end(); return false; }
+    out = parse_relay_reply(http.getString().c_str());
+    http.end();
+    return true;
+}
+
+// 起動挨拶として /chat に一度問い合わせ、結果を g_reply / g_requestedExpr に格納する（実機依存部）。
+static void fetchGreeting() {
+    ReplyMessage m;
+    if (fetchChatReply("起動したよ。ひとこと挨拶して。", m)) {
         g_reply = m.reply;
         g_requestedExpr = m.expression;
     } else {
-        // 失敗時も画面で分かるように（sad 表情でエラーコード表示）。
-        g_reply = std::string("relay error: ") + std::to_string(code);
+        // 失敗時も画面で分かるように（sad 表情）。
+        g_reply = "relay error";
         g_requestedExpr = Expression::Sad;
     }
-    http.end();
     g_exprRequestMs = millis();
     g_hasReply = true;
     g_replyDirty = true;  // 新しい返答が来たので、次フレームでダイアログと表情を必ず描き直す
@@ -641,6 +652,19 @@ static void sheepOnTap(uint32_t now) {
         Serial.printf("[stt] heard: %s\n", heard.c_str());
         drawSttBanner(heard);
         g_sttShownMs = millis();  // 録音に数秒かかるので now ではなく現在時刻を起点にする
+
+        // 聞き取れた言葉を /chat(Claude) に渡し、返答をずんだもん声で喋り返す（対話ループ・#60）。
+        // これで「タップ→喋りかけ→Claudeが考える→ずんだもん声で返答＋ダイアログ表示」が一巡する。
+        ReplyMessage rep;
+        if (!heard.empty() && fetchChatReply(heard, rep)) {
+            Serial.printf("[chat] reply: %s\n", rep.reply.c_str());
+            drawDialog(rep.reply, rep.expression);
+            if (speakTts(rep.reply)) {
+                // 録音＋/chat で数秒経つため、揺れ起点は古い now でなく最新 millis()（#58 と同じ理由）。
+                g_sheepSpeakStart = millis();
+                g_sheepSpeakDur   = speaking_duration_ms(rep.reply.size());
+            }
+        }
     }
 }
 
