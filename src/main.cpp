@@ -290,10 +290,13 @@ static WifiState currentWifiState(uint32_t now) {
 constexpr int kSheepCx = kScreenW / 2;
 constexpr int kSheepCy = kScreenH / 2 + 4;
 // 毎フレーム全体を描き直すための固定クリア枠（bob の振れ幅・足まで含む）。
+// 高さは羊の最下点（bob最大時で canvas-local ≈140px：胴毛の瘤）に小マージンを足した値に
+// 抑える。枠の底を画面 y=44+146=190 手前で止め、返答文領域(drawDialog: y=190〜)と分離する
+// （枠を毎フレーム背景色で塗り直すため、ここが文字に被ると文字が消える）。Issue #62。
 constexpr int kSheepClipX = 56;
 constexpr int kSheepClipY = 44;
 constexpr int kSheepClipW = 208;
-constexpr int kSheepClipH = 170;
+constexpr int kSheepClipH = 146;
 
 // 羊の色（RGB565）。
 constexpr uint16_t kColWool      = TFT_WHITE;
