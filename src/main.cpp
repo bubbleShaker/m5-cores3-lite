@@ -11,6 +11,7 @@
 #include "gesture.h"  // touch_update（短タップ/長押し検出・純粋ロジック）
 #include "scene.h"    // next_scene（シーン巡回・純粋ロジック）
 #include "voice.h"    // voice_baa_pcm（メェの PCM 合成・純粋ロジック）
+#include "gem.h"      // Gem / gem_count / gem_at（宝石図鑑データ・純粋ロジック）
 #include "wav.h"      // parse_wav_header（/tts の WAV から PCM を取り出す・純粋ロジック）
 #include "net.h"
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
@@ -580,6 +581,126 @@ static void drawFlowField(uint32_t seed, float t) {
     cv.pushSprite(&M5.Display, 0, 0);
 }
 
+// ───────── 宝石図鑑シーン（テーマ N / epic #27・P3 / Issue #66） ─────────
+// 「タップで開くカード」の最初の具体形。純粋データ層 gem（#64）を実機画面に出す。
+// 宝石スプライトは画像アセットを持たず、gem->color を明暗にシェードしてカット面を手続き生成する。
+// カードは動かないので静的描画（enter/タップ時だけ描き、毎フレームは描かない）。
+
+// 宝石スプライトの配置（rotation(1) の 320x240。上段中央に置き、下段に情報テキストを敷く）。
+constexpr int kGemCx = kScreenW / 2;  // スプライト中心X
+constexpr int kGemCy = 78;            // スプライト中心Y（テーブル面の基準）
+constexpr int kGemHalfW   = 44;       // girdle（最大幅）の半幅
+constexpr int kGemTableHW = 22;       // テーブル面（上の平面）の半幅
+constexpr int kGemCrownH   = 20;      // テーブルから girdle までの高さ（クラウン）
+constexpr int kGemPavilionH = 40;     // girdle から先端までの高さ（パビリオン）
+
+// RGB565 を明暗にシェードする（pct=100 で原色、>100 で明るく、<100 で暗く）。
+// 565 から r5/g6/b5 を取り出して各チャンネルを pct 倍し、飽和クランプして詰め直す（純粋な色演算）。
+static uint16_t gemShade(uint16_t c, int pct) {
+    int r = (c >> 11) & 0x1F;
+    int g = (c >> 5)  & 0x3F;
+    int b =  c        & 0x1F;
+    r = r * pct / 100; if (r > 31) r = 31;
+    g = g * pct / 100; if (g > 63) g = 63;
+    b = b * pct / 100; if (b > 31) b = 31;
+    return static_cast<uint16_t>((r << 11) | (g << 5) | b);
+}
+
+// ちらつき防止のオフスクリーン・キャンバス（羊/アートと同じ作法）。タップ毎にカード全体を
+// 描き替えるので、画面に直接 fillScreen すると黒の点滅が見える。キャンバスに全部描いてから
+// 一括 pushSprite する。フルスクリーン(320x240x2≒150KB)なので PSRAM に確保する。
+static M5Canvas g_gemCanvas(&M5.Display);
+
+// カット宝石を1つ描く。中心(cx,cy)を基準に、テーブル(上面)＋クラウン＋パビリオン(下の錐)を
+// 三角形の面で塗り分け、面の境界線を暗いシェードで描いて「カット」を表現する。
+// 光源を右上に仮定し、右面を明るく・左面を暗くして立体感を出す。
+// 描画先は LovyanGFX（M5.Display と M5Canvas の共通基底）で受け、画面/キャンバスどちらにも描ける。
+static void drawGemSprite(LovyanGFX& gfx, int cx, int cy, const Gem& g) {
+    const uint16_t base  = g.color;
+    const uint16_t light = gemShade(base, 150);  // 明るい面（光が当たる側）
+    const uint16_t mid   = base;                 // 中間の面
+    const uint16_t dark  = gemShade(base, 62);   // 影の面
+    const uint16_t edge  = gemShade(base, 40);   // 面の境界線（最も暗い）
+
+    // 頂点（ローカル→画面座標）。A,B=テーブル左右上端 / E,C=girdle 左右 / D=先端 / G=girdle 中央。
+    const int Ax = cx - kGemTableHW, Ay = cy - kGemCrownH;
+    const int Bx = cx + kGemTableHW, By = cy - kGemCrownH;
+    const int Ex = cx - kGemHalfW,   Ey = cy;
+    const int Cx = cx + kGemHalfW,   Cy = cy;
+    const int Dx = cx,               Dy = cy + kGemPavilionH;
+    const int Gx = cx,               Gy = cy;
+
+    // 面を塗る（テーブル＝最も明るい、左面＝暗い、右面＝中間で立体感）。
+    gfx.fillTriangle(Ax, Ay, Bx, By, Gx, Gy, light);  // テーブル
+    gfx.fillTriangle(Ax, Ay, Gx, Gy, Ex, Ey, dark);   // 左クラウン
+    gfx.fillTriangle(Bx, By, Cx, Cy, Gx, Gy, mid);    // 右クラウン
+    gfx.fillTriangle(Ex, Ey, Gx, Gy, Dx, Dy, dark);   // 左パビリオン
+    gfx.fillTriangle(Gx, Gy, Cx, Cy, Dx, Dy, mid);    // 右パビリオン
+
+    // 面の境界線（カットの稜線）を暗いシェードで描く。
+    gfx.drawLine(Ax, Ay, Bx, By, edge);  // テーブル上辺
+    gfx.drawLine(Bx, By, Cx, Cy, edge);  // 右肩
+    gfx.drawLine(Cx, Cy, Dx, Dy, edge);  // 右下辺
+    gfx.drawLine(Dx, Dy, Ex, Ey, edge);  // 左下辺
+    gfx.drawLine(Ex, Ey, Ax, Ay, edge);  // 左肩
+    gfx.drawLine(Ex, Ey, Cx, Cy, edge);  // girdle 線
+    gfx.drawLine(Ax, Ay, Gx, Gy, edge);  // 内側の稜線（左）
+    gfx.drawLine(Bx, By, Gx, Gy, edge);  // 内側の稜線（右）
+    gfx.drawLine(Gx, Gy, Dx, Dy, edge);  // 中央の稜線（縦）
+}
+
+// 情報テキストの基準（中央寄せで段組み）。和文は lgfxJapanGothic を使う。
+// 名前はスプライト先端(kGemCy+kGemPavilionH=118)より十分下から始め、稜線と被らせない。
+constexpr int kGemNameY = 136;  // 名前（大・中心Y）
+constexpr int kGemInfoY = 164;  // 以降の明細をこの間隔で並べる
+constexpr int kGemInfoStep = 23;
+
+// 宝石カードを1枚 gfx（画面 or キャンバス）へ描く（スプライト＋名前＋産地/組成/元素＋通し番号）。
+// 背景クリアも gfx に対して行うので、呼び出し側でのクリアは不要。
+static void drawGemCard(LovyanGFX& gfx, const Gem& g, int index, int total) {
+    gfx.fillScreen(kColBg);  // キャンバス全体を背景色で初期化（画面なら全消去）
+
+    // ヘッダ（図鑑名・左上）。
+    gfx.setFont(&fonts::lgfxJapanGothic_16);
+    gfx.setTextColor(TFT_CYAN, kColBg);
+    gfx.setTextDatum(textdatum_t::top_left);
+    gfx.drawString("宝石図鑑", 6, 4);
+    // 通し番号（右上）。色は前段に依存させず明示する。
+    gfx.setFont(&fonts::Font0);
+    gfx.setTextColor(TFT_CYAN, kColBg);
+    gfx.setTextSize(2);
+    gfx.setTextDatum(textdatum_t::top_right);
+    char idx[12];
+    snprintf(idx, sizeof(idx), "%d/%d", index + 1, total);
+    gfx.drawString(idx, kScreenW - 6, 4);
+    gfx.setTextSize(1);
+
+    // 宝石スプライト。
+    drawGemSprite(gfx, kGemCx, kGemCy, g);
+
+    // 名前（大・中央寄せ）。
+    gfx.setTextDatum(textdatum_t::middle_center);
+    gfx.setFont(&fonts::lgfxJapanGothic_24);
+    gfx.setTextColor(TFT_WHITE, kColBg);
+    gfx.drawString(g.name, kGemCx, kGemNameY);
+
+    // 明細（産地→組成→元素）を中央寄せで縦に並べる。
+    gfx.setFont(&fonts::lgfxJapanGothic_16);
+    gfx.setTextColor(TFT_WHITE, kColBg);
+    const std::string lines[] = {
+        std::string("産地: ") + g.locality,
+        std::string("組成: ") + g.formula,
+        std::string("元素: ") + g.elements,
+    };
+    for (int i = 0; i < 3; ++i) {
+        gfx.drawString(lines[i].c_str(), kGemCx, kGemInfoY + i * kGemInfoStep);
+    }
+
+    // 後続の描画（他シーンの print/setCursor 系）に影響しないよう既定へ戻す。
+    gfx.setFont(&fonts::Font0);
+    gfx.setTextDatum(textdatum_t::top_left);
+}
+
 // ───────── シーン状態機械（Issue #33：実行時シーン切替の基盤） ─────────
 // 各シーンを「enter/update/onTap」の関数ポインタに揃え、配列で持つ。
 // マネージャは現在の index を1つだけ握り、長押し(LongPress)で next_scene により次へ巡回、
@@ -693,10 +814,38 @@ static void artOnTap(uint32_t /*now*/) {
     g_artT    = 0.0f;
 }
 
+// --- 宝石図鑑シーンの状態とアダプタ（静的カード・タップで次の宝石） ---
+int g_gemIdx = 0;  // 現在表示中の宝石番号（next_scene で巡回する）
+
+static void gemDrawCurrent() {
+    const Gem* g = gem_at(g_gemIdx);
+    if (!g) { M5.Display.fillScreen(kColBg); return; }  // 図鑑が空（通常起きない）の安全側
+    // キャンバスへ全部描いてから一括転送（途中状態を画面に出さない＝点滅させない）。
+    drawGemCard(g_gemCanvas, *g, g_gemIdx, gem_count());
+    g_gemCanvas.pushSprite(&M5.Display, 0, 0);
+}
+static void gemEnter() {
+    // キャンバスは初回だけ PSRAM に確保（約150KB）。アートと同じ作法。
+    if (!g_gemCanvas.getBuffer()) {
+        g_gemCanvas.setPsram(true);
+        g_gemCanvas.createSprite(kScreenW, kScreenH);
+    }
+    gemDrawCurrent();  // シーンに入ったら現在の宝石カードを1回描く
+}
+static void gemUpdate(uint32_t /*now*/) {
+    // 静的カードなので毎フレームは描かない（タップ時だけ再描画）。
+}
+static void gemOnTap(uint32_t /*now*/) {
+    // 次の宝石へ。巡回は実装済みの next_scene を流用する（新規ロジックを作らない）。
+    g_gemIdx = next_scene(g_gemIdx, gem_count());
+    gemDrawCurrent();
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
 const SceneDef kScenes[] = {
     { sheepEnter, sheepUpdate, sheepOnTap },
     { artEnter,   artUpdate,   artOnTap   },
+    { gemEnter,   gemUpdate,   gemOnTap   },
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
