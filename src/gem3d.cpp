@@ -58,6 +58,34 @@ float gem3d_face_depth(const Vec3& a, const Vec3& b, const Vec3& c) {
     return (a.z + b.z + c.z) / 3.0f;
 }
 
+// 面の外向き法線（正規化）。(b-a)×(c-a) を求めて単位長に割り戻す。
+Vec3 gem3d_face_normal(const Vec3& a, const Vec3& b, const Vec3& c) {
+    float ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+    float vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+    // 外積 u×v。
+    float nx = uy * vz - uz * vy;
+    float ny = uz * vx - ux * vz;
+    float nz = ux * vy - uy * vx;
+    float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (len <= 0.0f) {
+        return Vec3{0.0f, 0.0f, 0.0f};  // 退化面（面積0）。明るさ0として安全に倒す。
+    }
+    return Vec3{nx / len, ny / len, nz / len};
+}
+
+// 面の明るさ係数 [0,1]。法線と光方向を正規化して内積を取り、負は0にクランプする。
+float gem3d_face_brightness(const Vec3& normal, const Vec3& light) {
+    float nlen = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+    float llen = std::sqrt(light.x * light.x + light.y * light.y + light.z * light.z);
+    if (nlen <= 0.0f || llen <= 0.0f) {
+        return 0.0f;  // どちらかが零ベクトル＝向きが定義できない。明るさ0。
+    }
+    float dot = (normal.x * light.x + normal.y * light.y + normal.z * light.z) / (nlen * llen);
+    if (dot < 0.0f) return 0.0f;  // 裏から当たる光は当たらない扱い。
+    if (dot > 1.0f) return 1.0f;  // 数値誤差での>1を抑える。
+    return dot;
+}
+
 // 正八面体の静的データ。
 // 頂点は各軸の±単位ベクトル: 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z。
 static const Vec3 kOctaVerts[] = {
