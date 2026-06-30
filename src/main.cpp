@@ -12,6 +12,7 @@
 #include "scene.h"    // next_scene（シーン巡回・純粋ロジック）
 #include "voice.h"    // voice_baa_pcm（メェの PCM 合成・純粋ロジック）
 #include "gem.h"      // Gem / gem_count / gem_at（宝石図鑑データ・純粋ロジック）
+#include "gem3d.h"    // gem3d_*（宝石3D回転の純粋数学：回転/投影/カリング/法線/明るさ）
 #include "wav.h"      // parse_wav_header（/tts の WAV から PCM を取り出す・純粋ロジック）
 #include "net.h"
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
@@ -586,16 +587,19 @@ static void drawFlowField(uint32_t seed, float t) {
 // 宝石スプライトは画像アセットを持たず、gem->color を明暗にシェードしてカット面を手続き生成する。
 // カードは動かないので静的描画（enter/タップ時だけ描き、毎フレームは描かない）。
 
-// 宝石スプライトの配置（rotation(1) の 320x240。上段中央に置き、下段に情報テキストを敷く）。
-constexpr int kGemCx = kScreenW / 2;  // スプライト中心X
-constexpr int kGemCy = 78;            // スプライト中心Y（テーブル面の基準）
-constexpr int kGemHalfW   = 44;       // girdle（最大幅）の半幅
-constexpr int kGemTableHW = 22;       // テーブル面（上の平面）の半幅
-constexpr int kGemCrownH   = 20;      // テーブルから girdle までの高さ（クラウン）
-constexpr int kGemPavilionH = 40;     // girdle から先端までの高さ（パビリオン）
+// 宝石3D表示の配置（rotation(1) の 320x240。上段中央に置き、下段に情報テキストを敷く）。
+// 回転宝石は専用の小スプライトに毎フレーム描いて push する（カード本体は静止＝再描画しない）。
+constexpr int kGemCx   = kScreenW / 2;  // 3D宝石の中心X（画面座標）
+// 中心Y。スプライトは不透明な黒矩形で push されるため、その下端(kGemCy+kGemHalf)が
+// 名前テキスト上端(=kGemNameY-12)に届くと文字の頭を毎フレーム消す。62+58=120 で 124 の手前に収める。
+constexpr int kGemCy   = 62;            // 3D宝石の中心Y（黒矩形下端120 < 名前上端124）
+constexpr int kGemHalf = 58;            // 回転スプライトの半辺（116x116 の正方）。投影拡大も収まる
+constexpr float kGemR  = 42.0f;         // 投影正規化座標→画素のスケール（girdle 相当の見かけ半径）
+constexpr float kGemCamD = 5.0f;        // 透視投影の焦点距離（z∈[-1,1]の単位メッシュで安全な距離）
 
 // RGB565 を明暗にシェードする（pct=100 で原色、>100 で明るく、<100 で暗く）。
 // 565 から r5/g6/b5 を取り出して各チャンネルを pct 倍し、飽和クランプして詰め直す（純粋な色演算）。
+// 3D面のフラットシェーディング（面ごとの明るさ%）に使う。
 static uint16_t gemShade(uint16_t c, int pct) {
     int r = (c >> 11) & 0x1F;
     int g = (c >> 5)  & 0x3F;
@@ -606,47 +610,84 @@ static uint16_t gemShade(uint16_t c, int pct) {
     return static_cast<uint16_t>((r << 11) | (g << 5) | b);
 }
 
-// ちらつき防止のオフスクリーン・キャンバス（羊/アートと同じ作法）。タップ毎にカード全体を
-// 描き替えるので、画面に直接 fillScreen すると黒の点滅が見える。キャンバスに全部描いてから
-// 一括 pushSprite する。フルスクリーン(320x240x2≒150KB)なので PSRAM に確保する。
+// カード本体（背景＋テキスト）用のフルスクリーン・キャンバス（羊/アートと同じ作法）。
+// 宝石送り時だけ描き替え一括 push する。フルスクリーン(320x240x2≒150KB)なので PSRAM に確保する。
 static M5Canvas g_gemCanvas(&M5.Display);
 
-// カット宝石を1つ描く。中心(cx,cy)を基準に、テーブル(上面)＋クラウン＋パビリオン(下の錐)を
-// 三角形の面で塗り分け、面の境界線を暗いシェードで描いて「カット」を表現する。
-// 光源を右上に仮定し、右面を明るく・左面を暗くして立体感を出す。
-// 描画先は LovyanGFX（M5.Display と M5Canvas の共通基底）で受け、画面/キャンバスどちらにも描ける。
-static void drawGemSprite(LovyanGFX& gfx, int cx, int cy, const Gem& g) {
-    const uint16_t base  = g.color;
-    const uint16_t light = gemShade(base, 150);  // 明るい面（光が当たる側）
-    const uint16_t mid   = base;                 // 中間の面
-    const uint16_t dark  = gemShade(base, 62);   // 影の面
-    const uint16_t edge  = gemShade(base, 40);   // 面の境界線（最も暗い）
+// 回転宝石だけを描く小スプライト（116x116x2≒27KB）。毎フレーム描き替えるので、
+// 速い内蔵RAMに置く（PSRAM 指定しない＝fillTriangle が速い）。カード本体の上に push する。
+static M5Canvas g_gem3dCanvas(&M5.Display);
 
-    // 頂点（ローカル→画面座標）。A,B=テーブル左右上端 / E,C=girdle 左右 / D=先端 / G=girdle 中央。
-    const int Ax = cx - kGemTableHW, Ay = cy - kGemCrownH;
-    const int Bx = cx + kGemTableHW, By = cy - kGemCrownH;
-    const int Ex = cx - kGemHalfW,   Ey = cy;
-    const int Cx = cx + kGemHalfW,   Cy = cy;
-    const int Dx = cx,               Dy = cy + kGemPavilionH;
-    const int Gx = cx,               Gy = cy;
+// 光源（宝石が向く方向＝面法線がこちらを向くほど明るい）。math座標(y上/+xが右)。
+// z=-1 はカメラ側（手前）、+y/+x で右上から差す。実機で見栄えを微調整する係数。
+static const Vec3 kGemLight{0.45f, 0.55f, -1.0f};
 
-    // 面を塗る（テーブル＝最も明るい、左面＝暗い、右面＝中間で立体感）。
-    gfx.fillTriangle(Ax, Ay, Bx, By, Gx, Gy, light);  // テーブル
-    gfx.fillTriangle(Ax, Ay, Gx, Gy, Ex, Ey, dark);   // 左クラウン
-    gfx.fillTriangle(Bx, By, Cx, Cy, Gx, Gy, mid);    // 右クラウン
-    gfx.fillTriangle(Ex, Ey, Gx, Gy, Dx, Dy, dark);   // 左パビリオン
-    gfx.fillTriangle(Gx, Gy, Cx, Cy, Dx, Dy, mid);    // 右パビリオン
+// ローポリ宝石を1フレーム分、スプライト spr に描く（フラットシェーディング・ソフトレンダ）。
+//   spr の中心を宝石の中心とし、メッシュ mesh をオイラー角 (ax,ay,az) で回して投影し、
+//   裏面カリング→奥行きソート（ペインターズ）→面ごとの明暗で fillTriangle する。
+//   色 color（RGB565）を面の明るさでシェードして宝石色を反映する。
+//   3D数学は純粋ロジック層 gem3d に委譲し、ここは描画（実機依存）だけを担う。
+static void drawGem3d(M5Canvas& spr, const Mesh& mesh,
+                      float ax, float ay, float az, uint16_t color) {
+    const int cx = spr.width()  / 2;
+    const int cy = spr.height() / 2;
 
-    // 面の境界線（カットの稜線）を暗いシェードで描く。
-    gfx.drawLine(Ax, Ay, Bx, By, edge);  // テーブル上辺
-    gfx.drawLine(Bx, By, Cx, Cy, edge);  // 右肩
-    gfx.drawLine(Cx, Cy, Dx, Dy, edge);  // 右下辺
-    gfx.drawLine(Dx, Dy, Ex, Ey, edge);  // 左下辺
-    gfx.drawLine(Ex, Ey, Ax, Ay, edge);  // 左肩
-    gfx.drawLine(Ex, Ey, Cx, Cy, edge);  // girdle 線
-    gfx.drawLine(Ax, Ay, Gx, Gy, edge);  // 内側の稜線（左）
-    gfx.drawLine(Bx, By, Gx, Gy, edge);  // 内側の稜線（右）
-    gfx.drawLine(Gx, Gy, Dx, Dy, edge);  // 中央の稜線（縦）
+    // 容量上限（八面体は6頂点/8面）。将来のローポリ拡張に少し余裕を持たせた固定長バッファ。
+    constexpr int kMaxV     = 16;  // 頂点バッファ rot/proj/ok の長さ
+    constexpr int kMaxFaces = 32;  // 可視面バッファ faces の長さ
+    // 容量を超えるメッシュは固定長バッファを溢れさせる（面ループが頂点インデックスで添字するため
+    // vcount だけでなく実インデックスも kMaxV 未満が前提）。安全側に描画を諦める。
+    if (mesh.vcount > kMaxV || mesh.tcount > kMaxFaces) return;
+
+    // 1) 全頂点を回して投影する。投影不能（カメラ手前 denom<=0）はフラグで弾く（M1申し送り1）。
+    //    単位メッシュ＋d=5 では発火しないが、面が中心に潰れる事故を運用として防ぐ。
+    Vec3 rot[kMaxV];
+    Vec2 proj[kMaxV];
+    bool ok[kMaxV];
+    for (int i = 0; i < mesh.vcount && i < kMaxV; ++i) {
+        rot[i]  = gem3d_rotate(mesh.verts[i], ax, ay, az);
+        proj[i] = gem3d_project(rot[i], kGemCamD);
+        ok[i]   = (kGemCamD + rot[i].z) > 0.0f;  // 投影可能か（gem3d_project と同じ判定）
+    }
+
+    // 2) 表向きの面だけ集め、代表深さで奥→手前にソートする。
+    //    カリングは投影座標（math座標・y上）で行い、M1テストの巻き順規約と整合させる（申し送り2）。
+    struct Face { int tri; float depth; };
+    Face faces[kMaxFaces];
+    int fn = 0;
+    for (int i = 0; i < mesh.tcount && fn < kMaxFaces; ++i) {
+        const Tri& t = mesh.tris[i];
+        if (!ok[t.a] || !ok[t.b] || !ok[t.c]) continue;            // 投影不能頂点を含む面は捨てる
+        if (gem3d_is_backface(proj[t.a], proj[t.b], proj[t.c])) continue;  // 裏面カリング
+        faces[fn].tri   = i;
+        faces[fn].depth = gem3d_face_depth(rot[t.a], rot[t.b], rot[t.c]);
+        ++fn;
+    }
+    // 挿入ソートで深さ降順（z大＝奥が先）。面数 ≤ 8 なので軽い。
+    for (int i = 1; i < fn; ++i) {
+        Face key = faces[i];
+        int j = i - 1;
+        while (j >= 0 && faces[j].depth < key.depth) { faces[j + 1] = faces[j]; --j; }
+        faces[j + 1] = key;
+    }
+
+    // 3) 奥から塗る。面法線×光で明るさ[0,1]を出し、環境光を足してシェード率に変換する。
+    //    画面は y 下向きなので投影 y を反転して画素座標へ（カリングは上で math 座標済み＝符号一貫）。
+    for (int k = 0; k < fn; ++k) {
+        const Tri& t = mesh.tris[faces[k].tri];
+        Vec3  n   = gem3d_face_normal(rot[t.a], rot[t.b], rot[t.c]);
+        float br  = gem3d_face_brightness(n, kGemLight);   // [0,1]：1=正面から受光
+        int   pct = 45 + static_cast<int>(br * 115.0f);    // 環境光45% + 拡散最大115% → [45,160]
+        uint16_t col = gemShade(color, pct);
+
+        const int axp = cx + static_cast<int>(proj[t.a].x * kGemR);
+        const int ayp = cy - static_cast<int>(proj[t.a].y * kGemR);  // y反転（math上→画面下）
+        const int bxp = cx + static_cast<int>(proj[t.b].x * kGemR);
+        const int byp = cy - static_cast<int>(proj[t.b].y * kGemR);
+        const int cxp = cx + static_cast<int>(proj[t.c].x * kGemR);
+        const int cyp = cy - static_cast<int>(proj[t.c].y * kGemR);
+        spr.fillTriangle(axp, ayp, bxp, byp, cxp, cyp, col);
+    }
 }
 
 // 情報テキストの基準（中央寄せで段組み）。和文は lgfxJapanGothic を使う。
@@ -675,8 +716,8 @@ static void drawGemCard(LovyanGFX& gfx, const Gem& g, int index, int total) {
     gfx.drawString(idx, kScreenW - 6, 4);
     gfx.setTextSize(1);
 
-    // 宝石スプライト。
-    drawGemSprite(gfx, kGemCx, kGemCy, g);
+    // 宝石本体（上段中央）は回転する 3D スプライトが毎フレーム上書きするので、ここでは描かない。
+    // （背景色のまま残し、その上に g_gem3dCanvas を push する）
 
     // 名前（大・中央寄せ）。
     gfx.setTextDatum(textdatum_t::middle_center);
@@ -814,31 +855,48 @@ static void artOnTap(uint32_t /*now*/) {
     g_artT    = 0.0f;
 }
 
-// --- 宝石図鑑シーンの状態とアダプタ（静的カード・タップで次の宝石） ---
-int g_gemIdx = 0;  // 現在表示中の宝石番号（next_scene で巡回する）
+// --- 宝石図鑑シーンの状態とアダプタ（3D回転宝石・タップで次の宝石） ---
+int   g_gemIdx = 0;     // 現在表示中の宝石番号（next_scene で巡回する）
+float g_gemAngX = 0.3f; // 宝石の回転角（x軸・わずかに傾けて立体感を出す）
+float g_gemAngY = 0.0f; // 宝石の回転角（y軸・主回転。毎フレーム進めて回す）
 
-static void gemDrawCurrent() {
+// y軸を主に回し、x軸はゆっくり傾ける（約30fps前提の1フレーム増分）。
+constexpr float kGemSpinY = 0.045f;  // ≈1.35 rad/s → 1周およそ4.6秒
+constexpr float kGemSpinX = 0.013f;  // ゆっくり首振り
+
+// カード本体（背景＋名前＋明細）を描いて一括 push する。宝石送り時とシーン入場時だけ呼ぶ。
+static void gemDrawCard() {
     const Gem* g = gem_at(g_gemIdx);
     if (!g) { M5.Display.fillScreen(kColBg); return; }  // 図鑑が空（通常起きない）の安全側
-    // キャンバスへ全部描いてから一括転送（途中状態を画面に出さない＝点滅させない）。
     drawGemCard(g_gemCanvas, *g, g_gemIdx, gem_count());
     g_gemCanvas.pushSprite(&M5.Display, 0, 0);
 }
 static void gemEnter() {
-    // キャンバスは初回だけ PSRAM に確保（約150KB）。アートと同じ作法。
+    // カード本体キャンバスは初回だけ PSRAM に確保（約150KB）。アートと同じ作法。
     if (!g_gemCanvas.getBuffer()) {
         g_gemCanvas.setPsram(true);
         g_gemCanvas.createSprite(kScreenW, kScreenH);
     }
-    gemDrawCurrent();  // シーンに入ったら現在の宝石カードを1回描く
+    // 回転宝石スプライトは初回だけ内蔵RAMに確保（約27KB・毎フレーム描くので速いRAMに）。
+    if (!g_gem3dCanvas.getBuffer()) {
+        g_gem3dCanvas.createSprite(kGemHalf * 2, kGemHalf * 2);
+    }
+    gemDrawCard();  // シーンに入ったらカード本体を1回描く（以後 update が宝石だけ上書き）
 }
 static void gemUpdate(uint32_t /*now*/) {
-    // 静的カードなので毎フレームは描かない（タップ時だけ再描画）。
+    // 宝石を少し回してから、専用スプライトに描いてカード本体の上へ push する。
+    g_gemAngY += kGemSpinY;
+    g_gemAngX += kGemSpinX;
+    const Gem* g = gem_at(g_gemIdx);
+    if (!g) return;
+    g_gem3dCanvas.fillScreen(kColBg);  // カード背景と同色でクリア（push 後に枠が出ないよう）
+    drawGem3d(g_gem3dCanvas, gem3d_octahedron(), g_gemAngX, g_gemAngY, 0.0f, g->color);
+    g_gem3dCanvas.pushSprite(&M5.Display, kGemCx - kGemHalf, kGemCy - kGemHalf);
 }
 static void gemOnTap(uint32_t /*now*/) {
     // 次の宝石へ。巡回は実装済みの next_scene を流用する（新規ロジックを作らない）。
     g_gemIdx = next_scene(g_gemIdx, gem_count());
-    gemDrawCurrent();
+    gemDrawCard();  // 名前・明細・通し番号を更新（宝石本体は直後の update が描く）
 }
 
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。

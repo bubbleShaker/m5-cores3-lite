@@ -167,6 +167,80 @@ void test_octahedron_faces_outward() {
     }
 }
 
+// 面法線は (b-a)×(c-a) を正規化したもの。xy平面の表向き三角形なら +z 単位ベクトル。
+void test_face_normal_basic() {
+    Vec3 n = gem3d_face_normal(Vec3{0.0f, 0.0f, 0.0f}, Vec3{1.0f, 0.0f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, n.x);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, n.y);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 1.0f, n.z);
+}
+
+// 法線は常に単位長（任意の三角形でノルム1）。
+void test_face_normal_is_unit() {
+    Vec3 n = gem3d_face_normal(Vec3{1.0f, 0.0f, 2.0f}, Vec3{0.0f, 3.0f, 1.0f}, Vec3{-2.0f, 1.0f, 0.0f});
+    float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 1.0f, len);
+}
+
+// 退化面（3点が一直線）は法線が定義できず零ベクトル。
+void test_face_normal_degenerate_is_zero() {
+    Vec3 n = gem3d_face_normal(Vec3{0.0f, 0.0f, 0.0f}, Vec3{1.0f, 1.0f, 1.0f}, Vec3{2.0f, 2.0f, 2.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, n.x);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, n.y);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, n.z);
+}
+
+// 正八面体の各面の外向き法線は重心方向と同じ側（内積>0）を向く。
+void test_face_normal_octahedron_outward() {
+    Mesh m = gem3d_octahedron();
+    for (int i = 0; i < m.tcount; ++i) {
+        const Vec3& a = m.verts[m.tris[i].a];
+        const Vec3& b = m.verts[m.tris[i].b];
+        const Vec3& c = m.verts[m.tris[i].c];
+        Vec3 n = gem3d_face_normal(a, b, c);
+        float gx = (a.x + b.x + c.x) / 3.0f;
+        float gy = (a.y + b.y + c.y) / 3.0f;
+        float gz = (a.z + b.z + c.z) / 3.0f;
+        TEST_ASSERT_TRUE(n.x * gx + n.y * gy + n.z * gz > 0.0f);
+    }
+}
+
+// 正面から光が当たる（法線と光が同方向）と明るさ1。
+void test_brightness_full_when_aligned() {
+    float b = gem3d_face_brightness(Vec3{0.0f, 0.0f, 1.0f}, Vec3{0.0f, 0.0f, 1.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 1.0f, b);
+}
+
+// 真横（直交）は明るさ0。
+void test_brightness_zero_when_perpendicular() {
+    float b = gem3d_face_brightness(Vec3{0.0f, 0.0f, 1.0f}, Vec3{1.0f, 0.0f, 0.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, b);
+}
+
+// 裏から当たる光（内積が負）は0にクランプ。
+void test_brightness_clamped_when_backlit() {
+    float b = gem3d_face_brightness(Vec3{0.0f, 0.0f, 1.0f}, Vec3{0.0f, 0.0f, -1.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, b);
+}
+
+// 入力は内部で正規化される（長さの違う光ベクトルでも cos は同じ）。
+void test_brightness_normalizes_inputs() {
+    float b = gem3d_face_brightness(Vec3{0.0f, 0.0f, 2.0f}, Vec3{0.0f, 0.0f, 5.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 1.0f, b);
+}
+
+// 零ベクトル（退化面の法線など）は明るさ0で安全に倒す。
+void test_brightness_zero_vector_is_zero() {
+    float b = gem3d_face_brightness(Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 0.0f, 1.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, b);
+}
+
+// 45度から当たる光は cos45° ≈ 0.707。
+void test_brightness_partial_angle() {
+    float b = gem3d_face_brightness(Vec3{0.0f, 0.0f, 1.0f}, Vec3{0.0f, 1.0f, 1.0f});
+    TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.70710678f, b);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_rotate_zero_is_identity);
@@ -186,5 +260,15 @@ int main(int, char**) {
     RUN_TEST(test_octahedron_counts);
     RUN_TEST(test_octahedron_indices_in_range);
     RUN_TEST(test_octahedron_faces_outward);
+    RUN_TEST(test_face_normal_basic);
+    RUN_TEST(test_face_normal_is_unit);
+    RUN_TEST(test_face_normal_degenerate_is_zero);
+    RUN_TEST(test_face_normal_octahedron_outward);
+    RUN_TEST(test_brightness_full_when_aligned);
+    RUN_TEST(test_brightness_zero_when_perpendicular);
+    RUN_TEST(test_brightness_clamped_when_backlit);
+    RUN_TEST(test_brightness_normalizes_inputs);
+    RUN_TEST(test_brightness_zero_vector_is_zero);
+    RUN_TEST(test_brightness_partial_angle);
     return UNITY_END();
 }
