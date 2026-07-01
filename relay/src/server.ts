@@ -20,6 +20,14 @@ import {
 } from "./pokemon";
 import { rgbaToRgb565, SPRITE_SIZE, spriteUrl } from "./sprite";
 import sharp from "sharp";
+import {
+  cryUrl,
+  ffmpegArgs,
+  MAX_CRY_BYTES,
+  WAV_HEADER_SIZE,
+  writeWavHeader,
+} from "./cry";
+import { runTranscode } from "./transcode";
 
 // Node 22+ 標準機能で .env を読み込む（dotenv 依存を増やさない）。
 // 無ければ実環境の環境変数をそのまま使う。
@@ -256,6 +264,74 @@ app.get("/pokemon/sprite/:id", async (c) => {
   } catch (err) {
     console.error("sprite conversion failed:", err);
     return c.json({ error: "sprite conversion failed" }, 502);
+  }
+});
+
+// 鳴き声 OGG の所在。PokeAPI/cries の "latest"（全世代カバー）。
+const CRY_BASE_URL =
+  process.env.CRY_BASE_URL ??
+  "https://raw.githubusercontent.com/PokeAPI/cries/main/cries/pokemon/latest";
+
+// FFmpeg 実行ファイル名（PATH 解決）。環境により差し替え可能に。
+const FFMPEG_BIN = process.env.FFMPEG_BIN ?? "ffmpeg";
+
+// FFmpeg 変換のタイムアウト（ms）。無応答の子プロセスをゾンビ化させないための門番。
+// 鳴き声は 1 秒程度なので 10 秒あれば十分な余裕がある。
+const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS ?? 10000);
+
+// stderr の蓄積上限。異常時に無制限連結して暴走しないよう先頭のみ保持する。
+const FFMPEG_STDERR_CAP = 4096;
+
+// 図鑑番号 → WAV バイト列のオンメモリキャッシュ（1件 ~30-64KB）。
+// info/sprite と同じくプロセス再起動でクリア・永続化しない（fair-use / ライセンス方針）。
+// キーは検証済み id（1..1025）に閉じ、値も MAX_CRY_BYTES 以下なので有界。
+const cryCache = new Map<number, Uint8Array<ArrayBuffer>>();
+
+// OGG バイト列を FFmpeg 子プロセスで 16kHz/mono/16bit 生 PCM へ変換する（副作用）。
+// 一時ファイルを作らず stdin/stdout パイプでメモリ上完結させる。
+// タイムアウト・出力サイズ上限・ゾンビ対策は runTranscode に集約（単体テスト可能）。
+function transcodeOggToPcm(ogg: Uint8Array): Promise<Uint8Array> {
+  return runTranscode(ogg, {
+    bin: FFMPEG_BIN,
+    args: ffmpegArgs(),
+    // WAV ヘッダ分を除いた PCM 上限。最終 WAV が MAX_CRY_BYTES 以内に収まる。
+    maxOutputBytes: MAX_CRY_BYTES - WAV_HEADER_SIZE,
+    timeoutMs: FFMPEG_TIMEOUT_MS,
+    stderrCap: FFMPEG_STDERR_CAP,
+  });
+}
+
+app.get("/pokemon/cry/:id", async (c) => {
+  // 図鑑番号の検証は純粋ロジックへ委譲。不正なら 400。
+  let id: number;
+  try {
+    id = parsePokemonId(c.req.param("id"));
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+
+  // キャッシュヒットなら CDN も FFmpeg も叩かず即返す。
+  const cached = cryCache.get(id);
+  if (cached) {
+    return c.body(cached, 200, { "content-type": "audio/wav" });
+  }
+
+  try {
+    const oggRes = await fetch(cryUrl(CRY_BASE_URL, id));
+    if (!oggRes.ok) {
+      console.error("cry fetch failed:", oggRes.status);
+      return c.json({ error: "upstream cry fetch failed" }, 502);
+    }
+    const ogg = new Uint8Array(await oggRes.arrayBuffer());
+
+    // FFmpeg で生 PCM 化 → 純粋関数で標準 WAV ヘッダを被せる（device の parse_wav_header と往復一致）。
+    const pcm = await transcodeOggToPcm(ogg);
+    const wav = writeWavHeader(pcm);
+    cryCache.set(id, wav);
+    return c.body(wav, 200, { "content-type": "audio/wav" });
+  } catch (err) {
+    console.error("cry conversion failed:", err);
+    return c.json({ error: "cry conversion failed" }, 502);
   }
 });
 
