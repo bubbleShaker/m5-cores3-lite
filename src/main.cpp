@@ -15,6 +15,7 @@
 #include "gem3d.h"    // gem3d_*（宝石3D回転の純粋数学：回転/投影/カリング/法線/明るさ）
 #include "wav.h"      // parse_wav_header（/tts の WAV から PCM を取り出す・純粋ロジック）
 #include "net.h"
+#include "pokemon.h"  // Pokemon / parse_pokemon_info（/pokemon/info の JSON→構造体・純粋ロジック）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
@@ -899,11 +900,204 @@ static void gemOnTap(uint32_t /*now*/) {
     gemDrawCard();  // 名前・明細・通し番号を更新（宝石本体は直後の update が描く）
 }
 
+// ───────── ポケモン図鑑シーン（テーマ N / epic #27・P4 / Issue #80） ─────────
+// 宝石図鑑と同形の「タップで開くカード」。ただしデータは著作物なので自前テーブルを持たず、
+// 中継サーバから実行時取得する（/pokemon/info の JSON→構造体は純粋層 pokemon.cpp で担保済み）。
+// スプライト画像もリポジトリに置かず、/pokemon/sprite が返す RGB565 raw を実行時に受けて表示する。
+//
+// 🔴 Pokémon and Pokémon character names are trademarks of Nintendo / Creatures Inc. / GAME FREAK inc.
+//    情報・画像・鳴き声はいずれも実行時取得のみで、当リポジトリには一切コミットしない。
+
+constexpr int    kPokeMaxId    = 151;                 // 循環範囲（カント地方の 1..151）
+constexpr int    kPokeSprW     = 96;                  // スプライト幅（中継契約）
+constexpr int    kPokeSprH     = 96;                  // スプライト高（中継契約）
+constexpr size_t kPokeSprBytes = static_cast<size_t>(kPokeSprW) * kPokeSprH * 2;  // RGB565=18432B
+constexpr int    kPokeSprX     = (kScreenW - kPokeSprW) / 2;  // 上段中央X（112）
+constexpr int    kPokeSprY     = 18;                         // 上段Y（名前 kGemNameY=136 と被らない）
+// 透過キー（中継契約）: この色の画素は描かずカード背景を透かす。マゼンタ 0xF81F(RGB565)。
+constexpr uint16_t kPokeTransKey = 0xF81F;
+// スプライト受信の全体タイムアウト。200＋Content-Length 後にストリームが中断しても
+// available()==0 で delay を無限に回さず、締め切りで抜けて WDT リセットを防ぐ。
+constexpr uint32_t kPokeFetchTimeoutMs = 8000;
+// 説明文(desc_ja)を1行に収めるための最大表示文字数（全角想定・超過は … で丸める）。
+// gem 明細は短い定数前提のレイアウトなので、長い図鑑説明はここで詰めてはみ出しを抑える。
+constexpr int kPokeDescMaxChars = 18;
+
+// UTF-8 文字列を先頭から maxChars「文字」で丸める（バイトではなく符号点で数え、多バイト境界を割らない）。
+// 丸めが起きた時だけ末尾に … を足す。日本語の図鑑説明を1行に収めるために使う。
+static std::string utf8_truncate(const std::string& s, int maxChars) {
+    int chars = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        // UTF-8 の先頭バイト長（0xxxxxxx=1 / 110=2 / 1110=3 / 11110=4）。継続バイトは飛ばして進む。
+        size_t step = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+        if (chars >= maxChars) return s.substr(0, i) + "…";  // ここまでで打ち切り
+        i += step;
+        ++chars;
+    }
+    return s;  // maxChars 以内なのでそのまま
+}
+
+// 中継のベースURL（末尾 /chat を除いたもの）。/tts /stt が /chat 前提なのと同じ導出。
+static std::string relayBaseUrl() {
+    std::string u = RELAY_URL;
+    const std::string chat = "/chat";
+    if (u.size() >= chat.size() &&
+        u.compare(u.size() - chat.size(), chat.size(), chat) == 0) {
+        u.erase(u.size() - chat.size());  // 末尾 /chat を落としてベースにする
+    }
+    return u;
+}
+static std::string pokeInfoUrl(int id)   { return relayBaseUrl() + "/pokemon/info/"   + std::to_string(id); }
+static std::string pokeSpriteUrl(int id) { return relayBaseUrl() + "/pokemon/sprite/" + std::to_string(id); }
+
+// カード本体（背景＋テキスト）用フルスクリーンキャンバス（宝石カードと同じ作法・PSRAM）。
+static M5Canvas g_pokeCanvas(&M5.Display);
+// 受信スプライト（RGB565 raw 18432B）。再取得のたびに再利用する。PSRAM に確保。
+static uint8_t* g_pokeSprite    = nullptr;
+int             g_pokeId        = 1;       // 現在表示中の図鑑番号（1..kPokeMaxId で循環）
+Pokemon         g_poke;                    // 直近取得した情報（描画に使う）
+bool            g_pokeHasSprite = false;   // スプライト取得に成功したか（失敗時は画像を出さない）
+
+// GET してレスポンス本文を文字列で受ける（/pokemon/info 用・小さな JSON）。
+static bool httpGetString(const std::string& url, std::string& out) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    HTTPClient http;
+    http.begin(url.c_str());
+    const int code = http.GET();
+    if (code != 200) { http.end(); return false; }
+    // info JSON は中継契約で <1KB。Content-Length が判れば上限超過を先に弾く（sprite 側と一貫）。
+    const int len = http.getSize();
+    constexpr int kMaxInfoBytes = 8 * 1024;
+    if (len > kMaxInfoBytes) { http.end(); return false; }
+    out = std::string(http.getString().c_str());
+    http.end();
+    return true;
+}
+
+// GET して RGB565 raw を g_pokeSprite に埋める（/pokemon/sprite 用・固定長 18432B）。
+// speakTts の WAV 受信と同じストリーム読み。長さが契約(18432)と違えば安全側に弾く。
+static bool fetchPokeSprite(int id) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    HTTPClient http;
+    http.begin(pokeSpriteUrl(id).c_str());
+    const int code = http.GET();
+    if (code != 200) { http.end(); return false; }
+
+    const int len = http.getSize();
+    if (len != static_cast<int>(kPokeSprBytes)) { http.end(); return false; }  // 契約長のみ受理
+
+    if (!g_pokeSprite) g_pokeSprite = static_cast<uint8_t*>(ps_malloc(kPokeSprBytes));
+    if (!g_pokeSprite) { http.end(); return false; }
+
+    WiFiClient* stream = http.getStreamPtr();
+    size_t got = 0;
+    const uint32_t deadline = millis() + kPokeFetchTimeoutMs;  // 全体締め切り
+    while (got < kPokeSprBytes && (http.connected() || stream->available())) {
+        const size_t avail = stream->available();
+        if (avail) {
+            size_t want = kPokeSprBytes - got;
+            if (avail < want) want = avail;
+            got += stream->readBytes(g_pokeSprite + got, want);
+        } else if (static_cast<int32_t>(millis() - deadline) >= 0) {
+            break;      // 締め切り超過（NW 中断など）→ 無限待ちせず抜ける
+        } else {
+            delay(1);   // まだ届いていない。少し待って再試行。
+        }
+    }
+    http.end();
+    return got == kPokeSprBytes;
+}
+
+// ポケモンカードを1枚 gfx へ描く（宝石カード drawGemCard の写経・レイアウト定数を共用）。
+// スプライトはカード push 後に別途 pushImage するので、ここでは上段領域を空けておく。
+static void drawPokeCard(LovyanGFX& gfx, const Pokemon& p) {
+    gfx.fillScreen(kColBg);
+
+    // ヘッダ（図鑑名・左上）。
+    gfx.setFont(&fonts::lgfxJapanGothic_16);
+    gfx.setTextColor(TFT_CYAN, kColBg);
+    gfx.setTextDatum(textdatum_t::top_left);
+    gfx.drawString("ポケモン図鑑", 6, 4);
+    // 図鑑番号（右上）。id/総数 で現在地を示す。
+    gfx.setFont(&fonts::Font0);
+    gfx.setTextColor(TFT_CYAN, kColBg);
+    gfx.setTextSize(2);
+    gfx.setTextDatum(textdatum_t::top_right);
+    char idx[12];
+    snprintf(idx, sizeof(idx), "%d/%d", p.id, kPokeMaxId);
+    gfx.drawString(idx, kScreenW - 6, 4);
+    gfx.setTextSize(1);
+
+    // 名前（大・中央寄せ）。
+    gfx.setTextDatum(textdatum_t::middle_center);
+    gfx.setFont(&fonts::lgfxJapanGothic_24);
+    gfx.setTextColor(TFT_WHITE, kColBg);
+    gfx.drawString(p.name_ja.c_str(), kGemCx, kGemNameY);
+
+    // 明細（タイプ→分類→説明）を中央寄せで縦に並べる。
+    gfx.setFont(&fonts::lgfxJapanGothic_16);
+    gfx.setTextColor(TFT_WHITE, kColBg);
+    const std::string lines[] = {
+        std::string("タイプ: ") + p.types,
+        std::string("分類: ") + p.category_ja,
+        utf8_truncate(p.desc_ja, kPokeDescMaxChars),  // 長い図鑑説明は1行に収まるよう丸める
+    };
+    for (int i = 0; i < 3; ++i) {
+        gfx.drawString(lines[i].c_str(), kGemCx, kGemInfoY + i * kGemInfoStep);
+    }
+
+    // 既定へ戻す（他シーンの描画に影響させない）。
+    gfx.setFont(&fonts::Font0);
+    gfx.setTextDatum(textdatum_t::top_left);
+}
+
+// 現在 id の情報＋スプライトを取得して1枚描く（シーン入場・タップ送りの両方から呼ぶ）。
+static void pokeLoad() {
+    std::string json;
+    if (httpGetString(pokeInfoUrl(g_pokeId), json)) {
+        g_poke = parse_pokemon_info(json);
+    } else {
+        g_poke = Pokemon{};             // 取得失敗 → 空にして番号だけ見せる
+        g_poke.id      = g_pokeId;
+        g_poke.name_ja = "取得失敗";
+    }
+    g_pokeHasSprite = fetchPokeSprite(g_pokeId);
+
+    drawPokeCard(g_pokeCanvas, g_poke);
+    g_pokeCanvas.pushSprite(&M5.Display, 0, 0);
+    if (g_pokeHasSprite) {
+        // 契約（暫定・実機目視で要確認）: 中継はリトルエンディアン RGB565 を吐く前提でスワップ無し。
+        // 実機で色が入れ替わる/透過が抜けない場合は push 前に M5.Display.setSwapBytes(true) を入れる
+        // （透過キー比較も同じ色空間で行われるため、スワップがずれると 0xF81F がマッチせず残る）。
+        M5.Display.pushImage(kPokeSprX, kPokeSprY, kPokeSprW, kPokeSprH,
+                             reinterpret_cast<const uint16_t*>(g_pokeSprite), kPokeTransKey);
+    }
+}
+
+static void pokeEnter() {
+    // カード本体キャンバスは初回だけ PSRAM に確保（約150KB・宝石/アートと同じ作法）。
+    if (!g_pokeCanvas.getBuffer()) {
+        g_pokeCanvas.setPsram(true);
+        g_pokeCanvas.createSprite(kScreenW, kScreenH);
+    }
+    pokeLoad();  // 入場時に現在 id を取得して描く
+}
+static void pokeUpdate(uint32_t /*now*/) {
+    // カードは静止画（取得済みの1枚を出しっぱなし）。毎フレーム描画は不要。
+}
+static void pokeOnTap(uint32_t /*now*/) {
+    g_pokeId = (g_pokeId % kPokeMaxId) + 1;  // 1..kPokeMaxId を循環（151 の次は 1）
+    pokeLoad();
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
 const SceneDef kScenes[] = {
     { sheepEnter, sheepUpdate, sheepOnTap },
     { artEnter,   artUpdate,   artOnTap   },
     { gemEnter,   gemUpdate,   gemOnTap   },
+    { pokeEnter,  pokeUpdate,  pokeOnTap  },
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
