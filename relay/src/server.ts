@@ -18,6 +18,8 @@ import {
   speciesUrl,
   type PokemonInfo,
 } from "./pokemon";
+import { rgbaToRgb565, SPRITE_SIZE, spriteUrl } from "./sprite";
+import sharp from "sharp";
 
 // Node 22+ 標準機能で .env を読み込む（dotenv 依存を増やさない）。
 // 無ければ実環境の環境変数をそのまま使う。
@@ -194,6 +196,66 @@ app.get("/pokemon/info/:id", async (c) => {
   } catch (err) {
     console.error("pokeapi call failed:", err);
     return c.json({ error: "upstream PokeAPI call failed" }, 502);
+  }
+});
+
+// スプライト PNG の所在。PokeAPI/sprites リポジトリの GitHub raw CDN。
+const SPRITE_BASE_URL =
+  process.env.SPRITE_BASE_URL ??
+  "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon";
+
+// 図鑑番号 → RGB565 バイト列のオンメモリキャッシュ（1件 18432 バイト）。
+// info と同じくプロセス再起動でクリア・永続化しない（fair-use / ライセンス方針）。
+// キーは parsePokemonId で検証済みの id（1..MAX_POKEMON_ID=1025）に閉じるため
+// 最大 1025 * 18432B ≒ 18.9MB で有界。上限を緩める時はここの有界性が崩れる点に注意。
+const spriteCache = new Map<number, Uint8Array<ArrayBuffer>>();
+
+app.get("/pokemon/sprite/:id", async (c) => {
+  // 図鑑番号の検証は純粋ロジックへ委譲。不正なら 400。
+  let id: number;
+  try {
+    id = parsePokemonId(c.req.param("id"));
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+
+  // キャッシュヒットなら CDN を叩かず即返す。
+  const cached = spriteCache.get(id);
+  if (cached) {
+    return c.body(cached, 200, { "content-type": "application/octet-stream" });
+  }
+
+  try {
+    const pngRes = await fetch(spriteUrl(SPRITE_BASE_URL, id));
+    if (!pngRes.ok) {
+      console.error("sprite fetch failed:", pngRes.status);
+      return c.json({ error: "upstream sprite fetch failed" }, 502);
+    }
+    const png = Buffer.from(await pngRes.arrayBuffer());
+
+    // sharp は PNG デコード＋リサイズだけ担う（トラスト境界）。
+    // 外部 CDN から取得したバイト列を初めてネイティブデコーダに通すため、多層防御として
+    // 入力画素数に上限を設け（展開爆弾対策）、デコードエラーで確実に失敗させる。
+    // fit:"contain" でアスペクト比を保ち、余白は透明で埋める（後段でクロマキー化される）。
+    const rawRgba = await sharp(png, {
+      limitInputPixels: 1024 * 1024, // スプライトは 96x96。正規の最大でも十分に余裕。
+      failOn: "error",
+    })
+      .resize(SPRITE_SIZE, SPRITE_SIZE, {
+        fit: "contain",
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+      })
+      .ensureAlpha() // α欠落フォーマットでも4chを保証（rgbaToRgb565 の前提）。
+      .raw()
+      .toBuffer();
+
+    // 純粋関数で RGB565（リトルエンディアン・透過はクロマキー）へ変換。
+    const rgb565 = rgbaToRgb565(new Uint8Array(rawRgba));
+    spriteCache.set(id, rgb565);
+    return c.body(rgb565, 200, { "content-type": "application/octet-stream" });
+  } catch (err) {
+    console.error("sprite conversion failed:", err);
+    return c.json({ error: "sprite conversion failed" }, 502);
   }
 });
 
