@@ -1068,11 +1068,14 @@ static void pokeLoad() {
     drawPokeCard(g_pokeCanvas, g_poke);
     g_pokeCanvas.pushSprite(&M5.Display, 0, 0);
     if (g_pokeHasSprite) {
-        // 契約（暫定・実機目視で要確認）: 中継はリトルエンディアン RGB565 を吐く前提でスワップ無し。
-        // 実機で色が入れ替わる/透過が抜けない場合は push 前に M5.Display.setSwapBytes(true) を入れる
-        // （透過キー比較も同じ色空間で行われるため、スワップがずれると 0xF81F がマッチせず残る）。
+        // 中継はメモリ上 LE で RGB565 を吐く（実バイトで 1F F8 = 0xF81F を確認済み）が、
+        // LovyanGFX はパネル既定（上位バイト先）でDMAするため、そのままだと色の上下バイトが
+        // 入れ替わって化ける。push 直前に setSwapBytes(true) で送出時にスワップさせる。
+        // （透過キー比較は色の値で行われ順序に依らないため、透過は swap 有無に関わらず効く）
+        M5.Display.setSwapBytes(true);
         M5.Display.pushImage(kPokeSprX, kPokeSprY, kPokeSprW, kPokeSprH,
                              reinterpret_cast<const uint16_t*>(g_pokeSprite), kPokeTransKey);
+        M5.Display.setSwapBytes(false);  // 他シーンの描画に影響しないよう既定へ戻す
     }
 }
 
