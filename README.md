@@ -48,3 +48,9 @@ pio test -e native                   # ホストPCで純粋ロジックの単体
 ## 開発フロー
 
 Issue 起票 → 実装 → PR → レビュー → マージ
+
+## 商標・ライセンス表記
+
+ポケモン図鑑シーン（P4）は、情報・スプライト画像・鳴き声を中継サーバ経由で**実行時にのみ取得**し、当リポジトリには一切コミットしない。
+
+> Pokémon and Pokémon character names are trademarks of Nintendo / Creatures Inc. / GAME FREAK inc.
