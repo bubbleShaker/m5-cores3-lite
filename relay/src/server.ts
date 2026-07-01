@@ -11,6 +11,13 @@ import {
   synthesisUrl,
 } from "./tts";
 import { asrUrl, parseAsrText, parseSttOptions, validateAudio } from "./stt";
+import {
+  extractPokemonInfo,
+  parsePokemonId,
+  pokemonUrl,
+  speciesUrl,
+  type PokemonInfo,
+} from "./pokemon";
 
 // Node 22+ 標準機能で .env を読み込む（dotenv 依存を増やさない）。
 // 無ければ実環境の環境変数をそのまま使う。
@@ -140,6 +147,53 @@ app.post("/stt", async (c) => {
   } catch (err) {
     console.error("whisper call failed:", err);
     return c.json({ error: "upstream Whisper call failed" }, 502);
+  }
+});
+
+// PokeAPI の所在。公式ホスト。fair-use ポリシーに従い下でオンメモリキャッシュする。
+const POKEAPI_URL = process.env.POKEAPI_URL ?? "https://pokeapi.co/api/v2";
+
+// 図鑑番号 → コンパクト情報のオンメモリキャッシュ。
+// PokeAPI の "Locally cache resources" ポリシー順守＋レイテンシ削減。
+// プロセス再起動でクリア（永続化しない = ライセンス方針にも合致）。
+const pokemonInfoCache = new Map<number, PokemonInfo>();
+
+app.get("/pokemon/info/:id", async (c) => {
+  // 図鑑番号の検証は純粋ロジックへ委譲。不正なら 400。
+  let id: number;
+  try {
+    id = parsePokemonId(c.req.param("id"));
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 400);
+  }
+
+  // キャッシュヒットなら PokeAPI を叩かず即返す。
+  const cached = pokemonInfoCache.get(id);
+  if (cached) {
+    return c.json(cached);
+  }
+
+  try {
+    // pokemon（個体データ）と pokemon-species（多言語名・分類・説明）を並行取得。
+    const [pokeRes, specRes] = await Promise.all([
+      fetch(pokemonUrl(POKEAPI_URL, id)),
+      fetch(speciesUrl(POKEAPI_URL, id)),
+    ]);
+    if (!pokeRes.ok || !specRes.ok) {
+      console.error("pokeapi fetch failed:", pokeRes.status, specRes.status);
+      return c.json({ error: "upstream PokeAPI fetch failed" }, 502);
+    }
+
+    const pokemon = (await pokeRes.json()) as Record<string, unknown>;
+    const species = (await specRes.json()) as Record<string, unknown>;
+
+    // ~30KB の生 JSON を実機向けコンパクト JSON へ純粋関数で削る。
+    const info = extractPokemonInfo(id, pokemon, species);
+    pokemonInfoCache.set(id, info);
+    return c.json(info);
+  } catch (err) {
+    console.error("pokeapi call failed:", err);
+    return c.json({ error: "upstream PokeAPI call failed" }, 502);
   }
 });
 
