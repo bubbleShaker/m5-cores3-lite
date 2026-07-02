@@ -28,6 +28,15 @@ import {
   writeWavHeader,
 } from "./cry";
 import { runTranscode } from "./transcode";
+import {
+  fetchWithTimeout,
+  isTimeoutError,
+  mapUpstreamStatus,
+  mapUpstreamStatusPair,
+  TIMEOUT_LLM_MS,
+  TIMEOUT_STATIC_MS,
+  TIMEOUT_VOICE_MS,
+} from "./upstream";
 
 // Node 22+ 標準機能で .env を読み込む（dotenv 依存を増やさない）。
 // 無ければ実環境の環境変数をそのまま使う。
@@ -56,7 +65,8 @@ app.post("/chat", async (c) => {
   }
 
   try {
-    const client = new Anthropic({ apiKey });
+    // 上流ハング対策。SDK は timeout 超過で APIConnectionTimeoutError を投げる。
+    const client = new Anthropic({ apiKey, timeout: TIMEOUT_LLM_MS });
     const res = await client.messages.create({
       model: MODEL,
       max_tokens: 512,
@@ -71,6 +81,9 @@ app.post("/chat", async (c) => {
     return c.json(parseClaudeReply(text));
   } catch (err) {
     console.error("claude call failed:", err);
+    if (err instanceof Anthropic.APIConnectionTimeoutError) {
+      return c.json({ error: "upstream Claude timed out" }, 504);
+    }
     return c.json({ error: "upstream Claude call failed" }, 502);
   }
 });
@@ -90,25 +103,26 @@ app.post("/tts", async (c) => {
 
   try {
     // ① 音の設計図（audio_query）を貰う。text/speaker はクエリ文字列で渡す仕様。
-    const aqRes = await fetch(
+    const aqRes = await fetchWithTimeout(
       audioQueryUrl(VOICEVOX_URL, req.text, req.speaker),
+      TIMEOUT_VOICE_MS,
       { method: "POST" },
     );
     if (!aqRes.ok) {
       console.error("voicevox audio_query failed:", aqRes.status);
-      return c.json({ error: "voicevox audio_query failed" }, 502);
+      return c.json({ error: "voicevox audio_query failed" }, mapUpstreamStatus(aqRes.status));
     }
     const query = (await aqRes.json()) as Record<string, unknown>;
 
     // ② 出力フォーマットを 16kHz/モノラルへ整形してから合成。
-    const synRes = await fetch(synthesisUrl(VOICEVOX_URL, req.speaker), {
+    const synRes = await fetchWithTimeout(synthesisUrl(VOICEVOX_URL, req.speaker), TIMEOUT_VOICE_MS, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(adjustAudioQuery(query)),
     });
     if (!synRes.ok) {
       console.error("voicevox synthesis failed:", synRes.status);
-      return c.json({ error: "voicevox synthesis failed" }, 502);
+      return c.json({ error: "voicevox synthesis failed" }, mapUpstreamStatus(synRes.status));
     }
 
     // WAV バイト列をそのまま audio/wav で返す。
@@ -116,6 +130,9 @@ app.post("/tts", async (c) => {
     return c.body(wav, 200, { "content-type": "audio/wav" });
   } catch (err) {
     console.error("voicevox call failed:", err);
+    if (isTimeoutError(err)) {
+      return c.json({ error: "upstream VOICEVOX timed out" }, 504);
+    }
     return c.json({ error: "upstream VOICEVOX call failed" }, 502);
   }
 });
@@ -146,16 +163,22 @@ app.post("/stt", async (c) => {
     const form = new FormData();
     form.append("audio_file", new Blob([audio], { type: "audio/wav" }), "audio.wav");
 
-    const res = await fetch(asrUrl(STT_URL, opts), { method: "POST", body: form });
+    const res = await fetchWithTimeout(asrUrl(STT_URL, opts), TIMEOUT_VOICE_MS, {
+      method: "POST",
+      body: form,
+    });
     if (!res.ok) {
       console.error("whisper /asr failed:", res.status);
-      return c.json({ error: "whisper /asr failed" }, 502);
+      return c.json({ error: "whisper /asr failed" }, mapUpstreamStatus(res.status));
     }
     // output=json なので JSON で受ける。壊れていても parseAsrText が空文字に丸める。
     const json = await res.json().catch(() => null);
     return c.json({ text: parseAsrText(json) });
   } catch (err) {
     console.error("whisper call failed:", err);
+    if (isTimeoutError(err)) {
+      return c.json({ error: "upstream Whisper timed out" }, 504);
+    }
     return c.json({ error: "upstream Whisper call failed" }, 502);
   }
 });
@@ -186,12 +209,16 @@ app.get("/pokemon/info/:id", async (c) => {
   try {
     // pokemon（個体データ）と pokemon-species（多言語名・分類・説明）を並行取得。
     const [pokeRes, specRes] = await Promise.all([
-      fetch(pokemonUrl(POKEAPI_URL, id)),
-      fetch(speciesUrl(POKEAPI_URL, id)),
+      fetchWithTimeout(pokemonUrl(POKEAPI_URL, id), TIMEOUT_STATIC_MS),
+      fetchWithTimeout(speciesUrl(POKEAPI_URL, id), TIMEOUT_STATIC_MS),
     ]);
     if (!pokeRes.ok || !specRes.ok) {
       console.error("pokeapi fetch failed:", pokeRes.status, specRes.status);
-      return c.json({ error: "upstream PokeAPI fetch failed" }, 502);
+      // 2 本の失敗を写像。404 だけなら 404（該当なし）、5xx 等が混じれば 502 を優先。
+      return c.json(
+        { error: "upstream PokeAPI fetch failed" },
+        mapUpstreamStatusPair(pokeRes.status, specRes.status),
+      );
     }
 
     const pokemon = (await pokeRes.json()) as Record<string, unknown>;
@@ -203,6 +230,9 @@ app.get("/pokemon/info/:id", async (c) => {
     return c.json(info);
   } catch (err) {
     console.error("pokeapi call failed:", err);
+    if (isTimeoutError(err)) {
+      return c.json({ error: "upstream PokeAPI timed out" }, 504);
+    }
     return c.json({ error: "upstream PokeAPI call failed" }, 502);
   }
 });
@@ -234,10 +264,10 @@ app.get("/pokemon/sprite/:id", async (c) => {
   }
 
   try {
-    const pngRes = await fetch(spriteUrl(SPRITE_BASE_URL, id));
+    const pngRes = await fetchWithTimeout(spriteUrl(SPRITE_BASE_URL, id), TIMEOUT_STATIC_MS);
     if (!pngRes.ok) {
       console.error("sprite fetch failed:", pngRes.status);
-      return c.json({ error: "upstream sprite fetch failed" }, 502);
+      return c.json({ error: "upstream sprite fetch failed" }, mapUpstreamStatus(pngRes.status));
     }
     const png = Buffer.from(await pngRes.arrayBuffer());
 
@@ -263,6 +293,9 @@ app.get("/pokemon/sprite/:id", async (c) => {
     return c.body(rgb565, 200, { "content-type": "application/octet-stream" });
   } catch (err) {
     console.error("sprite conversion failed:", err);
+    if (isTimeoutError(err)) {
+      return c.json({ error: "upstream sprite timed out" }, 504);
+    }
     return c.json({ error: "sprite conversion failed" }, 502);
   }
 });
@@ -317,10 +350,10 @@ app.get("/pokemon/cry/:id", async (c) => {
   }
 
   try {
-    const oggRes = await fetch(cryUrl(CRY_BASE_URL, id));
+    const oggRes = await fetchWithTimeout(cryUrl(CRY_BASE_URL, id), TIMEOUT_STATIC_MS);
     if (!oggRes.ok) {
       console.error("cry fetch failed:", oggRes.status);
-      return c.json({ error: "upstream cry fetch failed" }, 502);
+      return c.json({ error: "upstream cry fetch failed" }, mapUpstreamStatus(oggRes.status));
     }
     const ogg = new Uint8Array(await oggRes.arrayBuffer());
 
@@ -331,6 +364,10 @@ app.get("/pokemon/cry/:id", async (c) => {
     return c.body(wav, 200, { "content-type": "audio/wav" });
   } catch (err) {
     console.error("cry conversion failed:", err);
+    // 上流 OGG 取得のタイムアウトは 504。FFmpeg 変換の失敗/タイムアウトは従来通り 502 のまま。
+    if (isTimeoutError(err)) {
+      return c.json({ error: "upstream cry timed out" }, 504);
+    }
     return c.json({ error: "cry conversion failed" }, 502);
   }
 });
