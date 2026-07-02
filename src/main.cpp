@@ -346,6 +346,19 @@ static std::string ttsUrlFromRelay() {
     return u;
 }
 
+// 受信済み WAV バッファから PCM 本体を取り出して playRaw で鳴らす共通末尾。
+// TTS(/tts) と鳴き声(/pokemon/cry) は「取得の仕方」だけ違い、ヘッダ剥がし→再生は同一なので
+// ここに集約する（speakTts / speakCry が共有・DRY）。parse_wav_header は native テスト済みの純粋層。
+static bool playWavBuffer(const uint8_t* buf, size_t len) {
+    WavInfo info;
+    if (!parse_wav_header(buf, len, &info)) return false;
+
+    const int16_t* pcm = reinterpret_cast<const int16_t*>(buf + info.data_offset);
+    const size_t samples = info.data_bytes / 2;  // 16bit = 2byte / サンプル
+    M5.Speaker.setVolume(180);
+    return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
+}
+
 // 受信した WAV を置くバッファ。playRaw 再生中も生かしておく必要があるため static で保持し、
 // 次回呼び出しの先頭で解放する（再生中に free しない）。容量が読めないので PSRAM を使う。
 static uint8_t* g_ttsBuf = nullptr;
@@ -374,6 +387,9 @@ static bool speakTts(const std::string& text) {
     if (len <= 0 || static_cast<size_t>(len) > kMaxWav) { http.end(); return false; }
 
     // 前回バッファを解放してから確保（PSRAM）。確保失敗もフォールバックへ。
+    // playRaw は非同期でバッファをコピーしない（再生中は DMA が元バッファを参照し続ける）ため、
+    // 解放の前に必ず停止する。止めずに free すると解放済み PSRAM を DMA が読む（use-after-free）。
+    M5.Speaker.stop();
     if (g_ttsBuf) { free(g_ttsBuf); g_ttsBuf = nullptr; }
     g_ttsBuf = static_cast<uint8_t*>(ps_malloc(static_cast<size_t>(len)));
     if (!g_ttsBuf) { http.end(); return false; }
@@ -394,14 +410,8 @@ static bool speakTts(const std::string& text) {
     http.end();
     if (got != static_cast<size_t>(len)) return false;
 
-    // WAV ヘッダを剥がして PCM 本体を得る（純粋ロジック・native テスト済み）。
-    WavInfo info;
-    if (!parse_wav_header(g_ttsBuf, got, &info)) return false;
-
-    const int16_t* pcm = reinterpret_cast<const int16_t*>(g_ttsBuf + info.data_offset);
-    const size_t samples = info.data_bytes / 2;  // 16bit = 2byte / サンプル
-    M5.Speaker.setVolume(180);
-    return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
+    // WAV ヘッダを剥がして PCM を再生（cry と共有の共通末尾）。
+    return playWavBuffer(g_ttsBuf, got);
 }
 
 // ───────── 音声入力（録音→中継 /stt で文字起こし・P2 M3b-2 / Issue #55） ─────────
@@ -951,6 +961,7 @@ static std::string relayBaseUrl() {
 }
 static std::string pokeInfoUrl(int id)   { return relayBaseUrl() + "/pokemon/info/"   + std::to_string(id); }
 static std::string pokeSpriteUrl(int id) { return relayBaseUrl() + "/pokemon/sprite/" + std::to_string(id); }
+static std::string pokeCryUrl(int id)    { return relayBaseUrl() + "/pokemon/cry/"    + std::to_string(id); }
 
 // カード本体（背景＋テキスト）用フルスクリーンキャンバス（宝石カードと同じ作法・PSRAM）。
 static M5Canvas g_pokeCanvas(&M5.Display);
@@ -1008,6 +1019,55 @@ static bool fetchPokeSprite(int id) {
     }
     http.end();
     return got == kPokeSprBytes;
+}
+
+// 鳴き声 WAV バッファ（g_ttsBuf と同パターン。playRaw 再生中も生存させ、次回先頭で解放）。PSRAM 使用。
+static uint8_t* g_cryBuf = nullptr;
+
+// 中継 /pokemon/cry/{id} から WAV を取得して鳴らす（実機依存部・#81）。
+// speakTts の写経だが、POST body ではなく id 指定の GET。再生末尾は playWavBuffer を共有する。
+// 失敗しても黙って鳴らさず図鑑閲覧を止めない（オフライン/上流失敗でもカードは見られる）。
+static bool speakCry(int id) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    http.begin(pokeCryUrl(id).c_str());
+    const int code = http.GET();
+    if (code != 200) { http.end(); return false; }
+
+    // Content-Length。cry は relay 契約で 16kHz mono 16bit（~30-64KB）。TTS と同じ上限で安全側に弾く。
+    const int len = http.getSize();
+    constexpr size_t kMaxWav = 512 * 1024;
+    if (len <= 0 || static_cast<size_t>(len) > kMaxWav) { http.end(); return false; }
+
+    // playRaw は非同期でバッファをコピーしないため、解放の前に必ず停止する（use-after-free 防止）。
+    // cry はタップ連打で呼ばれやすく、前回の鳴き声が再生中/キュー待ちのまま free に至りやすい。
+    M5.Speaker.stop();
+    if (g_cryBuf) { free(g_cryBuf); g_cryBuf = nullptr; }
+    g_cryBuf = static_cast<uint8_t*>(ps_malloc(static_cast<size_t>(len)));
+    if (!g_cryBuf) { http.end(); return false; }
+
+    // ストリームを締め切り付きで読み切る（sprite 取得と同じ作法。NW 中断でも WDT リセットを防ぐ）。
+    WiFiClient* stream = http.getStreamPtr();
+    size_t got = 0;
+    const uint32_t deadline = millis() + kPokeFetchTimeoutMs;
+    while (got < static_cast<size_t>(len) && (http.connected() || stream->available())) {
+        const size_t avail = stream->available();
+        if (avail) {
+            size_t want = static_cast<size_t>(len) - got;
+            if (avail < want) want = avail;
+            got += stream->readBytes(g_cryBuf + got, want);
+        } else if (static_cast<int32_t>(millis() - deadline) >= 0) {
+            break;      // 締め切り超過 → 無限待ちせず抜ける
+        } else {
+            delay(1);   // まだ届いていない。少し待って再試行。
+        }
+    }
+    http.end();
+    if (got != static_cast<size_t>(len)) return false;
+
+    // WAV ヘッダを剥がして PCM を再生（TTS と共有の共通末尾）。
+    return playWavBuffer(g_cryBuf, got);
 }
 
 // ポケモンカードを1枚 gfx へ描く（宝石カード drawGemCard の写経・レイアウト定数を共用）。
@@ -1093,6 +1153,7 @@ static void pokeUpdate(uint32_t /*now*/) {
 static void pokeOnTap(uint32_t /*now*/) {
     g_pokeId = (g_pokeId % kPokeMaxId) + 1;  // 1..kPokeMaxId を循環（151 の次は 1）
     pokeLoad();
+    speakCry(g_pokeId);  // 送った先のポケモンの鳴き声を鳴らす（#81。失敗しても図鑑閲覧は続く）
 }
 
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
