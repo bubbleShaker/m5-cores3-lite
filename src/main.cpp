@@ -970,6 +970,8 @@ static uint8_t* g_pokeSprite    = nullptr;
 int             g_pokeId        = 1;       // 現在表示中の図鑑番号（1..kPokeMaxId で循環）
 Pokemon         g_poke;                    // 直近取得した情報（描画に使う）
 bool            g_pokeHasSprite = false;   // スプライト取得に成功したか（失敗時は画像を出さない）
+uint32_t        g_pokeTapMs     = 0;       // 直近タップ時刻（jiggle の減衰起点・#82）
+bool            g_pokeJiggling  = false;   // jiggle 中か（終了時に中心へ戻す確定描画を1回だけ行う）
 
 // GET してレスポンス本文を文字列で受ける（/pokemon/info 用・小さな JSON）。
 static bool httpGetString(const std::string& url, std::string& out) {
@@ -1113,6 +1115,18 @@ static void drawPokeCard(LovyanGFX& gfx, const Pokemon& p) {
     gfx.setTextDatum(textdatum_t::top_left);
 }
 
+// スプライトを上段に描く（中心から dx px 横ずらし＝jiggle 用・#82）。
+// 中継はメモリ上 LE で RGB565 を吐くが LovyanGFX はパネル既定（上位バイト先）でDMAするため、
+// そのままだと色の上下バイトが入れ替わって化ける。push 直前に setSwapBytes(true) で送出時に
+// スワップさせる（#80 実機確認済み）。pokeLoad と jiggle 双方から呼ぶので共通化しておく。
+static void pokePushSprite(int dx) {
+    if (!g_pokeHasSprite || !g_pokeSprite) return;
+    M5.Display.setSwapBytes(true);
+    M5.Display.pushImage(kPokeSprX + dx, kPokeSprY, kPokeSprW, kPokeSprH,
+                         reinterpret_cast<const uint16_t*>(g_pokeSprite), kPokeTransKey);
+    M5.Display.setSwapBytes(false);  // 他シーンの描画に影響しないよう既定へ戻す
+}
+
 // 現在 id の情報＋スプライトを取得して1枚描く（シーン入場・タップ送りの両方から呼ぶ）。
 static void pokeLoad() {
     std::string json;
@@ -1127,16 +1141,7 @@ static void pokeLoad() {
 
     drawPokeCard(g_pokeCanvas, g_poke);
     g_pokeCanvas.pushSprite(&M5.Display, 0, 0);
-    if (g_pokeHasSprite) {
-        // 中継はメモリ上 LE で RGB565 を吐く（実バイトで 1F F8 = 0xF81F を確認済み）が、
-        // LovyanGFX はパネル既定（上位バイト先）でDMAするため、そのままだと色の上下バイトが
-        // 入れ替わって化ける。push 直前に setSwapBytes(true) で送出時にスワップさせる。
-        // （透過キー比較は色の値で行われ順序に依らないため、透過は swap 有無に関わらず効く）
-        M5.Display.setSwapBytes(true);
-        M5.Display.pushImage(kPokeSprX, kPokeSprY, kPokeSprW, kPokeSprH,
-                             reinterpret_cast<const uint16_t*>(g_pokeSprite), kPokeTransKey);
-        M5.Display.setSwapBytes(false);  // 他シーンの描画に影響しないよう既定へ戻す
-    }
+    pokePushSprite(0);  // カード上段中央にスプライトを重ねる（中心＝dx 0）
 }
 
 static void pokeEnter() {
@@ -1148,12 +1153,27 @@ static void pokeEnter() {
     pokeLoad();  // 入場時に現在 id を取得して描く
 }
 static void pokeUpdate(uint32_t /*now*/) {
-    // カードは静止画（取得済みの1枚を出しっぱなし）。毎フレーム描画は不要。
+    // 通常は静止画（取得済みの1枚を出しっぱなし）。タップ直後だけ jiggle で毎フレーム描く（#82）。
+    // スプライトが無ければ揺らすものが無い＝静止画のまま（無駄な全画面再描画も避ける）。
+    if (!g_pokeJiggling || !g_pokeHasSprite) return;
+    // 引数 now は loop 先頭の値で、pokeOnTap 内の pokeLoad(HTTP)で数秒ブロックした後はここでは古い。
+    // g_pokeTapMs（millis()で記録）との差に古い now を使うと符号無し演算で桁あふれし即終了するため、
+    // sheepUpdate と同じく必ず最新の millis() で判定する。
+    const uint32_t elapsed = millis() - g_pokeTapMs;
+    const int dx = sheep_shake_offset(elapsed);  // 時間→減衰する横揺れ（純粋関数・test_sheep で検証済み）
+    // カード全体を描き直してからスプライトを dx ずらして重ねる＝残像（trail）を残さない。
+    g_pokeCanvas.pushSprite(&M5.Display, 0, 0);
+    pokePushSprite(dx);
+    // sheep_shake_offset は減衰しきると 0 を返す。その最終フレーム（dx=0＝中心）を描いてから静止へ戻す。
+    if (elapsed >= kShakeDurationMs) g_pokeJiggling = false;
 }
 static void pokeOnTap(uint32_t /*now*/) {
     g_pokeId = (g_pokeId % kPokeMaxId) + 1;  // 1..kPokeMaxId を循環（151 の次は 1）
     pokeLoad();
     speakCry(g_pokeId);  // 送った先のポケモンの鳴き声を鳴らす（#81。失敗しても図鑑閲覧は続く）
+    // jiggle 起点は取得・再生の後に実時刻で打つ。pokeLoad の HTTP ブロッキング分ずれず、鳴き声と同期する。
+    g_pokeTapMs    = millis();
+    g_pokeJiggling = true;
 }
 
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
