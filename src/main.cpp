@@ -16,6 +16,7 @@
 #include "wav.h"      // parse_wav_header（/tts の WAV から PCM を取り出す・純粋ロジック）
 #include "net.h"
 #include "pokemon.h"  // Pokemon / parse_pokemon_info（/pokemon/info の JSON→構造体・純粋ロジック）
+#include "volume.h"   // volume_up/down / volume_to_speaker / volume_is_up_tap（音量調整・純粋ロジック）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
@@ -327,10 +328,19 @@ static void drawSheepEye(M5Canvas& cv, int ex, int ey, float openness) {
 static int16_t g_baaPcm[kBaaSamples];
 static int     g_baaLen = 0;
 
+// 現在の音量レベル（0〜kVolumeMax）。音量シーンの左右タップで増減し、
+// 全再生経路（メェ／TTS／鳴き声）がこの1つの状態を参照する（音量の一元管理・DRY）。
+static int g_volumeLevel = kVolumeDefault;
+
+// 現在の音量レベルを実機スピーカーへ反映する。再生の直前に必ず呼ぶ。
+static void applyVolume() {
+    M5.Speaker.setVolume(volume_to_speaker(g_volumeLevel));
+}
+
 // 「メェ」を鳴らす。tone() の単音ではなく、合成した波形(PCM)を playRaw で再生する
 // （クラウド TTS でもサーバが返す PCM をこの経路で鳴らす＝同じ playRaw を先に通す）。
 static void playBleat() {
-    M5.Speaker.setVolume(180);
+    applyVolume();
     M5.Speaker.playRaw(g_baaPcm, g_baaLen, kVoiceSampleRate, false);  // false = モノラル
 }
 
@@ -355,7 +365,7 @@ static bool playWavBuffer(const uint8_t* buf, size_t len) {
 
     const int16_t* pcm = reinterpret_cast<const int16_t*>(buf + info.data_offset);
     const size_t samples = info.data_bytes / 2;  // 16bit = 2byte / サンプル
-    M5.Speaker.setVolume(180);
+    applyVolume();
     return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
 }
 
@@ -762,9 +772,9 @@ static void drawGemCard(LovyanGFX& gfx, const Gem& g, int index, int total) {
 // ※ Face（中継サーバ対話）は Wi-Fi 依存で update(now) 内に非同期接続/HTTP を抱えるため、
 //   本巡回には未組み込み。Face のシーン化は後続 Issue で扱う（描画関数群は温存）。
 struct SceneDef {
-    void (*enter)();              // 切替時に1回（背景クリア・初期描画）
-    void (*update)(uint32_t now); // 毎フレーム描画
-    void (*onTap)(uint32_t now);  // 短タップ反応
+    void (*enter)();                          // 切替時に1回（背景クリア・初期描画）
+    void (*update)(uint32_t now);             // 毎フレーム描画
+    void (*onTap)(uint32_t now, int touchX);  // 短タップ反応（touchX=離す直前のタッチX座標）
 };
 
 // --- 羊シーンの状態とアダプタ ---
@@ -804,7 +814,7 @@ static void sheepUpdate(uint32_t now) {
     }
     drawSheep(now, shakeX);
 }
-static void sheepOnTap(uint32_t now) {
+static void sheepOnTap(uint32_t now, int /*touchX*/) {
     g_sheepTapMs  = now;
     g_sheepTapped = true;
 
@@ -861,7 +871,7 @@ static void artUpdate(uint32_t /*now*/) {
     g_artT += kFlowDt;                 // 時間を進めて流れをゆっくり変形させる
     drawFlowField(g_artSeed, g_artT);
 }
-static void artOnTap(uint32_t /*now*/) {
+static void artOnTap(uint32_t /*now*/, int /*touchX*/) {
     g_artSeed = millis();  // タップで配色・流れを一新
     g_artT    = 0.0f;
 }
@@ -904,7 +914,7 @@ static void gemUpdate(uint32_t /*now*/) {
     drawGem3d(g_gem3dCanvas, gem3d_octahedron(), g_gemAngX, g_gemAngY, 0.0f, g->color);
     g_gem3dCanvas.pushSprite(&M5.Display, kGemCx - kGemHalf, kGemCy - kGemHalf);
 }
-static void gemOnTap(uint32_t /*now*/) {
+static void gemOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 次の宝石へ。巡回は実装済みの next_scene を流用する（新規ロジックを作らない）。
     g_gemIdx = next_scene(g_gemIdx, gem_count());
     gemDrawCard();  // 名前・明細・通し番号を更新（宝石本体は直後の update が描く）
@@ -1195,7 +1205,7 @@ static void pokeUpdate(uint32_t /*now*/) {
     // sheep_shake_offset は減衰しきると 0 を返す。その最終フレーム（dx=0＝中心）を描いてから静止へ戻す。
     if (elapsed >= kShakeDurationMs) g_pokeJiggling = false;
 }
-static void pokeOnTap(uint32_t /*now*/) {
+static void pokeOnTap(uint32_t /*now*/, int /*touchX*/) {
     g_pokeId = (g_pokeId % kPokeMaxId) + 1;  // 1..kPokeMaxId を循環（151 の次は 1）
     pokeLoad();
     speakCry(g_pokeId);  // 送った先のポケモンの鳴き声を鳴らす（#81。失敗しても図鑑閲覧は続く）
@@ -1204,12 +1214,83 @@ static void pokeOnTap(uint32_t /*now*/) {
     g_pokeJiggling = true;
 }
 
+// ───────── 音量シーン（テーマ 音量 / Issue #70：左右タップで増減・音量バー表示） ─────────
+// 表示は静的（タップ変更時だけ描く。羊/宝石カードと同じく毎フレームは描かない）。
+// 音量状態 g_volumeLevel は純粋ロジック volume.* で増減し、実機へは applyVolume で反映する。
+
+// 音量バーのレイアウト（rotation(1) 320x240 の中央付近）。
+constexpr int kVolBarX = 40;
+constexpr int kVolBarY = 108;
+constexpr int kVolBarW = 240;
+constexpr int kVolBarH = 26;
+constexpr uint16_t kColVolOn  = TFT_GREEN;  // 点灯セル
+constexpr uint16_t kColVolOff = 0x4208;     // 消灯セル（暗いグレー）
+
+// 音量バー＋レベル数値＋左右の操作ヒントを1画面ぶん描く（enter とタップ変更時に呼ぶ）。
+static void drawVolumeScreen() {
+    M5.Display.fillScreen(kColBg);
+
+    // タイトル（和文・中央上）。
+    M5.Display.setFont(&fonts::lgfxJapanGothic_24);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.drawString("音量", kScreenW / 2, 44);
+
+    // セグメントバー（kVolumeMax 個のセル。現在レベルぶんだけ点灯）。
+    const int cells = kVolumeMax;
+    const int gap   = 4;
+    const int cellW = (kVolBarW - gap * (cells - 1)) / cells;
+    for (int i = 0; i < cells; ++i) {
+        const int x = kVolBarX + i * (cellW + gap);
+        const uint16_t col = (i < g_volumeLevel) ? kColVolOn : kColVolOff;
+        M5.Display.fillRect(x, kVolBarY, cellW, kVolBarH, col);
+    }
+
+    // 数値ラベル（現在/最大）。
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(TFT_CYAN, kColBg);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d / %d", g_volumeLevel, kVolumeMax);
+    M5.Display.drawString(buf, kScreenW / 2, kVolBarY + kVolBarH + 26);
+    M5.Display.setTextSize(1);
+
+    // 操作ヒント（左=下げ / 右=上げ）。
+    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setTextDatum(textdatum_t::middle_left);
+    M5.Display.drawString("<< 下げる", 10, kScreenH - 22);
+    M5.Display.setTextDatum(textdatum_t::middle_right);
+    M5.Display.drawString("上げる >>", kScreenW - 10, kScreenH - 22);
+
+    // 後続描画に影響しないよう既定へ戻す。
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextDatum(textdatum_t::top_left);
+}
+
+static void volumeEnter() {
+    drawVolumeScreen();  // 入場時に一度だけ描く（以後はタップ時だけ更新）
+}
+static void volumeUpdate(uint32_t /*now*/) {
+    // 静的表示なので毎フレームは描かない（無駄な全画面再描画を避ける）。
+}
+static void volumeOnTap(uint32_t /*now*/, int touchX) {
+    // 右半分タップ=上げ / 左半分=下げ（判定は純粋ロジック volume_is_up_tap）。
+    g_volumeLevel = volume_is_up_tap(touchX, kScreenW) ? volume_up(g_volumeLevel)
+                                                       : volume_down(g_volumeLevel);
+    // 変更を耳で確認できるよう、新しい音量で試聴のメェを鳴らす（applyVolume は playBleat 内で実施）。
+    playBleat();
+    drawVolumeScreen();  // バー・数値を更新
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
 const SceneDef kScenes[] = {
-    { sheepEnter, sheepUpdate, sheepOnTap },
-    { artEnter,   artUpdate,   artOnTap   },
-    { gemEnter,   gemUpdate,   gemOnTap   },
-    { pokeEnter,  pokeUpdate,  pokeOnTap  },
+    { sheepEnter,  sheepUpdate,  sheepOnTap  },
+    { artEnter,    artUpdate,    artOnTap    },
+    { gemEnter,    gemUpdate,    gemOnTap    },
+    { pokeEnter,   pokeUpdate,   pokeOnTap   },
+    { volumeEnter, volumeUpdate, volumeOnTap },  // 音量調整（左右タップ・#70）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
@@ -1241,6 +1322,10 @@ void loop() {
     // タッチ系列をジェスチャ検出に流し、短タップ/長押しを判定する（純粋ロジック）。
     static TouchTracker tracker;
     const bool touching = (M5.Touch.getCount() > 0);
+    // Tap は「離した瞬間」に確定するため、その時点では指が離れて座標が無効になっている。
+    // そこで押下中の最後のX座標を覚えておき、Tap 確定時にそれを onTap へ渡す（音量シーンの左右判定用）。
+    static int lastTouchX = kScreenW / 2;
+    if (touching) lastTouchX = M5.Touch.getDetail().x;
     const TouchEvent ev = touch_update(tracker, touching, now);
 
     if (ev == TouchEvent::LongPress) {
@@ -1248,8 +1333,8 @@ void loop() {
         g_sceneIdx = next_scene(g_sceneIdx, kSceneCount);
         kScenes[g_sceneIdx].enter();
     } else if (ev == TouchEvent::Tap) {
-        // 短タップ → 現シーンの反応に委譲（羊のメェ／アート再生成など）。
-        kScenes[g_sceneIdx].onTap(now);
+        // 短タップ → 現シーンの反応に委譲（羊のメェ／アート再生成／音量増減など）。
+        kScenes[g_sceneIdx].onTap(now, lastTouchX);
     }
 
     kScenes[g_sceneIdx].update(now);  // 毎フレーム描画
