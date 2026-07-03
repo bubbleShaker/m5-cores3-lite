@@ -9,6 +9,7 @@ import {
   audioQueryUrl,
   parseTtsRequest,
   synthesisUrl,
+  ttsCacheKey,
 } from "./tts";
 import { asrUrl, parseAsrText, parseSttOptions, validateAudio } from "./stt";
 import {
@@ -91,6 +92,13 @@ app.post("/chat", async (c) => {
 // VOICEVOX ENGINE の所在。docker run -p 50021:50021 voicevox/voicevox_engine:cpu-latest を想定。
 const VOICEVOX_URL = process.env.VOICEVOX_URL ?? "http://localhost:50021";
 
+// 解説文 → 合成 WAV のオンメモリキャッシュ（#98）。宝石/ポケの解説は少数の定型文なので、
+// 2 回目以降は VOICEVOX を叩かず即返し、タップ→読み上げの体感遅延を消す。
+// info/sprite/cry キャッシュと違いキーが任意文字列なので、件数上限を設けて有界化する
+// （超過時は挿入順の最古を 1 件追い出す＝メモリ枯渇を防ぐ）。プロセス再起動でクリア・永続化しない。
+const TTS_CACHE_MAX = 256;
+const ttsCache = new Map<string, Uint8Array<ArrayBuffer>>();
+
 app.post("/tts", async (c) => {
   // 入力検証＋話者解決は純粋ロジックへ委譲。投げられたら 400。
   const body = await c.req.json().catch(() => null);
@@ -99,6 +107,13 @@ app.post("/tts", async (c) => {
     req = parseTtsRequest(body);
   } catch (err) {
     return c.json({ error: (err as Error).message }, 400);
+  }
+
+  // キャッシュヒットなら VOICEVOX を叩かず即返す（初回だけ合成コストを払う）。
+  const cacheKey = ttsCacheKey(req.text, req.speaker);
+  const cachedWav = ttsCache.get(cacheKey);
+  if (cachedWav) {
+    return c.body(cachedWav, 200, { "content-type": "audio/wav" });
   }
 
   try {
@@ -125,8 +140,14 @@ app.post("/tts", async (c) => {
       return c.json({ error: "voicevox synthesis failed" }, mapUpstreamStatus(synRes.status));
     }
 
-    // WAV バイト列をそのまま audio/wav で返す。
-    const wav = await synRes.arrayBuffer();
+    // WAV バイト列をそのまま audio/wav で返しつつ、次回のためにキャッシュへ格納する。
+    const wav = new Uint8Array(await synRes.arrayBuffer());
+    // 上限超なら挿入順の最古を 1 件だけ追い出してから格納（件数を有界に保つ）。
+    if (ttsCache.size >= TTS_CACHE_MAX) {
+      const oldest = ttsCache.keys().next().value;
+      if (oldest !== undefined) ttsCache.delete(oldest);
+    }
+    ttsCache.set(cacheKey, wav);
     return c.body(wav, 200, { "content-type": "audio/wav" });
   } catch (err) {
     console.error("voicevox call failed:", err);
