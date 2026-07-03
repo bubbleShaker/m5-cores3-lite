@@ -370,7 +370,9 @@ static bool playWavBuffer(const uint8_t* buf, size_t len, float volumeScale = 1.
     const int16_t* pcm = reinterpret_cast<const int16_t*>(buf + info.data_offset);
     const size_t samples = info.data_bytes / 2;  // 16bit = 2byte / サンプル
     // applyVolume() の setVolume 一段だけを差し替え、現在の音量(0〜255)へ倍率を掛けて出す。
-    M5.Speaker.setVolume(static_cast<uint8_t>(volume_to_speaker(g_volumeLevel) * volumeScale));
+    // float→uint8_t は範囲外だと未定義動作なので、倍率を 0.0〜1.0 に丸めてから掛ける（誤用防止）。
+    const float scale = volumeScale < 0.0f ? 0.0f : (volumeScale > 1.0f ? 1.0f : volumeScale);
+    M5.Speaker.setVolume(static_cast<uint8_t>(volume_to_speaker(g_volumeLevel) * scale));
     return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
 }
 
