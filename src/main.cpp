@@ -1052,12 +1052,6 @@ static void artOnTap(uint32_t /*now*/, int /*touchX*/) {
 
 // --- 宝石図鑑シーンの状態とアダプタ（3D回転宝石・タップで次の宝石） ---
 int   g_gemIdx = 0;     // 現在表示中の宝石番号（next_scene で巡回する）
-// 次の宝石解説を先読みする予定（#112）。先読みの同期DLをタップ直後ではなく予定時刻以降に
-// gemUpdate から実行し、回転宝石を先に見せてから裏でこっそり取得する。予定の有無は専用フラグで
-// 持つ（millis()+delay がちょうど 0 になる稀な瞬間でも取りこぼさないよう、時刻値をセンチネルにしない）。
-bool     g_gemPrefetchPending = false;  // 先読み予定が入っているか
-uint32_t g_gemPrefetchDue     = 0;      // 予定時刻（Pending 時のみ有効）
-constexpr uint32_t kGemPrefetchDelayMs = 600;  // タップ後この余白を置いてから先読み（宝石を先に描く）
 float g_gemAngX = 0.3f; // 宝石の回転角（x軸・わずかに傾けて立体感を出す）
 float g_gemAngY = 0.0f; // 宝石の回転角（y軸・主回転。毎フレーム進めて回す）
 
@@ -1089,12 +1083,9 @@ static void gemEnter() {
         g_gem3dCanvas.createSprite(kGemHalf * 2, kGemHalf * 2);
     }
     gemDrawCard();  // シーンに入ったらカード本体を1回描く（以後 update が宝石だけ上書き）
-    // 最初のタップで喋る「次の宝石」の解説を先読みする（#101）。ただし同期DLで入場描画を止めない
-    // よう、実行は gemUpdate に遅延させる（#112）。
-    g_gemPrefetchDue     = millis() + kGemPrefetchDelayMs;
-    g_gemPrefetchPending = true;
+    gemPrefetchNext();  // 最初のタップで喋る「次の宝石」の解説を先読みしておく（#101）
 }
-static void gemUpdate(uint32_t now) {
+static void gemUpdate(uint32_t /*now*/) {
     // 宝石を少し回してから、専用スプライトに描いてカード本体の上へ push する。
     g_gemAngY += kGemSpinY;
     g_gemAngX += kGemSpinX;
@@ -1103,13 +1094,6 @@ static void gemUpdate(uint32_t now) {
     g_gem3dCanvas.fillScreen(kColBg);  // カード背景と同色でクリア（push 後に枠が出ないよう）
     drawGem3d(g_gem3dCanvas, gem3d_octahedron(), g_gemAngX, g_gemAngY, 0.0f, g->color);
     g_gem3dCanvas.pushSprite(&M5.Display, kGemCx - kGemHalf, kGemCy - kGemHalf);
-
-    // 予定時刻を過ぎたら「次の宝石」を先読みする（#112）。この同期DLはループを一瞬止めるが、
-    // 既に宝石を数フレーム回して見せた後なので「タップしたのに宝石が出ない」ラグは起きない。
-    if (g_gemPrefetchPending && static_cast<int32_t>(now - g_gemPrefetchDue) >= 0) {
-        g_gemPrefetchPending = false;  // 二重実行を防ぐため先にクリア
-        gemPrefetchNext();
-    }
 }
 static void gemOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 次の宝石へ。巡回は実装済みの next_scene を流用する（新規ロジックを作らない）。
@@ -1122,11 +1106,7 @@ static void gemOnTap(uint32_t /*now*/, int /*touchX*/) {
     const Gem* g = gem_at(g_gemIdx);
     if (g) speakTts(gem_commentary(*g));  // gemEnter/前タップで先読み済み → 合成待ちなく即再生（#101）
 
-    // 次のタップに備えて「さらに次の宝石」を先読みする（#101）。ただし同期DLをここで走らせると
-    // 回転宝石の描画が止まって「タップしたのに宝石が出ない」ラグになる（#112）ので、実行は
-    // gemUpdate に遅延させ、まず宝石を回して見せてから裏で取得する。
-    g_gemPrefetchDue     = millis() + kGemPrefetchDelayMs;
-    g_gemPrefetchPending = true;
+    gemPrefetchNext();  // 次のタップに備えて、さらに次の宝石の解説を先読みしておく（#101）
 }
 
 // ───────── ポケモン図鑑シーン（テーマ N / epic #27・P4 / Issue #80） ─────────
@@ -1413,19 +1393,12 @@ static void pokeOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 1) 送った先のポケモンの鳴き声を鳴らす（#81・#99 で読み上げより控えめの音量）。playRaw は非同期。
     speakCry(g_pokeId);
 
-    // 解説文はタップ直後に確定する（純粋関数・native テスト済み）。先読み(#112)と最終再生で共有する。
-    const std::string pokeText = pokemon_commentary(g_poke);
-
     // 2) 鳴き声の再生中、その場でポケモンを揺らす（#98）。以前は「鳴き声待ち＋TTS取得」を全部
     //    ブロッキングで終えた後に update 経由で揺らしていたため、震えが大きく遅れていた。ここで直接
     //    描くことでタップ直後（＝鳴き声と同時）に震える。待ちループを idle(delay) から「毎フレーム
     //    揺れを描く」へ置き換えただけで、鳴き声が終わるまで待つブロッキング時間は従来と同じ。
     const uint32_t shakeStart = millis();
-    // 震え／鳴き声待ちの上限。先読み(2.5)の同期DL自体はこの判定を跨いで最大 kTtsFetchTimeoutMs(8s)
-    // 走り得るので、pokeOnTap 全体の実上限は ~4s ではなく先読みぶんを含む点に注意。WDT は
-    // fetchTtsWav 内の delay(1) で回避される（リセットはしない）。
-    const uint32_t deadline   = shakeStart + 4000;
-    bool prefetched = false;  // 解説WAVの先読みを1回だけ起動するためのフラグ（#112・案B）
+    const uint32_t deadline   = shakeStart + 4000;  // NW 異常等での無限待ち防止（従来の cry 待ちと同じ上限）
     for (;;) {
         const uint32_t elapsed = millis() - shakeStart;
         const bool shaking = elapsed < kShakeDurationMs;  // 揺れがまだ減衰しきっていない
@@ -1434,25 +1407,14 @@ static void pokeOnTap(uint32_t /*now*/, int /*touchX*/) {
         // 揺れている間だけ帯を描く（sheep_shake_offset は純粋関数・test_sheep で検証済み）。
         if (shaking && g_pokeHasSprite) pokeJiggleFrame(sheep_shake_offset(elapsed));
         delay(16);  // ≈60fps
-
-        // 2.5) 震えを一度見せた後、鳴き声DMAの裏で解説WAVを先読みする（#112・案B）。prefetchTts は
-        //      同期DLなのでこの1回だけ震えが一瞬止まるが、タップ直後の震え開始（#98）は保たれる。
-        //      鳴き声が鳴っている裏でDLするので、ループ後の speakTts は先読みヒットで即再生になり
-        //      「読み上げまでが遅い」を解消する。ヒットしなくても speakTts が同期フォールバックする。
-        if (!prefetched) {
-            prefetched = true;
-            prefetchTts(pokeText);
-        }
     }
     // 揺れ終わりを中心（dx=0）で確定させ、静止画へ戻す（帯の最終フレームを中央に揃える）。
     if (g_pokeHasSprite) pokeJiggleFrame(0);
 
     // 3) 鳴き声に続けて、そのポケモンの解説をずんだもん声で読み上げる（P5 M2a / Issue #94）。
     //    speakTts は先頭で Speaker.stop() を呼ぶので、揺れ＝鳴き声が終わってから読み上げに移る。
-    //    先読み(2.5)がヒットしていれば合成待ちゼロで即再生する。ヒットしていない時（＝先読みが
-    //    同期DLで失敗した時）は、同じ低速/不調サーバへ speakTts がもう一度同期DLして二重に固まる
-    //    （最悪 ~16s）のを避けるため、読み上げは諦めて黙って閲覧を続行する（#112 の 🟡・fail-fast）。
-    if (prefetchMatches(pokeText)) speakTts(pokeText);
+    //    失敗（オフライン等）なら黙って図鑑閲覧を続行する。
+    speakTts(pokemon_commentary(g_poke));
 }
 
 // ───────── 音量シーン（テーマ 音量 / Issue #70：左右タップで増減・音量バー表示） ─────────
