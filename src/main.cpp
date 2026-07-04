@@ -18,6 +18,7 @@
 #include "pokemon.h"  // Pokemon / parse_pokemon_info（/pokemon/info の JSON→構造体・純粋ロジック）
 #include "commentary.h"  // gem_commentary / pokemon_commentary（カード→ずんだもん語の解説文・純粋ロジック）
 #include "volume.h"   // volume_up/down / volume_to_speaker / volume_is_up_tap（音量調整・純粋ロジック）
+#include "voice_select.h"  // voice_speaker_at / voice_name_at / voice_next 等（話者選択・純粋ロジック・#105）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
@@ -333,6 +334,10 @@ static int     g_baaLen = 0;
 // 全再生経路（メェ／TTS／鳴き声）がこの1つの状態を参照する（音量の一元管理・DRY）。
 static int g_volumeLevel = kVolumeDefault;
 
+// 現在の話者選択インデックス（#105）。設定シーンの左右タップで巡回し、TTS 全経路
+// （fetchTtsWav）がこの1つの状態から speaker id を引く。既定 0=ずんだもんで従来の声を維持。
+static int g_voiceIdx = 0;
+
 // 現在の音量レベルを実機スピーカーへ反映する。再生の直前に必ず呼ぶ。
 static void applyVolume() {
     M5.Speaker.setVolume(volume_to_speaker(g_volumeLevel));
@@ -386,7 +391,8 @@ static uint8_t* g_ttsBuf = nullptr;
 // タップ→発話の critical path から合成待ちが消える。再生には使わない待機用の別バッファ。
 static uint8_t*   g_prefetchBuf  = nullptr;
 static size_t     g_prefetchLen  = 0;
-static std::string g_prefetchText;  // g_prefetchBuf が保持している WAV のテキスト（空＝未保持）
+static std::string g_prefetchText;    // g_prefetchBuf が保持している WAV のテキスト（空＝未保持）
+static int         g_prefetchVoice = -1;  // 保持している WAV を合成した speaker id（声変更で無効化するため一致条件に含める・#105）
 
 // 中継 /tts へ text を投げ、返ってきた WAV を新規 PSRAM バッファへ読み切る（取得だけ・再生しない）。
 // 成功時は *outBuf に確保済みバッファ（呼び出し側が free 責任を持つ）と *outLen を返す。
@@ -399,8 +405,10 @@ static bool fetchTtsWav(const std::string& text, uint8_t** outBuf, size_t* outLe
     http.addHeader("Content-Type", "application/json");
 
     // body は ArduinoJson で組み立て（特殊文字を安全にエスケープ）。
+    // voice_id は現在の話者選択から引く（未指定なら中継が既定=ずんだもんに倒すが、明示する・#105）。
     JsonDocument req;
-    req["text"] = text.c_str();
+    req["text"]     = text.c_str();
+    req["voice_id"] = voice_speaker_at(g_voiceIdx);
     std::string body;
     serializeJson(req, body);
 
@@ -447,10 +455,19 @@ static bool fetchTtsWav(const std::string& text, uint8_t** outBuf, size_t* outLe
 // （二重取得を避ける）。取得は同期だが、カード描画直後の「ユーザーが眺めている余白」で呼ぶことで、
 // タップ→発話の critical path から合成待ちを外す狙い。失敗時は黙ってスロットを空のままにする
 // （フォールバックは speakTts 側が同期合成で担うので、鳴らないことはない）。
+// 先読みスロットが「今から喋りたい text＋現在の話者」に一致するか（#101/#105）。
+// 声を変えた後に旧声の WAV を再生しないよう、text だけでなく合成時の speaker も一致条件に含める。
+static bool prefetchMatches(const std::string& text) {
+    return g_prefetchBuf && g_prefetchText == text &&
+           g_prefetchVoice == voice_speaker_at(g_voiceIdx);
+}
+
 static void prefetchTts(const std::string& text) {
     if (text.empty()) return;
-    if (g_prefetchBuf && g_prefetchText == text) return;  // 既に同じものを保持
+    if (prefetchMatches(text)) return;  // 既に同じ text＋話者を保持
 
+    // 取得前に現在の話者を確定させる（fetchTtsWav は g_voiceIdx から voice_id を載せる）。
+    const int voice = voice_speaker_at(g_voiceIdx);
     uint8_t* buf = nullptr;
     size_t   len = 0;
     if (!fetchTtsWav(text, &buf, &len)) return;  // 失敗なら現状維持
@@ -458,9 +475,10 @@ static void prefetchTts(const std::string& text) {
     // 取得成功。古い先読みは破棄して差し替える。g_prefetchBuf は再生に使われていない
     // （speakTts が使う時は g_ttsBuf へ所有権を移す）ので、ここでの free は安全。
     if (g_prefetchBuf) free(g_prefetchBuf);
-    g_prefetchBuf  = buf;
-    g_prefetchLen  = len;
-    g_prefetchText = text;
+    g_prefetchBuf   = buf;
+    g_prefetchLen   = len;
+    g_prefetchText  = text;
+    g_prefetchVoice = voice;
 }
 
 // 先読みスロットを「再生中バッファ」へ移譲して再生する（#101）。playRaw は非同期で元バッファを
@@ -473,6 +491,7 @@ static bool playPrefetched() {
     const size_t len = g_prefetchLen;
     g_prefetchBuf    = nullptr;
     g_prefetchLen    = 0;
+    g_prefetchVoice  = -1;
     g_prefetchText.clear();
     // WAV ヘッダを剥がして PCM を再生（cry と共有の共通末尾）。
     return playWavBuffer(g_ttsBuf, len);
@@ -482,8 +501,8 @@ static bool playPrefetched() {
 // 成否を返し、失敗時は呼び出し側で自前メェにフォールバックさせる（オフラインでも必ず鳴る）。
 // 先読み(#101)済みの text はサーバ合成を待たず即再生する。
 static bool speakTts(const std::string& text) {
-    // 先読みヒット：合成待ちゼロで即再生（タップ→発話ラグ解消の要）。
-    if (g_prefetchBuf && g_prefetchText == text) {
+    // 先読みヒット（text＋話者一致）：合成待ちゼロで即再生（タップ→発話ラグ解消の要）。
+    if (prefetchMatches(text)) {
         return playPrefetched();
     }
 
@@ -1392,6 +1411,61 @@ static void volumeOnTap(uint32_t /*now*/, int touchX) {
     drawVolumeScreen();  // バー・数値を更新
 }
 
+// ───────── 話者シーン（Issue #105：左右タップで voiceroid を切替・選択名表示・試聴） ─────────
+// 音量シーンと同形：静的表示（タップ変更時だけ描く）、状態 g_voiceIdx は純粋ロジック voice_select.* で巡回。
+static void drawVoiceScreen() {
+    M5.Display.fillScreen(kColBg);
+
+    // タイトル（和文・中央上）。
+    M5.Display.setFont(&fonts::lgfxJapanGothic_24);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.drawString("話者", kScreenW / 2, 44);
+
+    // 現在の話者名（大きく中央）。
+    M5.Display.setFont(&fonts::lgfxJapanGothic_36);
+    M5.Display.setTextColor(TFT_CYAN, kColBg);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.drawString(voice_name_at(g_voiceIdx), kScreenW / 2, kScreenH / 2);
+
+    // 位置（現在/総数）。
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d / %d", g_voiceIdx + 1, voice_option_count());
+    M5.Display.drawString(buf, kScreenW / 2, kScreenH / 2 + 44);
+    M5.Display.setTextSize(1);
+
+    // 操作ヒント（左=前 / 右=次）。
+    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setTextDatum(textdatum_t::middle_left);
+    M5.Display.drawString("<< 前の声", 10, kScreenH - 22);
+    M5.Display.setTextDatum(textdatum_t::middle_right);
+    M5.Display.drawString("次の声 >>", kScreenW - 10, kScreenH - 22);
+
+    // 後続描画に影響しないよう既定へ戻す。
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextDatum(textdatum_t::top_left);
+}
+
+static void voiceEnter() {
+    drawVoiceScreen();  // 入場時に一度だけ描く（以後はタップ時だけ更新）
+}
+static void voiceUpdate(uint32_t /*now*/) {
+    // 静的表示なので毎フレームは描かない（音量シーンと同じ）。
+}
+static void voiceOnTap(uint32_t /*now*/, int touchX) {
+    // 右半分=次の声 / 左半分=前の声（判定は純粋ロジック voice_is_next_tap）。
+    g_voiceIdx = voice_is_next_tap(touchX, kScreenW) ? voice_next(g_voiceIdx)
+                                                     : voice_prev(g_voiceIdx);
+    drawVoiceScreen();  // 選択名・位置を更新
+    // 選んだ声で試聴：その話者が自分の名前を名乗る（オフライン等で失敗しても黙って続行）。
+    speakTts(std::string(voice_name_at(g_voiceIdx)) + "です。");
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
 const SceneDef kScenes[] = {
     { sheepEnter,  sheepUpdate,  sheepOnTap  },
@@ -1399,6 +1473,7 @@ const SceneDef kScenes[] = {
     { gemEnter,    gemUpdate,    gemOnTap    },
     { pokeEnter,   pokeUpdate,   pokeOnTap   },
     { volumeEnter, volumeUpdate, volumeOnTap },  // 音量調整（左右タップ・#70）
+    { voiceEnter,  voiceUpdate,  voiceOnTap  },  // 話者選択（左右タップ・#105）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
