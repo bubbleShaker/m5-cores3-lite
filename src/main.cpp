@@ -377,13 +377,21 @@ static bool playWavBuffer(const uint8_t* buf, size_t len, float volumeScale = 1.
     return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
 }
 
-// 受信した WAV を置くバッファ。playRaw 再生中も生かしておく必要があるため static で保持し、
-// 次回呼び出しの先頭で解放する（再生中に free しない）。容量が読めないので PSRAM を使う。
+// 受信した WAV を置く「再生中バッファ」。playRaw 再生中も生かしておく必要があるため static で
+// 保持し、次回再生の直前で解放する（再生中に free しない）。容量が読めないので PSRAM を使う。
 static uint8_t* g_ttsBuf = nullptr;
 
-// 中継 /tts に text を投げ、返ってきた WAV を playRaw で鳴らす（実機依存部・P2 M2b / Issue #48）。
-// 成否を返し、失敗時は呼び出し側で自前メェにフォールバックさせる（オフラインでも必ず鳴る）。
-static bool speakTts(const std::string& text) {
+// 先読み(prefetch)スロット（#101）。カード巡回は決定的（next_scene / id+1）なので、次に喋る
+// 解説文の WAV をタップ前に取得して置いておく。タップ時に text が一致すれば合成を待たず即再生でき、
+// タップ→発話の critical path から合成待ちが消える。再生には使わない待機用の別バッファ。
+static uint8_t*   g_prefetchBuf  = nullptr;
+static size_t     g_prefetchLen  = 0;
+static std::string g_prefetchText;  // g_prefetchBuf が保持している WAV のテキスト（空＝未保持）
+
+// 中継 /tts へ text を投げ、返ってきた WAV を新規 PSRAM バッファへ読み切る（取得だけ・再生しない）。
+// 成功時は *outBuf に確保済みバッファ（呼び出し側が free 責任を持つ）と *outLen を返す。
+// speakTts（再生用）と prefetchTts（先読み用）で取得ロジックを共有する（DRY）。
+static bool fetchTtsWav(const std::string& text, uint8_t** outBuf, size_t* outLen) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
     HTTPClient http;
@@ -404,32 +412,95 @@ static bool speakTts(const std::string& text) {
     constexpr size_t kMaxWav = 512 * 1024;
     if (len <= 0 || static_cast<size_t>(len) > kMaxWav) { http.end(); return false; }
 
-    // 前回バッファを解放してから確保（PSRAM）。確保失敗もフォールバックへ。
-    // playRaw は非同期でバッファをコピーしない（再生中は DMA が元バッファを参照し続ける）ため、
-    // 解放の前に必ず停止する。止めずに free すると解放済み PSRAM を DMA が読む（use-after-free）。
-    M5.Speaker.stop();
-    if (g_ttsBuf) { free(g_ttsBuf); g_ttsBuf = nullptr; }
-    g_ttsBuf = static_cast<uint8_t*>(ps_malloc(static_cast<size_t>(len)));
-    if (!g_ttsBuf) { http.end(); return false; }
+    // 取得専用の新規バッファへ確保（再生中の g_ttsBuf には触れない＝use-after-free を避ける）。
+    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(static_cast<size_t>(len)));
+    if (!buf) { http.end(); return false; }
 
     // ストリームから len バイトを読み切る（available() を見ながら詰める）。
+    // speakCry と同じく全体締め切りを張る。上流が「接続維持のまま無応答」でも delay(1) で無限
+    // スピンせず抜ける（先読みで同期取得の呼び出し箇所が増えるため、loop の WDT リセットを防ぐ）。
     WiFiClient* stream = http.getStreamPtr();
+    constexpr uint32_t kTtsFetchTimeoutMs = 8000;  // 受信全体の締め切り（speakCry と同値）
+    const uint32_t deadline = millis() + kTtsFetchTimeoutMs;
     size_t got = 0;
     while (got < static_cast<size_t>(len) && (http.connected() || stream->available())) {
         const size_t avail = stream->available();
         if (avail) {
             size_t want = static_cast<size_t>(len) - got;
             if (avail < want) want = avail;
-            got += stream->readBytes(g_ttsBuf + got, want);
+            got += stream->readBytes(buf + got, want);
+        } else if (static_cast<int32_t>(millis() - deadline) >= 0) {
+            break;     // 締め切り超過（NW 中断など）→ 無限待ちせず抜ける
         } else {
             delay(1);  // まだ届いていない。少し待って再試行。
         }
     }
     http.end();
-    if (got != static_cast<size_t>(len)) return false;
+    if (got != static_cast<size_t>(len)) { free(buf); return false; }
+
+    *outBuf = buf;
+    *outLen = got;
+    return true;
+}
+
+// 次に喋る解説文の WAV を先読みしてスロットに置く（#101）。同じ text を保持済みなら何もしない
+// （二重取得を避ける）。取得は同期だが、カード描画直後の「ユーザーが眺めている余白」で呼ぶことで、
+// タップ→発話の critical path から合成待ちを外す狙い。失敗時は黙ってスロットを空のままにする
+// （フォールバックは speakTts 側が同期合成で担うので、鳴らないことはない）。
+static void prefetchTts(const std::string& text) {
+    if (text.empty()) return;
+    if (g_prefetchBuf && g_prefetchText == text) return;  // 既に同じものを保持
+
+    uint8_t* buf = nullptr;
+    size_t   len = 0;
+    if (!fetchTtsWav(text, &buf, &len)) return;  // 失敗なら現状維持
+
+    // 取得成功。古い先読みは破棄して差し替える。g_prefetchBuf は再生に使われていない
+    // （speakTts が使う時は g_ttsBuf へ所有権を移す）ので、ここでの free は安全。
+    if (g_prefetchBuf) free(g_prefetchBuf);
+    g_prefetchBuf  = buf;
+    g_prefetchLen  = len;
+    g_prefetchText = text;
+}
+
+// 先読みスロットを「再生中バッファ」へ移譲して再生する（#101）。playRaw は非同期で元バッファを
+// 参照し続けるため、再生に使うバッファは g_ttsBuf に一本化して寿命管理する。
+static bool playPrefetched() {
+    // DMA が旧 g_ttsBuf を参照中の可能性があるため、停止してから解放・差し替える。
+    M5.Speaker.stop();
+    if (g_ttsBuf) free(g_ttsBuf);
+    g_ttsBuf         = g_prefetchBuf;
+    const size_t len = g_prefetchLen;
+    g_prefetchBuf    = nullptr;
+    g_prefetchLen    = 0;
+    g_prefetchText.clear();
+    // WAV ヘッダを剥がして PCM を再生（cry と共有の共通末尾）。
+    return playWavBuffer(g_ttsBuf, len);
+}
+
+// 中継 /tts に text を投げ、返ってきた WAV を playRaw で鳴らす（実機依存部・P2 M2b / Issue #48）。
+// 成否を返し、失敗時は呼び出し側で自前メェにフォールバックさせる（オフラインでも必ず鳴る）。
+// 先読み(#101)済みの text はサーバ合成を待たず即再生する。
+static bool speakTts(const std::string& text) {
+    // 先読みヒット：合成待ちゼロで即再生（タップ→発話ラグ解消の要）。
+    if (g_prefetchBuf && g_prefetchText == text) {
+        return playPrefetched();
+    }
+
+    // ミス：同期取得してから再生（従来経路）。
+    uint8_t* buf = nullptr;
+    size_t   len = 0;
+    if (!fetchTtsWav(text, &buf, &len)) return false;
+
+    // 再生バッファへ移す。playRaw は非同期でバッファをコピーしない（再生中は DMA が元バッファを
+    // 参照し続ける）ため、旧バッファは必ず停止してから解放する。止めずに free すると解放済み
+    // PSRAM を DMA が読む（use-after-free）。
+    M5.Speaker.stop();
+    if (g_ttsBuf) free(g_ttsBuf);
+    g_ttsBuf = buf;
 
     // WAV ヘッダを剥がして PCM を再生（cry と共有の共通末尾）。
-    return playWavBuffer(g_ttsBuf, got);
+    return playWavBuffer(g_ttsBuf, len);
 }
 
 // ───────── 音声入力（録音→中継 /stt で文字起こし・P2 M3b-2 / Issue #55） ─────────
@@ -900,6 +971,12 @@ static void gemDrawCard() {
     drawGemCard(g_gemCanvas, *g, g_gemIdx, gem_count());
     g_gemCanvas.pushSprite(&M5.Display, 0, 0);
 }
+// 次のタップで喋る「次の宝石」の解説文を先読みしておく（#101）。巡回は決定的（next_scene）なので、
+// タップ前にこの WAV を用意でき、タップ時は合成を待たず即再生になる。
+static void gemPrefetchNext() {
+    const Gem* g = gem_at(next_scene(g_gemIdx, gem_count()));
+    if (g) prefetchTts(gem_commentary(*g));
+}
 static void gemEnter() {
     // カード本体キャンバスは初回だけ PSRAM に確保（約150KB）。アートと同じ作法。
     if (!g_gemCanvas.getBuffer()) {
@@ -911,6 +988,7 @@ static void gemEnter() {
         g_gem3dCanvas.createSprite(kGemHalf * 2, kGemHalf * 2);
     }
     gemDrawCard();  // シーンに入ったらカード本体を1回描く（以後 update が宝石だけ上書き）
+    gemPrefetchNext();  // 最初のタップで喋る「次の宝石」の解説を先読みしておく（#101）
 }
 static void gemUpdate(uint32_t /*now*/) {
     // 宝石を少し回してから、専用スプライトに描いてカード本体の上へ push する。
@@ -931,7 +1009,9 @@ static void gemOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 文字列組み立ては native テスト済みの純粋層 gem_commentary に委譲し、鳴らすだけを実機で行う。
     // 失敗（オフライン等）なら黙って図鑑閲覧を続行する。
     const Gem* g = gem_at(g_gemIdx);
-    if (g) speakTts(gem_commentary(*g));
+    if (g) speakTts(gem_commentary(*g));  // gemEnter/前タップで先読み済み → 合成待ちなく即再生（#101）
+
+    gemPrefetchNext();  // 次のタップに備えて、さらに次の宝石の解説を先読みしておく（#101）
 }
 
 // ───────── ポケモン図鑑シーン（テーマ N / epic #27・P4 / Issue #80） ─────────
