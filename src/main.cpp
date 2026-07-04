@@ -415,9 +415,11 @@ static bool fetchTtsWav(const std::string& text, uint8_t** outBuf, size_t* outLe
     const int code = http.POST(String(body.c_str()));
     if (code != 200) { http.end(); return false; }
 
-    // Content-Length。不明(-1)や中継方針(<=500KB)超過は安全側に弾く。
+    // Content-Length。不明(-1)や上限超過は安全側に弾く。
+    // 24kHz 化(#107)で同じ文字数でも WAV が約1.5倍になるため、長文解説が新たに無音落ちしないよう
+    // 上限を 1MB に引き上げる（PSRAM 8MB に対し先読みと合わせ最大2MBで十分収まる）。
     const int len = http.getSize();
-    constexpr size_t kMaxWav = 512 * 1024;
+    constexpr size_t kMaxWav = 1024 * 1024;
     if (len <= 0 || static_cast<size_t>(len) > kMaxWav) { http.end(); return false; }
 
     // 取得専用の新規バッファへ確保（再生中の g_ttsBuf には触れない＝use-after-free を避ける）。

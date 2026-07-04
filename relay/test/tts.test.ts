@@ -3,6 +3,7 @@ import {
   adjustAudioQuery,
   audioQueryUrl,
   DEFAULT_SPEAKER,
+  INTONATION_SCALE,
   MAX_TEXT_LENGTH,
   OUTPUT_SAMPLING_RATE,
   OUTPUT_STEREO,
@@ -45,15 +46,23 @@ describe("parseTtsRequest", () => {
 });
 
 describe("adjustAudioQuery", () => {
-  it("出力フォーマットを 16kHz/モノラルに上書きする", () => {
+  it("出力フォーマットを 24kHz/モノラルに上書きする", () => {
     const out = adjustAudioQuery({
-      outputSamplingRate: 24000,
+      outputSamplingRate: 16000,
       outputStereo: true,
     });
     expect(out.outputSamplingRate).toBe(OUTPUT_SAMPLING_RATE);
+    expect(OUTPUT_SAMPLING_RATE).toBe(24000);
     expect(out.outputStereo).toBe(OUTPUT_STEREO);
   });
-  it("韻律など他フィールドは保持する", () => {
+  it("抑揚(intonationScale)を設定して平板さを減らす", () => {
+    // 素の 1.0 を上書きし、控えめに強める（1.0 より大きく、誇張しすぎない範囲）。
+    const out = adjustAudioQuery({ intonationScale: 1.0 });
+    expect(out.intonationScale).toBe(INTONATION_SCALE);
+    expect(INTONATION_SCALE).toBeGreaterThan(1.0);
+    expect(INTONATION_SCALE).toBeLessThanOrEqual(1.3);
+  });
+  it("アクセント句など他の韻律フィールドは保持する", () => {
     const out = adjustAudioQuery({ speedScale: 1.2, accent_phrases: ["x"] });
     expect(out.speedScale).toBe(1.2);
     expect(out.accent_phrases).toEqual(["x"]);
