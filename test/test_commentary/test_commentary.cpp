@@ -12,12 +12,12 @@ static void assert_contains(const std::string& haystack, const std::string& need
 
 // --- gem_commentary ---
 
-// 全フィールドが揃った宝石は「名前なのだ。産地は…組成は…主な元素は…なのだ。」の形になる
+// 全フィールドが揃った宝石は「名前です。産地は…組成は…主な元素は…です。」の形になる
 void test_gem_full() {
     Gem g{"ルビー", "ミャンマー", "Al2O3 (Cr)", "Al / O（発色:Cr）", 0};
     std::string s = gem_commentary(g);
     TEST_ASSERT_EQUAL_STRING(
-        "ルビーなのだ。産地はミャンマー、組成はAl2O3 (Cr)、主な元素はAl / O（発色:Cr）なのだ。",
+        "ルビーです。産地はミャンマー、組成はAl2O3 (Cr)、主な元素はAl / O（発色:Cr）です。",
         s.c_str());
 }
 
@@ -28,7 +28,7 @@ void test_gem_from_table() {
         std::string s = gem_commentary(*g);
         assert_contains(s, g->name);
         assert_contains(s, "産地は");
-        assert_contains(s, "なのだ。");
+        assert_contains(s, "です。");
     }
 }
 
@@ -37,26 +37,26 @@ void test_gem_partial_fields() {
     Gem g{"謎の石", "", "SiO2", "", 0};
     std::string s = gem_commentary(g);
     // 産地・元素は省かれ、組成だけが残る
-    TEST_ASSERT_EQUAL_STRING("謎の石なのだ。組成はSiO2なのだ。", s.c_str());
+    TEST_ASSERT_EQUAL_STRING("謎の石です。組成はSiO2です。", s.c_str());
 }
 
 // 名前が空なら既定の呼称へフォールバックし、事実が無ければ本体だけ返す
 void test_gem_empty_falls_back() {
     Gem g{"", "", "", "", 0};
     std::string s = gem_commentary(g);
-    TEST_ASSERT_EQUAL_STRING("この宝石なのだ。", s.c_str());
+    TEST_ASSERT_EQUAL_STRING("この宝石です。", s.c_str());
 }
 
 // name が nullptr でも落ちない（Gem は const char*。安全側に畳む）
 void test_gem_null_pointer_safe() {
     Gem g{nullptr, nullptr, nullptr, nullptr, 0};
     std::string s = gem_commentary(g);
-    TEST_ASSERT_EQUAL_STRING("この宝石なのだ。", s.c_str());
+    TEST_ASSERT_EQUAL_STRING("この宝石です。", s.c_str());
 }
 
 // --- pokemon_commentary ---
 
-// 全フィールドが揃ったポケモンは「名前、分類なのだ。タイプは…。説明」の形になる
+// 全フィールドが揃ったポケモンは「名前、分類です。タイプは…。説明」の形になる
 void test_pokemon_full() {
     Pokemon p;
     p.id = 1;
@@ -66,7 +66,7 @@ void test_pokemon_full() {
     p.desc_ja = "うまれたときからせなかにタネがある。";
     std::string s = pokemon_commentary(p);
     TEST_ASSERT_EQUAL_STRING(
-        "フシギダネ、たねポケモンなのだ。タイプはgrass, poison。うまれたときからせなかにタネがある。",
+        "フシギダネ、たねポケモンです。タイプはgrass, poison。うまれたときからせなかにタネがある。",
         s.c_str());
 }
 
@@ -75,14 +75,14 @@ void test_pokemon_name_only() {
     Pokemon p;
     p.name_ja = "ミュウ";
     std::string s = pokemon_commentary(p);
-    TEST_ASSERT_EQUAL_STRING("ミュウなのだ。", s.c_str());
+    TEST_ASSERT_EQUAL_STRING("ミュウです。", s.c_str());
 }
 
 // 名前が空（パース失敗の既定値）なら既定の呼称へフォールバック
 void test_pokemon_empty_falls_back() {
     Pokemon p;  // 全て既定値（name_ja="")
     std::string s = pokemon_commentary(p);
-    TEST_ASSERT_EQUAL_STRING("このポケモンなのだ。", s.c_str());
+    TEST_ASSERT_EQUAL_STRING("このポケモンです。", s.c_str());
 }
 
 // 決定論的：同じ入力なら必ず同じ文字列
