@@ -19,6 +19,8 @@
 #include "commentary.h"  // gem_commentary / pokemon_commentary（カード→ずんだもん語の解説文・純粋ロジック）
 #include "volume.h"   // volume_up/down / volume_to_speaker / volume_is_up_tap（音量調整・純粋ロジック）
 #include "voice_select.h"  // voice_speaker_at / voice_name_at / voice_next 等（話者選択・純粋ロジック・#105）
+#include "envelope.h"   // voice_envelope（発話 PCM→音量エンベロープ・純粋ロジック・#109）
+#include "particles.h"  // particle_ring（円形パーティクルの幾何・純粋ロジック・#109）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
@@ -362,6 +364,14 @@ static std::string ttsUrlFromRelay() {
     return u;
 }
 
+// 発話中パーティクル用の音量エンベロープと再生タイミング（#109）。playWavBuffer が再生開始時に
+// 埋め、ひつじシーンの描画が「経過時間→bucket→強さ」で実音声に連動したリングを描く。
+constexpr int   kEnvBuckets    = 24;
+static uint8_t  g_voiceEnv[kEnvBuckets];
+static int      g_voiceEnvN     = 0;   // g_voiceEnv の有効数（0=無効）
+static uint32_t g_voicePlayStart = 0;  // 再生開始 millis()
+static uint32_t g_voicePlayDur   = 0;  // 再生長 ms（0=無効）
+
 // 受信済み WAV バッファから PCM 本体を取り出して playRaw で鳴らす共通末尾。
 // TTS(/tts) と鳴き声(/pokemon/cry) は「取得の仕方」だけ違い、ヘッダ剥がし→再生は同一なので
 // ここに集約する（speakTts / speakCry が共有・DRY）。parse_wav_header は native テスト済みの純粋層。
@@ -379,7 +389,19 @@ static bool playWavBuffer(const uint8_t* buf, size_t len, float volumeScale = 1.
     // 「>= 0.0f でない」で下限を判定するので、NaN も比較が false になりこの枝で 0.0f に落ちる。
     const float scale = !(volumeScale >= 0.0f) ? 0.0f : (volumeScale > 1.0f ? 1.0f : volumeScale);
     M5.Speaker.setVolume(static_cast<uint8_t>(volume_to_speaker(g_volumeLevel) * scale));
-    return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
+    const bool ok = M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
+
+    // 再生開始後に音量エンベロープと再生長を記録する（#109）。playRaw は非同期なので、ここでの
+    // 読み取り専用スキャンは DMA と競合しない。再生開始そのものは遅らせない（音の頭出しに影響なし）。
+    if (ok) {
+        g_voiceEnvN = voice_envelope(pcm, static_cast<int>(samples), g_voiceEnv, kEnvBuckets);
+        const uint32_t rate   = info.sample_rate ? info.sample_rate : 1;
+        const uint32_t frames  = (info.channels == 2) ? static_cast<uint32_t>(samples / 2)
+                                                       : static_cast<uint32_t>(samples);
+        g_voicePlayDur   = static_cast<uint32_t>(static_cast<uint64_t>(frames) * 1000u / rate);
+        g_voicePlayStart = millis();
+    }
+    return ok;
 }
 
 // 受信した WAV を置く「再生中バッファ」。playRaw 再生中も生かしておく必要があるため static で
@@ -661,6 +683,57 @@ static void drawSheep(uint32_t now, int shakeX) {
     cv.pushSprite(&M5.Display, kSheepClipX, kSheepClipY);
 }
 
+// ───────── 発話中の円形素粒子エフェクト（Issue #109） ─────────
+// アバターの周囲（クリップ枠の外側の背景）に、実音声の音量エンベロープへ連動して脈動する
+// 粒子リングを描く。幾何は純粋ロジック particle_ring、強さは voice_envelope が担当（native テスト済み）。
+constexpr int kSpeakRingRadius = 92;   // 羊のクリップ枠を囲む半径（枠外へはみ出す粒だけを描く）
+constexpr int kMaxParticles    = 16;
+
+// 直前フレームに描いた粒子（次フレーム先頭で背景色に塗り消して trail を残さない＝全画面クリア不要）。
+static Particle g_prevParticles[kMaxParticles];
+static int      g_prevParticleN = 0;
+
+// エンベロープの明るさ(0..255)を素粒子らしい水色系の色へ写す（暗→黒、明→白寄りの水色）。
+static uint16_t particleColor(uint8_t level) {
+    return M5.Display.color565(level >> 1, level, level);  // R控えめ・G/B強め＝シアン〜白
+}
+
+// 発話中パーティクルを1フレーム更新する。ひつじシーンの update から毎フレーム呼ぶ。
+static void drawSpeakingParticles(uint32_t now) {
+    // 1) まず直前フレームの粒を消す（枠外の背景に描いたものだけなのでキャラは触らない）。
+    for (int i = 0; i < g_prevParticleN; ++i) {
+        M5.Display.fillCircle(g_prevParticles[i].x, g_prevParticles[i].y,
+                              g_prevParticles[i].radius, kColBg);
+    }
+    g_prevParticleN = 0;
+
+    // 2) 実際に鳴っていなければ（or エンベロープ無効なら）ここで終わり＝粒子は消えたまま。
+    if (!M5.Speaker.isPlaying() || g_voicePlayDur == 0 || g_voiceEnvN <= 0) return;
+
+    // 3) 経過時間を bucket に写して実音声の大小を強さ(0..1)にする（＝声に連動）。
+    const uint32_t elapsed = now - g_voicePlayStart;
+    int idx = static_cast<int>(static_cast<uint64_t>(elapsed) * g_voiceEnvN / g_voicePlayDur);
+    if (idx < 0) idx = 0;
+    if (idx >= g_voiceEnvN) idx = g_voiceEnvN - 1;
+    const float intensity = g_voiceEnv[idx] / 255.0f;
+
+    // 4) リング幾何を計算して、キャラのクリップ枠の外側だけに描く（キャラを隠さない）。
+    Particle ps[kMaxParticles];
+    const float t = now / 1000.0f;
+    const int n = particle_ring(ps, kMaxParticles, kMaxParticles,
+                                kSheepCx, kSheepCy, kSpeakRingRadius, t, intensity);
+    for (int i = 0; i < n; ++i) {
+        const int px = ps[i].x, py = ps[i].y;
+        // 画面外・認識バナー帯(上部)・キャラのクリップ枠内 は避ける。
+        if (px < 0 || px >= kScreenW || py < 0 || py >= kScreenH) continue;
+        if (py < kSttBannerY + kSttBannerH) continue;
+        if (px >= kSheepClipX && px < kSheepClipX + kSheepClipW &&
+            py >= kSheepClipY && py < kSheepClipY + kSheepClipH) continue;
+        M5.Display.fillCircle(px, py, ps[i].radius, particleColor(ps[i].level));
+        g_prevParticles[g_prevParticleN++] = ps[i];
+    }
+}
+
 // ───────── アートシーン（Issue #42 / #34 M3：フローフィールド曲線のアニメ） ─────────
 // ノイズの流れ場(art_flow_angle)に沿って細い曲線を多数流す（Tyler Hobbs "Fidenza" 系）。
 // 毎フレーム全描画してもちらつかないよう、フルスクリーンの M5Canvas に描いてから一括転送する。
@@ -913,6 +986,7 @@ static void sheepUpdate(uint32_t now) {
         shakeX = 0;
     }
     drawSheep(now, shakeX);
+    drawSpeakingParticles(now);  // 発話中だけアバター周囲に実音声連動の円形パーティクル（#109）
 }
 static void sheepOnTap(uint32_t now, int /*touchX*/) {
     g_sheepTapMs  = now;
