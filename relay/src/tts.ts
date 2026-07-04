@@ -75,3 +75,10 @@ export function synthesisUrl(baseUrl: string, speaker: number): string {
   const params = new URLSearchParams({ speaker: String(speaker) });
   return `${normalizeBase(baseUrl)}/synthesis?${params.toString()}`;
 }
+
+// 合成 WAV キャッシュのキー（#98）。同じ (speaker, text) は同じ音声になるので使い回せる。
+// text は任意文字列だが、speaker は非負整数（数字のみ）で ":" を含まない。最初の ":" で speaker と
+// text を一意に分離できるので、text 内に ":" があってもキーは衝突しない。
+export function ttsCacheKey(text: string, speaker: number): string {
+  return `${speaker}:${text}`;
+}

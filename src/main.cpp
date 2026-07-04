@@ -360,13 +360,20 @@ static std::string ttsUrlFromRelay() {
 // 受信済み WAV バッファから PCM 本体を取り出して playRaw で鳴らす共通末尾。
 // TTS(/tts) と鳴き声(/pokemon/cry) は「取得の仕方」だけ違い、ヘッダ剥がし→再生は同一なので
 // ここに集約する（speakTts / speakCry が共有・DRY）。parse_wav_header は native テスト済みの純粋層。
-static bool playWavBuffer(const uint8_t* buf, size_t len) {
+// volumeScale は「この再生だけ音量を控えめにする」倍率（0.0〜1.0・既定1.0＝現在の音量そのまま）。
+// 鳴き声(cry)を読み上げ(TTS)より小さくするために使う（#99）。音量レベル g_volumeLevel 自体は変えない
+// ので、次の再生（scale=1.0）で自動的に通常音量へ戻る。
+static bool playWavBuffer(const uint8_t* buf, size_t len, float volumeScale = 1.0f) {
     WavInfo info;
     if (!parse_wav_header(buf, len, &info)) return false;
 
     const int16_t* pcm = reinterpret_cast<const int16_t*>(buf + info.data_offset);
     const size_t samples = info.data_bytes / 2;  // 16bit = 2byte / サンプル
-    applyVolume();
+    // applyVolume() の setVolume 一段だけを差し替え、現在の音量(0〜255)へ倍率を掛けて出す。
+    // float→uint8_t は範囲外だと未定義動作なので、倍率を 0.0〜1.0 に丸めてから掛ける（誤用防止）。
+    // 「>= 0.0f でない」で下限を判定するので、NaN も比較が false になりこの枝で 0.0f に落ちる。
+    const float scale = !(volumeScale >= 0.0f) ? 0.0f : (volumeScale > 1.0f ? 1.0f : volumeScale);
+    M5.Speaker.setVolume(static_cast<uint8_t>(volume_to_speaker(g_volumeLevel) * scale));
     return M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2);
 }
 
@@ -882,11 +889,6 @@ int   g_gemIdx = 0;     // 現在表示中の宝石番号（next_scene で巡回
 float g_gemAngX = 0.3f; // 宝石の回転角（x軸・わずかに傾けて立体感を出す）
 float g_gemAngY = 0.0f; // 宝石の回転角（y軸・主回転。毎フレーム進めて回す）
 
-// 発話状態（P5 M2a / Issue #94）。解説を喋っている間だけ口パクを動かすための起点と見積もり時間。
-// 羊シーン（g_sheepSpeak*）と同形。描画（口パク）は M2b で is_speaking を見て使う。
-uint32_t g_gemSpeakStart = 0;  // 喋り始めた時刻
-uint32_t g_gemSpeakDur   = 0;  // speaking_duration_ms の見積もり（0 なら喋っていない）
-
 // y軸を主に回し、x軸はゆっくり傾ける（約30fps前提の1フレーム増分）。
 constexpr float kGemSpinY = 0.045f;  // ≈1.35 rad/s → 1周およそ4.6秒
 constexpr float kGemSpinX = 0.013f;  // ゆっくり首振り
@@ -920,23 +922,16 @@ static void gemUpdate(uint32_t /*now*/) {
     drawGem3d(g_gem3dCanvas, gem3d_octahedron(), g_gemAngX, g_gemAngY, 0.0f, g->color);
     g_gem3dCanvas.pushSprite(&M5.Display, kGemCx - kGemHalf, kGemCy - kGemHalf);
 }
-static void gemOnTap(uint32_t now, int /*touchX*/) {
+static void gemOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 次の宝石へ。巡回は実装済みの next_scene を流用する（新規ロジックを作らない）。
     g_gemIdx = next_scene(g_gemIdx, gem_count());
     gemDrawCard();  // 名前・明細・通し番号を更新（宝石本体は直後の update が描く）
 
     // 送った先の宝石の解説を、ずんだもん声で読み上げる（P5 M2a / Issue #94）。
     // 文字列組み立ては native テスト済みの純粋層 gem_commentary に委譲し、鳴らすだけを実機で行う。
+    // 失敗（オフライン等）なら黙って図鑑閲覧を続行する。
     const Gem* g = gem_at(g_gemIdx);
-    const std::string text = g ? gem_commentary(*g) : std::string();
-    if (g && speakTts(text)) {
-        // クラウド TTS は実音長が不明なので、解説文のバイト長から粗く見積もる（羊シーンと同じ作法）。
-        // 起点は TTS の HTTP ブロッキング後に実時刻で打つ（#58 と同じ理由・口パクと音を揃える）。
-        g_gemSpeakStart = millis();
-        g_gemSpeakDur   = speaking_duration_ms(text.size());
-    } else {
-        g_gemSpeakDur = 0;  // オフライン/失敗時は喋らない（図鑑閲覧は続行・口パクも出さない）
-    }
+    if (g) speakTts(gem_commentary(*g));
 }
 
 // ───────── ポケモン図鑑シーン（テーマ N / epic #27・P4 / Issue #80） ─────────
@@ -1008,10 +1003,6 @@ static uint8_t* g_pokeSprite    = nullptr;
 int             g_pokeId        = 1;       // 現在表示中の図鑑番号（1..kPokeMaxId で循環）
 Pokemon         g_poke;                    // 直近取得した情報（描画に使う）
 bool            g_pokeHasSprite = false;   // スプライト取得に成功したか（失敗時は画像を出さない）
-uint32_t        g_pokeTapMs     = 0;       // 直近タップ時刻（jiggle の減衰起点・#82）
-bool            g_pokeJiggling  = false;   // jiggle 中か（終了時に中心へ戻す確定描画を1回だけ行う）
-uint32_t        g_pokeSpeakStart = 0;      // 解説を喋り始めた時刻（口パク起点・P5 M2a / Issue #94）
-uint32_t        g_pokeSpeakDur   = 0;      // speaking_duration_ms の見積もり（0 なら喋っていない）
 
 // GET してレスポンス本文を文字列で受ける（/pokemon/info 用・小さな JSON）。
 static bool httpGetString(const std::string& url, std::string& out) {
@@ -1066,6 +1057,10 @@ static bool fetchPokeSprite(int id) {
 // 鳴き声 WAV バッファ（g_ttsBuf と同パターン。playRaw 再生中も生存させ、次回先頭で解放）。PSRAM 使用。
 static uint8_t* g_cryBuf = nullptr;
 
+// 鳴き声の音量倍率（#99）。VOICEROID の読み上げ(TTS)に対して鳴き声が大きすぎたので控えめにする。
+// 音量レベル自体は変えず、この再生だけ scale を掛ける（数値は耳で微調整可）。
+constexpr float kCryVolumeScale = 0.5f;
+
 // 中継 /pokemon/cry/{id} から WAV を取得して鳴らす（実機依存部・#81）。
 // speakTts の写経だが、POST body ではなく id 指定の GET。再生末尾は playWavBuffer を共有する。
 // 失敗しても黙って鳴らさず図鑑閲覧を止めない（オフライン/上流失敗でもカードは見られる）。
@@ -1108,8 +1103,8 @@ static bool speakCry(int id) {
     http.end();
     if (got != static_cast<size_t>(len)) return false;
 
-    // WAV ヘッダを剥がして PCM を再生（TTS と共有の共通末尾）。
-    return playWavBuffer(g_cryBuf, got);
+    // WAV ヘッダを剥がして PCM を再生（TTS と共有の共通末尾）。鳴き声は控えめの音量で（#99）。
+    return playWavBuffer(g_cryBuf, got, kCryVolumeScale);
 }
 
 // ポケモンカードを1枚 gfx へ描く（宝石カード drawGemCard の写経・レイアウト定数を共用）。
@@ -1213,46 +1208,38 @@ static void pokeEnter() {
     pokeLoad();  // 入場時に現在 id を取得して描く
 }
 static void pokeUpdate(uint32_t /*now*/) {
-    // 通常は静止画（取得済みの1枚を出しっぱなし）。タップ直後だけ jiggle で毎フレーム描く（#82）。
-    // スプライトが無ければ揺らすものが無い＝静止画のまま（無駄な全画面再描画も避ける）。
-    if (!g_pokeJiggling || !g_pokeHasSprite) return;
-    // 引数 now は loop 先頭の値で、pokeOnTap 内の pokeLoad(HTTP)で数秒ブロックした後はここでは古い。
-    // g_pokeTapMs（millis()で記録）との差に古い now を使うと符号無し演算で桁あふれし即終了するため、
-    // sheepUpdate と同じく必ず最新の millis() で判定する。
-    const uint32_t elapsed = millis() - g_pokeTapMs;
-    const int dx = sheep_shake_offset(elapsed);  // 時間→減衰する横揺れ（純粋関数・test_sheep で検証済み）
-    // スプライト帯だけを合成して1回 push（全画面 push によるちらつきを避ける・残像も帯の複写で消える）。
-    pokeJiggleFrame(dx);
-    // sheep_shake_offset は減衰しきると 0 を返す。その最終フレーム（dx=0＝中心）を描いてから静止へ戻す。
-    if (elapsed >= kShakeDurationMs) g_pokeJiggling = false;
+    // ポケは静止画（取得済みの1枚を出しっぱなし）。タップ時の揺れ(jiggle)は onTap 内で鳴き声と
+    // 同時に完結させるので、update では何もしない（無駄な再描画も避ける・#98）。
 }
 static void pokeOnTap(uint32_t /*now*/, int /*touchX*/) {
     g_pokeId = (g_pokeId % kPokeMaxId) + 1;  // 1..kPokeMaxId を循環（151 の次は 1）
     pokeLoad();
 
-    // 1) 送った先のポケモンの鳴き声を鳴らす（#81）。playRaw は非同期で再生が始まる。
+    // 1) 送った先のポケモンの鳴き声を鳴らす（#81・#99 で読み上げより控えめの音量）。playRaw は非同期。
     speakCry(g_pokeId);
-    // 鳴き声が鳴り終わるまで待つ。直後の speakTts は先頭で Speaker.stop() を呼ぶため、
-    // 待たずに解説へ進むと鳴き声が途中で切れる（コメント通り「鳴き声に続けて解説」を守る）。
-    // 連打や NW 異常での無限待ちを防ぐため上限付きで待つ。
-    const uint32_t cryDeadline = millis() + 4000;
-    while (M5.Speaker.isPlaying() && static_cast<int32_t>(millis() - cryDeadline) < 0) delay(5);
 
-    // 2) 鳴き声に続けて、そのポケモンの解説をずんだもん声で読み上げる（P5 M2a / Issue #94）。
-    //    文字列は native テスト済みの純粋層 pokemon_commentary に委譲し、鳴らすだけを実機で行う。
-    const std::string text = pokemon_commentary(g_poke);
-    if (speakTts(text)) {
-        // 実音長は不明なので解説文のバイト長から粗く見積もる。口パク起点は TTS 完了後の実時刻で打つ。
-        g_pokeSpeakStart = millis();
-        g_pokeSpeakDur   = speaking_duration_ms(text.size());
-    } else {
-        g_pokeSpeakDur = 0;  // オフライン/取得失敗時は喋らない（図鑑閲覧は続行・口パクも出さない）
+    // 2) 鳴き声の再生中、その場でポケモンを揺らす（#98）。以前は「鳴き声待ち＋TTS取得」を全部
+    //    ブロッキングで終えた後に update 経由で揺らしていたため、震えが大きく遅れていた。ここで直接
+    //    描くことでタップ直後（＝鳴き声と同時）に震える。待ちループを idle(delay) から「毎フレーム
+    //    揺れを描く」へ置き換えただけで、鳴き声が終わるまで待つブロッキング時間は従来と同じ。
+    const uint32_t shakeStart = millis();
+    const uint32_t deadline   = shakeStart + 4000;  // NW 異常等での無限待ち防止（従来の cry 待ちと同じ上限）
+    for (;;) {
+        const uint32_t elapsed = millis() - shakeStart;
+        const bool shaking = elapsed < kShakeDurationMs;  // 揺れがまだ減衰しきっていない
+        const bool crying  = M5.Speaker.isPlaying();      // 鳴き声がまだ鳴っている
+        if ((!shaking && !crying) || static_cast<int32_t>(millis() - deadline) >= 0) break;
+        // 揺れている間だけ帯を描く（sheep_shake_offset は純粋関数・test_sheep で検証済み）。
+        if (shaking && g_pokeHasSprite) pokeJiggleFrame(sheep_shake_offset(elapsed));
+        delay(16);  // ≈60fps
     }
+    // 揺れ終わりを中心（dx=0）で確定させ、静止画へ戻す（帯の最終フレームを中央に揃える）。
+    if (g_pokeHasSprite) pokeJiggleFrame(0);
 
-    // 3) jiggle は解説の再生に合わせて揺らす。onTap がブロック中は update が回らず jiggle を描けないため、
-    //    起点は全ブロッキング（鳴き声待ち＋TTS 取得）完了後の実時刻で打つ。M2b の口パクと同じ窓で揺れる。
-    g_pokeTapMs    = millis();
-    g_pokeJiggling = true;
+    // 3) 鳴き声に続けて、そのポケモンの解説をずんだもん声で読み上げる（P5 M2a / Issue #94）。
+    //    speakTts は先頭で Speaker.stop() を呼ぶので、揺れ＝鳴き声が終わってから読み上げに移る。
+    //    失敗（オフライン等）なら黙って図鑑閲覧を続行する。
+    speakTts(pokemon_commentary(g_poke));
 }
 
 // ───────── 音量シーン（テーマ 音量 / Issue #70：左右タップで増減・音量バー表示） ─────────

@@ -8,6 +8,7 @@ import {
   OUTPUT_STEREO,
   parseTtsRequest,
   synthesisUrl,
+  ttsCacheKey,
 } from "../src/tts";
 
 describe("parseTtsRequest", () => {
@@ -83,5 +84,23 @@ describe("synthesisUrl", () => {
     expect(synthesisUrl("http://localhost:50021", 3)).toBe(
       "http://localhost:50021/synthesis?speaker=3",
     );
+  });
+});
+
+describe("ttsCacheKey", () => {
+  it("同じ text/speaker は同じキーになる", () => {
+    expect(ttsCacheKey("やあ", 3)).toBe(ttsCacheKey("やあ", 3));
+  });
+  it("text か speaker が違えば別キーになる", () => {
+    expect(ttsCacheKey("やあ", 3)).not.toBe(ttsCacheKey("やあ", 1));
+    expect(ttsCacheKey("やあ", 3)).not.toBe(ttsCacheKey("こんにちは", 3));
+  });
+  it("speaker と text の境界を取り違えない（区切りで衝突しない）", () => {
+    // "3"+"あ" と "3あ" のような連結衝突が起きないこと。
+    expect(ttsCacheKey("あ", 3)).not.toBe(ttsCacheKey("3あ", 0));
+  });
+  it("text 内にコロンを含んでも区切りと混同しない", () => {
+    // 区切り文字がコロンなので、text 側のコロンで境界がずれないこと。
+    expect(ttsCacheKey("a:b", 3)).not.toBe(ttsCacheKey("b", 3));
   });
 });
