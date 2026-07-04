@@ -4,10 +4,16 @@
 // VOICEVOX の既定話者。3 = ずんだもん（ノーマル）。
 export const DEFAULT_SPEAKER = 3;
 
-// デバイス互換のための出力フォーマット。
-// M5 側で playRaw するため 16kHz / モノラルへ落とす（容量も小さくなる）。
-export const OUTPUT_SAMPLING_RATE = 16000;
+// デバイス互換のための出力フォーマット（#107）。
+// VOICEVOX ネイティブの 24kHz をそのまま使う。以前は 16kHz へダウンサンプルしていたが、
+// 高域が落ちてこもるため、クリアさ優先で 24kHz に上げる（M5 側は WAV ヘッダのレートで playRaw）。
+// 代償として同じ文字数でも WAV が約1.5倍になるので、実機側は受信上限を引き上げてある。
+export const OUTPUT_SAMPLING_RATE = 24000;
 export const OUTPUT_STEREO = false;
+
+// 抑揚(intonation)の強さ。1.0 = VOICEVOX 素のまま。わずかに上げて機械的な平板さを減らし、
+// 「もう少し自然なイントネーション」にする。上げ過ぎると誇張され不自然になるので控えめに。
+export const INTONATION_SCALE = 1.1;
 
 // reply が長すぎると WAV が肥大化（<=500KB 目安）するので上限を設ける。
 export const MAX_TEXT_LENGTH = 200;
@@ -43,13 +49,15 @@ export function parseTtsRequest(body: unknown): TtsRequest {
   return { text, speaker };
 }
 
-// VOICEVOX /audio_query が返す JSON は多数のフィールドを持つが、ここでは出力フォーマットだけ差し替える。
-// 元の韻律パラメータ（アクセント等）は保持したいので、スプレッドで上書きする。
+// VOICEVOX /audio_query が返す JSON は多数のフィールドを持つが、ここでは出力フォーマットと
+// 抑揚(intonationScale)だけ差し替える。アクセント句(accent_phrases)など他の韻律は保持したいので、
+// スプレッドで元を残しつつ必要なキーだけ上書きする。
 export function adjustAudioQuery(
   query: Record<string, unknown>,
 ): Record<string, unknown> {
   return {
     ...query,
+    intonationScale: INTONATION_SCALE,  // 抑揚を控えめに強めて平板さを減らす（#107）
     outputSamplingRate: OUTPUT_SAMPLING_RATE,
     outputStereo: OUTPUT_STEREO,
   };
