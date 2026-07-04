@@ -156,6 +156,9 @@ app.post("/tts", async (c) => {
     }
     // 単体で上限を超える異常な WAV はキャッシュしない（返却はする）。
     if (wav.byteLength <= TTS_CACHE_MAX_BYTES) {
+      // 同一キーの並行 miss で二重計上しないよう、既存エントリ分を先に減算してから入れ替える。
+      const prev = ttsCache.get(cacheKey);
+      if (prev) ttsCacheBytes -= prev.byteLength;
       ttsCache.set(cacheKey, wav);
       ttsCacheBytes += wav.byteLength;
     }

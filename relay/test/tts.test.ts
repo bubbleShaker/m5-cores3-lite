@@ -99,4 +99,8 @@ describe("ttsCacheKey", () => {
     // "3"+"あ" と "3あ" のような連結衝突が起きないこと。
     expect(ttsCacheKey("あ", 3)).not.toBe(ttsCacheKey("3あ", 0));
   });
+  it("text 内にコロンを含んでも区切りと混同しない", () => {
+    // 区切り文字がコロンなので、text 側のコロンで境界がずれないこと。
+    expect(ttsCacheKey("a:b", 3)).not.toBe(ttsCacheKey("b", 3));
+  });
 });
