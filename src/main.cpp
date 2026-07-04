@@ -683,27 +683,42 @@ static void drawSheep(uint32_t now, int shakeX) {
     cv.pushSprite(&M5.Display, kSheepClipX, kSheepClipY);
 }
 
-// ───────── 発話中の円形素粒子エフェクト（Issue #109） ─────────
-// アバターの周囲（クリップ枠の外側の背景）に、実音声の音量エンベロープへ連動して脈動する
-// 粒子リングを描く。幾何は純粋ロジック particle_ring、強さは voice_envelope が担当（native テスト済み）。
-constexpr int kSpeakRingRadius = 92;   // 羊のクリップ枠を囲む半径（枠外へはみ出す粒だけを描く）
-constexpr int kMaxParticles    = 16;
+// ───────── 発話中の楕円素粒子エフェクト（Issue #109 / 全シーン共通化 #117） ─────────
+// 主役（アバター/宝石/…）の周囲の背景に、実音声の音量エンベロープへ連動して脈動する楕円リングを描く。
+// 幾何は純粋ロジック particle_ring、強さは voice_envelope が担当（native テスト済み）。中心・半径・
+// 背景色・除外矩形を引数で受け、各シーンの update から自分のジオメトリで呼ぶ。背景が静止している
+// シーン専用（前フレームの粒を背景色で塗り消す方式なので、毎フレーム全画面を描き直すシーンには使わない）。
+// 楕円(横>縦)で横長のレイアウトを均等に囲む。真円だと左右が主役の枠に埋もれ下弧しか出なかった(#116)。
+constexpr int kSpeakRingRadiusX = 116;  // 標準の横半径：羊枠右端 x=264 を越えるよう >104
+constexpr int kSpeakRingRadiusY = 84;   // 標準の縦半径：羊枠下端 y=190 を越え、上はバナー(34)より下
+constexpr int kMaxParticles     = 16;
+
+// 発話中に避ける矩形（主役スプライトや文字帯）。この内側には粒を描かない。
+struct ParticleExcl { int x, y, w, h; };
+// 除外矩形配列の要素数を配列そのものから導く（呼び出し側で個数を手書きして更新漏れ→範囲外参照になるのを防ぐ）。
+template <int N> constexpr int particleExclCount(const ParticleExcl (&)[N]) { return N; }
 
 // 直前フレームに描いた粒子（次フレーム先頭で背景色に塗り消して trail を残さない＝全画面クリア不要）。
 static Particle g_prevParticles[kMaxParticles];
-static int      g_prevParticleN = 0;
+static int      g_prevParticleN  = 0;
+static uint16_t g_prevParticleBg = 0;  // 消去に使う背景色（描いた時点の色で消す＝シーンを跨いでも正しい）
 
 // エンベロープの明るさ(0..255)を素粒子らしい水色系の色へ写す（暗→黒、明→白寄りの水色）。
 static uint16_t particleColor(uint8_t level) {
     return M5.Display.color565(level >> 1, level, level);  // R控えめ・G/B強め＝シアン〜白
 }
 
-// 発話中パーティクルを1フレーム更新する。ひつじシーンの update から毎フレーム呼ぶ。
-static void drawSpeakingParticles(uint32_t now) {
-    // 1) まず直前フレームの粒を消す（枠外の背景に描いたものだけなのでキャラは触らない）。
+// シーン切替時に呼ぶ：前フレーム粒子を「捨てる」（別シーンの背景へ誤って塗り消さない）。
+static void resetSpeakingParticles() { g_prevParticleN = 0; }
+
+// 発話中パーティクルを1フレーム更新する。各シーンの update から中心(cx,cy)・楕円半径(rx,ry)・
+// 背景色 bg・除外矩形 excl[exclN] を渡して毎フレーム呼ぶ。
+static void drawSpeakingParticles(uint32_t now, int cx, int cy, int rx, int ry,
+                                  uint16_t bg, const ParticleExcl* excl, int exclN) {
+    // 1) まず直前フレームの粒を、描いた時点の背景色で消す（除外矩形外にしか描いていないので主役は触らない）。
     for (int i = 0; i < g_prevParticleN; ++i) {
         M5.Display.fillCircle(g_prevParticles[i].x, g_prevParticles[i].y,
-                              g_prevParticles[i].radius, kColBg);
+                              g_prevParticles[i].radius, g_prevParticleBg);
     }
     g_prevParticleN = 0;
 
@@ -717,18 +732,21 @@ static void drawSpeakingParticles(uint32_t now) {
     if (idx >= g_voiceEnvN) idx = g_voiceEnvN - 1;
     const float intensity = g_voiceEnv[idx] / 255.0f;
 
-    // 4) リング幾何を計算して、キャラのクリップ枠の外側だけに描く（キャラを隠さない）。
+    // 4) 楕円リング幾何を計算して、除外矩形の外側だけに描く（主役・文字を隠さない）。
     Particle ps[kMaxParticles];
     const float t = now / 1000.0f;
     const int n = particle_ring(ps, kMaxParticles, kMaxParticles,
-                                kSheepCx, kSheepCy, kSpeakRingRadius, t, intensity);
+                                cx, cy, rx, t, intensity, ry);
+    g_prevParticleBg = bg;  // この回に描く粒は、次フレームで bg で消す
     for (int i = 0; i < n; ++i) {
         const int px = ps[i].x, py = ps[i].y;
-        // 画面外・認識バナー帯(上部)・キャラのクリップ枠内 は避ける。
-        if (px < 0 || px >= kScreenW || py < 0 || py >= kScreenH) continue;
-        if (py < kSttBannerY + kSttBannerH) continue;
-        if (px >= kSheepClipX && px < kSheepClipX + kSheepClipW &&
-            py >= kSheepClipY && py < kSheepClipY + kSheepClipH) continue;
+        if (px < 0 || px >= kScreenW || py < 0 || py >= kScreenH) continue;  // 画面外
+        bool inExcl = false;
+        for (int e = 0; e < exclN; ++e) {
+            const ParticleExcl& r = excl[e];
+            if (px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h) { inExcl = true; break; }
+        }
+        if (inExcl) continue;
         M5.Display.fillCircle(px, py, ps[i].radius, particleColor(ps[i].level));
         g_prevParticles[g_prevParticleN++] = ps[i];
     }
@@ -986,7 +1004,14 @@ static void sheepUpdate(uint32_t now) {
         shakeX = 0;
     }
     drawSheep(now, shakeX);
-    drawSpeakingParticles(now);  // 発話中だけアバター周囲に実音声連動の円形パーティクル（#109）
+    // 発話中だけアバター周囲に実音声連動の楕円パーティクル（#109 / 共通化 #117）。
+    // 除外＝キャラのクリップ枠 と 上部の認識バナー帯(y<34)。背景色は kColBg。
+    const ParticleExcl sheepExcl[] = {
+        { kSheepClipX, kSheepClipY, kSheepClipW, kSheepClipH },
+        { 0, 0, kScreenW, kSttBannerY + kSttBannerH },
+    };
+    drawSpeakingParticles(now, kSheepCx, kSheepCy, kSpeakRingRadiusX, kSpeakRingRadiusY,
+                          kColBg, sheepExcl, particleExclCount(sheepExcl));
 }
 static void sheepOnTap(uint32_t now, int /*touchX*/) {
     g_sheepTapMs  = now;
@@ -1085,7 +1110,7 @@ static void gemEnter() {
     gemDrawCard();  // シーンに入ったらカード本体を1回描く（以後 update が宝石だけ上書き）
     gemPrefetchNext();  // 最初のタップで喋る「次の宝石」の解説を先読みしておく（#101）
 }
-static void gemUpdate(uint32_t /*now*/) {
+static void gemUpdate(uint32_t now) {
     // 宝石を少し回してから、専用スプライトに描いてカード本体の上へ push する。
     g_gemAngY += kGemSpinY;
     g_gemAngX += kGemSpinX;
@@ -1094,9 +1119,23 @@ static void gemUpdate(uint32_t /*now*/) {
     g_gem3dCanvas.fillScreen(kColBg);  // カード背景と同色でクリア（push 後に枠が出ないよう）
     drawGem3d(g_gem3dCanvas, gem3d_octahedron(), g_gemAngX, g_gemAngY, 0.0f, g->color);
     g_gem3dCanvas.pushSprite(&M5.Display, kGemCx - kGemHalf, kGemCy - kGemHalf);
+
+    // 解説の読み上げ中、宝石を囲むハローとして楕円パーティクルを背景へ出す（#117）。宝石本体
+    // スプライト矩形と上部ヘッダ帯を除外（カード下部は文字が密なので中心を宝石に置き上半分で光らせる）。
+    // 背景は宝石カードと同じ kColBg。ジオメトリは実機で調整する初期値。
+    constexpr int kGemRingRx     = 104;  // 横半径：宝石スプライト半辺58を越えて左右に出す
+    constexpr int kGemRingRy     = 52;   // 縦半径：宝石の上下は本体スプライトに隠れ、左右のハローが残る
+    constexpr int kGemHeaderH    = 22;   // 上部ヘッダ（図鑑名・通し番号）の帯の高さ
+    const ParticleExcl gemExcl[] = {
+        { kGemCx - kGemHalf, kGemCy - kGemHalf, kGemHalf * 2, kGemHalf * 2 },  // 宝石スプライト
+        { 0, 0, kScreenW, kGemHeaderH },                                      // 上部ヘッダ帯
+    };
+    drawSpeakingParticles(now, kGemCx, kGemCy, kGemRingRx, kGemRingRy,
+                          kColBg, gemExcl, particleExclCount(gemExcl));
 }
 static void gemOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 次の宝石へ。巡回は実装済みの next_scene を流用する（新規ロジックを作らない）。
+    resetSpeakingParticles();  // カードを描き直すので前の宝石の残り粒を捨てる（#117）
     g_gemIdx = next_scene(g_gemIdx, gem_count());
     gemDrawCard();  // 名前・明細・通し番号を更新（宝石本体は直後の update が描く）
 
@@ -1589,6 +1628,7 @@ void loop() {
 
     if (ev == TouchEvent::LongPress) {
         // 長押し → 次シーンへ巡回し、新シーンを初期描画する。
+        resetSpeakingParticles();  // 前シーンの残り粒を捨てる（新背景へ誤って塗り消さない・#117）
         g_sceneIdx = next_scene(g_sceneIdx, kSceneCount);
         kScenes[g_sceneIdx].enter();
     } else if (ev == TouchEvent::Tap) {

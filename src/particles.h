@@ -13,9 +13,12 @@ struct Particle {
     uint8_t radius;  // 粒の半径(px)（intensity で少し太る）
 };
 
-// out[capacity] にリング状の粒子を書き込む。返り値＝実際に書いた粒子数（min(count, capacity)）。
-//   baseRadius … 脈動していない時のリング半径(px)
-//   t          … アニメ時間（秒・単調増加）。公転と波打ちの位相に使う。
-//   intensity  … 0..1（範囲外は内部でクランプ）。0 なら明るさ 0＝実質見えない。
+// out[capacity] にリング状（楕円）の粒子を書き込む。返り値＝実際に書いた粒子数（min(count, capacity)）。
+//   baseRadiusX … 脈動していない時の横方向の半径(px)
+//   baseRadiusY … 縦方向の半径(px)。負値なら baseRadiusX と同値＝真円（従来動作）。
+//                 横長のアバター枠を均等に囲むため、横>縦の楕円にする用途（Issue #116）。
+//   t           … アニメ時間（秒・単調増加）。公転と波打ちの位相に使う。
+//   intensity   … 0..1（範囲外は内部でクランプ）。0 なら明るさ 0＝実質見えない。
 int particle_ring(Particle* out, int capacity, int count,
-                  int cx, int cy, int baseRadius, float t, float intensity);
+                  int cx, int cy, int baseRadiusX, float t, float intensity,
+                  int baseRadiusY = -1);
