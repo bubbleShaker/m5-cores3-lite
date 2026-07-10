@@ -26,6 +26,11 @@
 #include "particles.h"  // particle_ring（円形パーティクルの幾何・純粋ロジック・#109）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
+// 定番OSS「スタックチャン」の顔（#121 で lib_deps 追加 / #125 でシーン化）。
+// ライブラリも Expression という型を持ち自作 face_logic.h と同名なので、名前空間は開かず
+// m5avatar:: で明示的に修飾する。
+#include <Avatar.h>
+
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 240;
@@ -969,6 +974,9 @@ struct SceneDef {
     void (*enter)();                          // 切替時に1回（背景クリア・初期描画）
     void (*update)(uint32_t now);             // 毎フレーム描画
     void (*onTap)(uint32_t now, int touchX);  // 短タップ反応（touchX=離す直前のタッチX座標）
+    // 切替で「出て行く」時に1回（省略可 = nullptr）。自前で描画タスクを持つシーン（スタックちゃん）が
+    // 画面の占有を手放すために使う。持たないシーンは loop が描くだけなので nullptr でよい（#125）。
+    void (*exit)();
 };
 
 // --- 羊シーンの状態とアダプタ ---
@@ -1619,7 +1627,36 @@ static void voiceOnTap(uint32_t /*now*/, int touchX) {
     speakTts(std::string(voice_name_at(g_voiceIdx)) + "です。");
 }
 
+// --- スタックちゃんシーン（本家 M5Stack-Avatar・#125 M1） ---
+// 他シーンと違い、描画は loop() ではなくライブラリが立てる2本の FreeRTOS タスクが行う。
+//   drawLoop   … M5.Display へ顔を描き続ける
+//   facialLoop … まばたき・サッケード（視線の揺れ）・呼吸の内部状態を進める
+// よって update() は何もせず、enter/exit でタスクの生死だけを管理する。
+static m5avatar::Avatar g_stackchan;
+
+static void stackchanEnter() {
+    // 背景も含めてライブラリが全面を描くので、こちらで塗る必要はない。
+    g_stackchan.start();
+}
+static void stackchanUpdate(uint32_t /*now*/) {
+    // 描画は drawLoop タスクの担当。ここで M5.Display に触ると奪い合いになるので何もしない。
+}
+static void stackchanOnTap(uint32_t /*now*/, int /*touchX*/) {
+    // 発話と口パクは #125 M2 で配線する。
+}
+static void stackchanExit() {
+    // stop() は _isDrawing フラグを下ろすだけで、タスクは次のループ判定（drawLoop は10ms、
+    // facialLoop は33ms 周期）で自分を vTaskDelete する。ここで待たずに再 start() すると、
+    // 古いタスクが停止フラグを見る前にフラグが true へ戻り、終了しそこねた古いタスクと
+    // 新タスクが二重に描画してしまう。長押し連打で一周して戻って来た時に踏むため、
+    // 自己削除の猶予を必ず与える。
+    g_stackchan.stop();
+    delay(50);
+    M5.Display.fillScreen(kColBg);  // 次シーンへ渡す前に顔を消しておく
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
+// exit を持たないシーンは4要素目を省略する（aggregate 初期化で nullptr になる）。
 const SceneDef kScenes[] = {
     { sheepEnter,  sheepUpdate,  sheepOnTap  },
     { artEnter,    artUpdate,    artOnTap    },
@@ -1627,6 +1664,7 @@ const SceneDef kScenes[] = {
     { pokeEnter,   pokeUpdate,   pokeOnTap   },
     { volumeEnter, volumeUpdate, volumeOnTap },  // 音量調整（左右タップ・#70）
     { voiceEnter,  voiceUpdate,  voiceOnTap  },  // 話者選択（左右タップ・#105）
+    { stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
@@ -1669,6 +1707,8 @@ void loop() {
         M5.Speaker.stop();         // 前シーンの音声を打ち切る。長尺解説の再生中に切替えると遷移先の
                                    // update が他人の音声エンベロープに連動して発話ハローを描くため（#119）。
         resetSpeakingParticles();  // 前シーンの残り粒を捨てる（新背景へ誤って塗り消さない・#117）
+        // 自前の描画タスクを持つシーンに画面を手放させてから次を描き始める（#125）。
+        if (kScenes[g_sceneIdx].exit) kScenes[g_sceneIdx].exit();
         g_sceneIdx = next_scene(g_sceneIdx, kSceneCount);
         kScenes[g_sceneIdx].enter();
     } else if (ev == TouchEvent::Tap) {
