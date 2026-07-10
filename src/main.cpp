@@ -26,6 +26,11 @@
 #include "particles.h"  // particle_ring（円形パーティクルの幾何・純粋ロジック・#109）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
+// 定番OSS「スタックチャン」の顔（#121 で lib_deps 追加 / #125 でシーン化）。
+// ライブラリも Expression という型を持ち自作 face_logic.h と同名なので、名前空間は開かず
+// m5avatar:: で明示的に修飾する。
+#include <Avatar.h>
+
 // 画面レイアウト定数（320x240 を setRotation(1) で使う想定）。
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 240;
@@ -969,6 +974,9 @@ struct SceneDef {
     void (*enter)();                          // 切替時に1回（背景クリア・初期描画）
     void (*update)(uint32_t now);             // 毎フレーム描画
     void (*onTap)(uint32_t now, int touchX);  // 短タップ反応（touchX=離す直前のタッチX座標）
+    // 切替で「出て行く」時に1回（省略可 = nullptr）。自前で描画タスクを持つシーン（スタックちゃん）が
+    // 画面の占有を手放すために使う。持たないシーンは loop が描くだけなので nullptr でよい（#125）。
+    void (*exit)();
 };
 
 // --- 羊シーンの状態とアダプタ ---
@@ -1619,7 +1627,85 @@ static void voiceOnTap(uint32_t /*now*/, int touchX) {
     speakTts(std::string(voice_name_at(g_voiceIdx)) + "です。");
 }
 
+// --- スタックちゃんシーン（本家 M5Stack-Avatar・#125 M1） ---
+// 他シーンと違い、描画は loop() ではなくライブラリが立てる2本の FreeRTOS タスクが行う。
+//   drawLoop   … M5.Display へ顔を描き続ける
+//   facialLoop … まばたき・サッケード（視線の揺れ）・呼吸の内部状態を進める
+// よって update() は何もせず、enter/exit でタスクの生死だけを管理する。
+static m5avatar::Avatar g_stackchan;
+
+static void stackchanEnter() {
+    // 背景も含めてライブラリが全面を描くので、こちらで塗る必要はない。
+    // 前回の exit で2タスクの消滅を確認済みなので、ここでの start() が二重起動になることはない。
+    g_stackchan.start();
+}
+static void stackchanUpdate(uint32_t /*now*/) {
+    // 描画は drawLoop タスクの担当。ここで M5.Display に触ると奪い合いになるので何もしない。
+}
+static void stackchanOnTap(uint32_t /*now*/, int /*touchX*/) {
+    // 発話と口パクは #125 M2 で配線する。
+}
+// stop() を要求したアバターの2タスクが自己削除し終わるまで待つ。
+// 名前で引いて NULL が返る＝そのタスクはもう存在しない。
+//
+// なぜ固定 delay ではないか：Avatar::stop() は _isDrawing フラグを下ろすだけで、進行中の
+// Face::draw() を中断できない。その draw() は画面を高さ8pxの短冊30枚に分けて DMA 転送し、
+// 毎回 lgfx::delay(1) を挟む（Face.cpp）。つまり stop() の直後に draw() へ入られると、
+// 最低でも 30ms、実際にはスプライト生成と30回の pushRotateZoom を足して数十ms 走り切ってから
+// ようやくフラグを見に来る。固定の待ち時間はこの所要時間の見積もりに賭けることになる。
+//
+// なぜハンドルを保持して eTaskGetState しないか：両タスクは vTaskDelete(NULL) で自己削除し、
+// TCB は idle タスクが解放する。解放後のハンドルを覗くのは未定義動作になる。
+// 名前で引く xTaskGetHandle はハンドルを保持しないので、その危険が無い。
+//
+// タイムアウトは保険。将来ライブラリがタスク名を変えたら NULL が返らずここで空回りするが、
+// 上限で必ず抜けて従来どおり「十分待った」状態へ縮退する（表示が乱れうるだけで停止はしない）。
+constexpr uint32_t kAvatarTeardownTimeoutMs = 400;
+
+// ライブラリが xTaskCreateUniversal に渡すタスク名（Avatar.cpp）。
+// drawLoop   … M5.Display へ DMA 転送する。fillScreen と競合するので必ず消滅を待つ。
+// facialLoop … 内部の float を書くだけで Display には触れない。表示は競合しないが、
+//              生き残ったまま再 start() すると2本目が走り、呼吸・視線の状態を奪い合う。
+constexpr const char* kAvatarTaskNames[] = { "drawLoop", "facialLoop" };
+
+static void waitAvatarTasksGone() {
+    const uint32_t deadline = millis() + kAvatarTeardownTimeoutMs;
+    // millis() のラップアラウンドに耐えるよう、差の符号で判定する（絶対値の大小比較にしない）。
+    while (static_cast<int32_t>(millis() - deadline) < 0) {
+        bool alive = false;
+        for (const char* name : kAvatarTaskNames) {
+            if (xTaskGetHandle(name) != nullptr) { alive = true; break; }
+        }
+        if (!alive) return;  // 両方の自己削除を確認できた
+        // 他タスクへ CPU を譲る（最後の draw() を終えるのを待つ）。delay は vTaskDelay に落ちるので
+        // loopTask 自体がブロックし、同優先度(1)の drawLoop も上位(2)の facialLoop も確実に走る。
+        // 5ms が 5tick になるのは Arduino-ESP32 が tick を 1000Hz に設定しているため（素の ESP-IDF 既定
+        // 100Hz では 0tick = 単なる yield に落ちる）。移植時はここが前提になる。
+        delay(5);
+    }
+    // ここに来た＝上限まで待っても名前が引け続けた。実際にはタスクは _isDrawing=false で
+    // 自滅しているはず（drawLoop は draw 最悪~70ms + TaskDelay 10ms、facialLoop は ~33ms）なので
+    // 表示が壊れる可能性は低いが、ライブラリのタスク名が変わった徴候なので必ず気付けるようにする。
+    Serial.println("[avatar] teardown wait timed out; task name may have changed upstream");
+}
+
+
+static void stackchanExit() {
+    // 停止を要求 → 2タスクが消えたことを確認 → はじめて自分で塗る。
+    // この順を守らないと、生きている drawLoop の DMA 転送と fillScreen が同一バスへ並行アクセスし、
+    // 表示が化けたり顔が残ったりする。M5GFX のバストランザクションはタスク安全ではない。
+    //
+    // ここで消滅を確認しておくことが、再訪時の二重起動も同時に防ぐ。start() は
+    // `if (_isDrawing) return;` でしか守られておらず、stop() 直後（フラグ false・タスクは生存）に
+    // start() すると、古いタスクが停止フラグを見る前に true へ戻り、古い方も終了しそこねて
+    // 2本が並走してしまうためである。
+    g_stackchan.stop();
+    waitAvatarTasksGone();
+    M5.Display.fillScreen(kColBg);  // 次シーンへ渡す前に顔を消しておく
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
+// exit を持たないシーンは4要素目を省略する（aggregate 初期化で nullptr になる）。
 const SceneDef kScenes[] = {
     { sheepEnter,  sheepUpdate,  sheepOnTap  },
     { artEnter,    artUpdate,    artOnTap    },
@@ -1627,6 +1713,7 @@ const SceneDef kScenes[] = {
     { pokeEnter,   pokeUpdate,   pokeOnTap   },
     { volumeEnter, volumeUpdate, volumeOnTap },  // 音量調整（左右タップ・#70）
     { voiceEnter,  voiceUpdate,  voiceOnTap  },  // 話者選択（左右タップ・#105）
+    { stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号（next_scene で巡回する）
@@ -1669,6 +1756,8 @@ void loop() {
         M5.Speaker.stop();         // 前シーンの音声を打ち切る。長尺解説の再生中に切替えると遷移先の
                                    // update が他人の音声エンベロープに連動して発話ハローを描くため（#119）。
         resetSpeakingParticles();  // 前シーンの残り粒を捨てる（新背景へ誤って塗り消さない・#117）
+        // 自前の描画タスクを持つシーンに画面を手放させてから次を描き始める（#125）。
+        if (kScenes[g_sceneIdx].exit) kScenes[g_sceneIdx].exit();
         g_sceneIdx = next_scene(g_sceneIdx, kSceneCount);
         kScenes[g_sceneIdx].enter();
     } else if (ev == TouchEvent::Tap) {
