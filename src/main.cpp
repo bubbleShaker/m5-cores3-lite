@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 #include <math.h>     // cosf / sinf（流れ場に沿った曲線の積分に使う）
-#include "avatar.h"
+#include "face.h"     // 顔の純粋ロジック（表情/まばたき/口パク）。本家 <Avatar.h> と衝突するため avatar.h から改名（#126）
 #include "sheep.h"
 #include "art.h"      // art_generate（幾何学アートの図形プリミティブ生成・純粋ロジック）
 #include "gesture.h"  // touch_update（短タップ/長押し検出・純粋ロジック）

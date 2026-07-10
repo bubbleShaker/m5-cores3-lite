@@ -1,4 +1,4 @@
-#include "avatar.h"
+#include "face.h"
 
 float eye_openness(uint32_t elapsed_ms) {
     // 周期内の位相。瞬き窓(kBlinkDurationMs)の外ならずっと開いたまま。
