@@ -5,7 +5,10 @@
 #include <string>
 #include <vector>
 #include <math.h>     // cosf / sinf（流れ場に沿った曲線の積分に使う）
-#include "face.h"     // 顔の純粋ロジック（表情/まばたき/口パク）。本家 <Avatar.h> と衝突するため avatar.h から改名（#126）
+// 顔の純粋ロジック（表情/まばたき/口パク）。M5Stack-Avatar が Avatar.h / Face.h / Expression.h を
+// 持ち、Windows の case-insensitive FS ではそれらと同名のヘッダを src/ に置けないため、
+// ライブラリのどのヘッダとも衝突しない名前にしてある（#126。avatar.h → face.h → face_logic.h）。
+#include "face_logic.h"
 #include "sheep.h"
 #include "art.h"      // art_generate（幾何学アートの図形プリミティブ生成・純粋ロジック）
 #include "gesture.h"  // touch_update（短タップ/長押し検出・純粋ロジック）

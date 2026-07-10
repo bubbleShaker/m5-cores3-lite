@@ -1,7 +1,7 @@
 // 中継サーバの「純粋ロジック」。ネットワーク非依存なので native 同様に単体テストできる。
 // 役割は2つ: (1) Claude へ渡すプロンプト組み立て (2) Claude 応答のパース＆検証。
 
-// アバター側(avatar.h)の表情語彙と一致させる。ここがクラウドとデバイスの「契約」になる。
+// アバター側(face_logic.h)の表情語彙と一致させる。ここがクラウドとデバイスの「契約」になる。
 export type Expression = "neutral" | "happy" | "thinking" | "sad" | "surprised";
 export type Action = "none" | "notify";
 
