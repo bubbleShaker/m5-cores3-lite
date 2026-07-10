@@ -1677,9 +1677,18 @@ static void waitAvatarTasksGone() {
             if (xTaskGetHandle(name) != nullptr) { alive = true; break; }
         }
         if (!alive) return;  // 両方の自己削除を確認できた
-        delay(5);            // 他タスクへ CPU を譲る（最後の draw() を終えるのを待つ）
+        // 他タスクへ CPU を譲る（最後の draw() を終えるのを待つ）。delay は vTaskDelay に落ちるので
+        // loopTask 自体がブロックし、同優先度(1)の drawLoop も上位(2)の facialLoop も確実に走る。
+        // 5ms が 5tick になるのは Arduino-ESP32 が tick を 1000Hz に設定しているため（素の ESP-IDF 既定
+        // 100Hz では 0tick = 単なる yield に落ちる）。移植時はここが前提になる。
+        delay(5);
     }
+    // ここに来た＝上限まで待っても名前が引け続けた。実際にはタスクは _isDrawing=false で
+    // 自滅しているはず（drawLoop は draw 最悪~70ms + TaskDelay 10ms、facialLoop は ~33ms）なので
+    // 表示が壊れる可能性は低いが、ライブラリのタスク名が変わった徴候なので必ず気付けるようにする。
+    Serial.println("[avatar] teardown wait timed out; task name may have changed upstream");
 }
+
 
 static void stackchanExit() {
     // 停止を要求 → 2タスクが消えたことを確認 → はじめて自分で塗る。
