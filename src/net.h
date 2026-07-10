@@ -1,6 +1,6 @@
 #pragma once
 #include <string>
-#include "avatar.h"  // Expression / parse_expression を再利用する
+#include "face_logic.h"  // Expression / parse_expression を再利用する
 
 // Wi-Fi の接続状態（ハード非依存・テストからも参照する）。
 enum class WifiState { Connecting, Connected, Failed };

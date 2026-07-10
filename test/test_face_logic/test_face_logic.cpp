@@ -1,6 +1,6 @@
 #include <unity.h>
 #include <string>
-#include "avatar.h"
+#include "face_logic.h"
 
 void setUp(void) {}
 void tearDown(void) {}
