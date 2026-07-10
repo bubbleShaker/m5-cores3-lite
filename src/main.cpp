@@ -1636,6 +1636,7 @@ static m5avatar::Avatar g_stackchan;
 
 static void stackchanEnter() {
     // 背景も含めてライブラリが全面を描くので、こちらで塗る必要はない。
+    // 前回の exit で2タスクの消滅を確認済みなので、ここでの start() が二重起動になることはない。
     g_stackchan.start();
 }
 static void stackchanUpdate(uint32_t /*now*/) {
@@ -1644,14 +1645,53 @@ static void stackchanUpdate(uint32_t /*now*/) {
 static void stackchanOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 発話と口パクは #125 M2 で配線する。
 }
+// stop() を要求したアバターの2タスクが自己削除し終わるまで待つ。
+// 名前で引いて NULL が返る＝そのタスクはもう存在しない。
+//
+// なぜ固定 delay ではないか：Avatar::stop() は _isDrawing フラグを下ろすだけで、進行中の
+// Face::draw() を中断できない。その draw() は画面を高さ8pxの短冊30枚に分けて DMA 転送し、
+// 毎回 lgfx::delay(1) を挟む（Face.cpp）。つまり stop() の直後に draw() へ入られると、
+// 最低でも 30ms、実際にはスプライト生成と30回の pushRotateZoom を足して数十ms 走り切ってから
+// ようやくフラグを見に来る。固定の待ち時間はこの所要時間の見積もりに賭けることになる。
+//
+// なぜハンドルを保持して eTaskGetState しないか：両タスクは vTaskDelete(NULL) で自己削除し、
+// TCB は idle タスクが解放する。解放後のハンドルを覗くのは未定義動作になる。
+// 名前で引く xTaskGetHandle はハンドルを保持しないので、その危険が無い。
+//
+// タイムアウトは保険。将来ライブラリがタスク名を変えたら NULL が返らずここで空回りするが、
+// 上限で必ず抜けて従来どおり「十分待った」状態へ縮退する（表示が乱れうるだけで停止はしない）。
+constexpr uint32_t kAvatarTeardownTimeoutMs = 400;
+
+// ライブラリが xTaskCreateUniversal に渡すタスク名（Avatar.cpp）。
+// drawLoop   … M5.Display へ DMA 転送する。fillScreen と競合するので必ず消滅を待つ。
+// facialLoop … 内部の float を書くだけで Display には触れない。表示は競合しないが、
+//              生き残ったまま再 start() すると2本目が走り、呼吸・視線の状態を奪い合う。
+constexpr const char* kAvatarTaskNames[] = { "drawLoop", "facialLoop" };
+
+static void waitAvatarTasksGone() {
+    const uint32_t deadline = millis() + kAvatarTeardownTimeoutMs;
+    // millis() のラップアラウンドに耐えるよう、差の符号で判定する（絶対値の大小比較にしない）。
+    while (static_cast<int32_t>(millis() - deadline) < 0) {
+        bool alive = false;
+        for (const char* name : kAvatarTaskNames) {
+            if (xTaskGetHandle(name) != nullptr) { alive = true; break; }
+        }
+        if (!alive) return;  // 両方の自己削除を確認できた
+        delay(5);            // 他タスクへ CPU を譲る（最後の draw() を終えるのを待つ）
+    }
+}
+
 static void stackchanExit() {
-    // stop() は _isDrawing フラグを下ろすだけで、タスクは次のループ判定（drawLoop は10ms、
-    // facialLoop は33ms 周期）で自分を vTaskDelete する。ここで待たずに再 start() すると、
-    // 古いタスクが停止フラグを見る前にフラグが true へ戻り、終了しそこねた古いタスクと
-    // 新タスクが二重に描画してしまう。長押し連打で一周して戻って来た時に踏むため、
-    // 自己削除の猶予を必ず与える。
+    // 停止を要求 → 2タスクが消えたことを確認 → はじめて自分で塗る。
+    // この順を守らないと、生きている drawLoop の DMA 転送と fillScreen が同一バスへ並行アクセスし、
+    // 表示が化けたり顔が残ったりする。M5GFX のバストランザクションはタスク安全ではない。
+    //
+    // ここで消滅を確認しておくことが、再訪時の二重起動も同時に防ぐ。start() は
+    // `if (_isDrawing) return;` でしか守られておらず、stop() 直後（フラグ false・タスクは生存）に
+    // start() すると、古いタスクが停止フラグを見る前に true へ戻り、古い方も終了しそこねて
+    // 2本が並走してしまうためである。
     g_stackchan.stop();
-    delay(50);
+    waitAvatarTasksGone();
     M5.Display.fillScreen(kColBg);  // 次シーンへ渡す前に顔を消しておく
 }
 
