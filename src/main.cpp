@@ -1124,7 +1124,10 @@ static void gemUpdate(uint32_t now) {
     // スプライト矩形と上部ヘッダ帯を除外（カード下部は文字が密なので中心を宝石に置き上半分で光らせる）。
     // 背景は宝石カードと同じ kColBg。ジオメトリは実機で調整する初期値。
     constexpr int kGemRingRx     = 104;  // 横半径：宝石スプライト半辺58を越えて左右に出す
-    constexpr int kGemRingRy     = 52;   // 縦半径：宝石の上下は本体スプライトに隠れ、左右のハローが残る
+    constexpr int kGemRingRy     = 40;   // 縦半径：脈動込みでも名前上端(124)を越えない上限。
+                                         // 下端上界 = kGemCy(62)+ry(40)+脈動11+粒半径4 = 117 < 124（名前上端）。
+                                         // 上下は本体スプライトに隠れ左右ハローが残るが、旧52比で縦は約2割平たくなる
+                                         // （X到達=rx104依存で不変・halo消失なし。平たさは実機#111で最終確認）（#119・ポケ#117と同型）
     constexpr int kGemHeaderH    = 22;   // 上部ヘッダ（図鑑名・通し番号）の帯の高さ
     const ParticleExcl gemExcl[] = {
         { kGemCx - kGemHalf, kGemCy - kGemHalf, kGemHalf * 2, kGemHalf * 2 },  // 宝石スプライト
@@ -1660,6 +1663,8 @@ void loop() {
 
     if (ev == TouchEvent::LongPress) {
         // 長押し → 次シーンへ巡回し、新シーンを初期描画する。
+        M5.Speaker.stop();         // 前シーンの音声を打ち切る。長尺解説の再生中に切替えると遷移先の
+                                   // update が他人の音声エンベロープに連動して発話ハローを描くため（#119）。
         resetSpeakingParticles();  // 前シーンの残り粒を捨てる（新背景へ誤って塗り消さない・#117）
         g_sceneIdx = next_scene(g_sceneIdx, kSceneCount);
         kScenes[g_sceneIdx].enter();
