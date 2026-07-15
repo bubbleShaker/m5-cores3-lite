@@ -82,3 +82,56 @@ Pos pac_step(Pos p, Dir d) {
     const Pos delta = dir_delta(d);
     return Pos{p.x + delta.x, p.y + delta.y};
 }
+
+// ───────── ゲーム状態（Step3） ─────────
+
+// (x,y) が eaten 配列の有効な添字か。範囲外アクセスを防ぐ共通ガード。
+static bool in_eaten_bounds(int x, int y) {
+    return x >= 0 && x < kPacMaxW && y >= 0 && y < kPacMaxH;
+}
+
+PacGame pac_game_init() {
+    PacGame g{};  // 集約の値初期化で eaten を全 false、その他を 0 にする
+    g.player    = pac_player_start();
+    g.dir       = Dir::None;
+    g.score     = 0;
+    g.dots_left = 0;
+    // 迷路上のドット／パワーエサ総数を数え、クリア判定用の残数に入れる。
+    for (int y = 0; y < pac_maze_h(); ++y) {
+        for (int x = 0; x < pac_maze_w(); ++x) {
+            const Tile t = pac_tile_at(x, y);
+            if (t == Tile::Dot || t == Tile::Power) ++g.dots_left;
+        }
+    }
+    return g;
+}
+
+Tile pac_current_tile(const PacGame& g, int x, int y) {
+    const Tile t = pac_tile_at(x, y);
+    // 回収済みのドット／パワーエサは床（Empty）として見せる。壁・範囲外はそのまま。
+    if ((t == Tile::Dot || t == Tile::Power) && in_eaten_bounds(x, y) && g.eaten[y][x]) {
+        return Tile::Empty;
+    }
+    return t;
+}
+
+bool pac_game_advance(PacGame& g, Dir desired) {
+    // 曲がれる時だけ予約方向を採用。desired が Dir::None（予約なし）だと pac_can_move は
+    // 常に false なので g.dir は維持され、慣性でそのまま直進し続ける（本家と同じ挙動）。
+    if (pac_can_move(g.player, desired)) g.dir = desired;
+    if (!pac_can_move(g.player, g.dir)) return false;      // 壁向きなら動かない
+    g.player = pac_step(g.player, g.dir);
+
+    // 入った先が未回収のペレットなら食べる（同じマスを再訪しても二重加点しない）。
+    // ドットとパワーエサは得点だけ異なり、回収処理（eaten 記録・残数減）は共通。
+    const int x = g.player.x, y = g.player.y;
+    if (in_eaten_bounds(x, y) && !g.eaten[y][x]) {
+        const Tile t = pac_tile_at(x, y);
+        if (t == Tile::Dot || t == Tile::Power) {
+            g.eaten[y][x] = true;
+            g.score += (t == Tile::Power) ? kPacScorePower : kPacScoreDot;
+            --g.dots_left;
+        }
+    }
+    return true;
+}

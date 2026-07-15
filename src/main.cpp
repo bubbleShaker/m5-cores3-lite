@@ -1745,9 +1745,9 @@ constexpr PacRect kPadDown  { 268, 138, 294, 164 };
 constexpr PacRect kPadLeft  { 242, 108, 268, 134 };
 constexpr PacRect kPadRight { 294, 108, 320, 134 };
 
-// プレイヤーの状態（このシーン局所。ドット/スコア/ゴーストは Step3 以降で純粋層へ移す）。
-Pos      g_pacPos      = {1, 1};    // 現在のマス
-Dir      g_pacDir      = Dir::None; // 実際に進んでいる方向
+// ゲーム状態。プレイヤー位置・進行方向・スコア・回収済みマスは純粋層 PacGame（native テスト済み）が持つ。
+// このシーン局所の一時変数（予約方向・タイマ・タッチ立ち上がり）だけ描画層で保持する。
+PacGame  g_pacGame;                 // 迷路プレイの状態（pac_game_init / pac_game_advance で更新）
 Dir      g_pacDesired  = Dir::None; // タップで予約した進行方向（曲がれる所で採用）
 uint32_t g_pacLastStep = 0;         // 最後に1マス進んだ時刻
 bool     g_pacPrevTouch = false;    // 前フレームで触れていたか（押した瞬間だけ拾う立ち上がり検出）
@@ -1764,14 +1764,15 @@ static Dir pacDpadDirAt(int x, int y) {
     return Dir::None;
 }
 
-// 1マス (tx,ty) を迷路データ通りに描く（プレイヤーの通過跡を消す時にも使う）。
+// 1マス (tx,ty) を現在の見た目通りに描く（プレイヤーの通過跡を消す時にも使う）。
+// pac_current_tile を使うので、回収済みのドット／パワーエサは床として描かれ二度と復活しない。
 static void pacDrawTile(int tx, int ty) {
     const int px = kPacOx + tx * kPacTile;
     const int py = kPacOy + ty * kPacTile;
     M5.Display.fillRect(px, py, kPacTile, kPacTile, kColBg);  // まず背景で消す
     const int cx = px + kPacTile / 2;
     const int cy = py + kPacTile / 2;
-    switch (pac_tile_at(tx, ty)) {
+    switch (pac_current_tile(g_pacGame, tx, ty)) {
         case Tile::Wall:
             // 1px 内側に塗って升目の境界を見せる（隣の壁と繋がって見えるのを防ぐ）
             M5.Display.fillRect(px + 1, py + 1, kPacTile - 2, kPacTile - 2, kColPacWall);
@@ -1830,10 +1831,22 @@ static void pacDrawDpad() {
       M5.Display.fillTriangle(cx + m, cy, cx - m, cy - m, cx - m, cy + m, kColPacPadIcon); }
 }
 
+// スコアを画面右上（十字パッド帯の上・y<48）に描く。入場時とスコア変化時だけ呼ぶ。
+static void pacDrawScore() {
+    const int x = kPadLeft.x0;                       // 迷路(x<240)より右の帯に置く
+    M5.Display.fillRect(x, 8, kScreenW - x, 40, kColBg);  // 数字が伸びても消えるよう帯ごと消去
+    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.setCursor(x + 2, 10);
+    M5.Display.print("SCORE");
+    M5.Display.setCursor(x + 2, 28);
+    M5.Display.printf("%d", g_pacGame.score);
+}
+
 static void pacEnter() {
     M5.Display.fillScreen(kColBg);
-    g_pacPos      = pac_player_start();
-    g_pacDir      = Dir::None;
+    g_pacGame     = pac_game_init();  // プレイヤー初期位置・スコア0・全ペレット未回収
     g_pacDesired  = Dir::None;
     g_pacLastStep = millis();
     // 入場は長押し（メニュー決定）で来るため指がまだ触れている可能性がある。
@@ -1841,7 +1854,8 @@ static void pacEnter() {
     g_pacPrevTouch = true;
     pacDrawMaze();
     pacDrawDpad();
-    pacDrawPlayer(g_pacPos.x, g_pacPos.y);
+    pacDrawScore();
+    pacDrawPlayer(g_pacGame.player.x, g_pacGame.player.y);
 }
 
 static void pacUpdate(uint32_t now) {
@@ -1854,17 +1868,17 @@ static void pacUpdate(uint32_t now) {
     }
     g_pacPrevTouch = touching;
 
-    // ② 移動：一定間隔ごとに1マスだけ進める。曲がれるなら予約方向へ切替え、進めるなら1マス動く。
+    // ② 移動：一定間隔ごとに1ティック進める。方向転換・移動・ペレット回収は純粋層に委譲する。
     if (now - g_pacLastStep < kPacStepMs) return;
     g_pacLastStep = now;
 
-    if (pac_can_move(g_pacPos, g_pacDesired)) g_pacDir = g_pacDesired;  // 予約方向へ曲がれる時だけ採用
-    if (!pac_can_move(g_pacPos, g_pacDir)) return;                      // 壁向きなら停止（描画も不要）
+    const Pos old        = g_pacGame.player;
+    const int prevScore  = g_pacGame.score;
+    if (!pac_game_advance(g_pacGame, g_pacDesired)) return;  // 壁向きで動かなければ描画も不要
 
-    const Pos old = g_pacPos;
-    g_pacPos = pac_step(g_pacPos, g_pacDir);
-    pacDrawTile(old.x, old.y);                    // 通過跡を迷路の見た目に戻す
-    pacDrawPlayer(g_pacPos.x, g_pacPos.y);        // 新しい位置に描く
+    pacDrawTile(old.x, old.y);                        // 通過跡を現在の見た目に戻す（食べた跡は床）
+    pacDrawPlayer(g_pacGame.player.x, g_pacGame.player.y);
+    if (g_pacGame.score != prevScore) pacDrawScore();  // 得点した時だけスコア再描画
 }
 
 static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {

@@ -149,6 +149,106 @@ void test_moves_one_tile_into_open() {
     TEST_ASSERT_TRUE_MESSAGE(tested, "player start has no open neighbor");
 }
 
+// ───────── Step3：ゲーム状態（ドット回収＋スコア） ─────────
+
+// 初期状態：スコア0、残ペレット>0、プレイヤーは初期位置、まだ何も食べていない
+void test_game_init_state() {
+    const PacGame g = pac_game_init();
+    TEST_ASSERT_EQUAL_INT(0, g.score);
+    TEST_ASSERT_GREATER_THAN_INT(0, g.dots_left);
+    const Pos s = pac_player_start();
+    TEST_ASSERT_EQUAL_INT(s.x, g.player.x);
+    TEST_ASSERT_EQUAL_INT(s.y, g.player.y);
+    // 初期位置のタイルは見た目上もペレットではない（'P' は床扱い）
+    TEST_ASSERT_EQUAL(static_cast<int>(Tile::Empty),
+                      static_cast<int>(pac_current_tile(g, s.x, s.y)));
+}
+
+// 初期の残ペレット数は迷路上のドット＋パワーエサ総数と一致する
+void test_dots_left_matches_maze() {
+    int pellets = 0;
+    for (int y = 0; y < pac_maze_h(); ++y)
+        for (int x = 0; x < pac_maze_w(); ++x) {
+            const Tile t = pac_tile_at(x, y);
+            if (t == Tile::Dot || t == Tile::Power) ++pellets;
+        }
+    const PacGame g = pac_game_init();
+    TEST_ASSERT_EQUAL_INT(pellets, g.dots_left);
+}
+
+// 隣接するペレットへ進むと、加点され残数が減り、そのマスは見た目上 Empty になる
+void test_advance_eats_pellet() {
+    PacGame g = pac_game_init();
+
+    // 初期位置から動ける方向を1つ選び、その先が元々ペレットのマスを探す
+    const Dir dirs[] = {Dir::Left, Dir::Right, Dir::Up, Dir::Down};
+    bool tested = false;
+    for (Dir d : dirs) {
+        if (!pac_can_move(g.player, d)) continue;
+        const Pos next = pac_step(g.player, d);
+        const Tile t = pac_tile_at(next.x, next.y);
+        if (t != Tile::Dot && t != Tile::Power) continue;
+
+        const int before_score = g.score;
+        const int before_left  = g.dots_left;
+        const int gain = (t == Tile::Power) ? kPacScorePower : kPacScoreDot;
+
+        const bool moved = pac_game_advance(g, d);
+        TEST_ASSERT_TRUE(moved);
+        TEST_ASSERT_EQUAL_INT(next.x, g.player.x);
+        TEST_ASSERT_EQUAL_INT(next.y, g.player.y);
+        TEST_ASSERT_EQUAL_INT(before_score + gain, g.score);
+        TEST_ASSERT_EQUAL_INT(before_left - 1, g.dots_left);
+        // 食べたマスは見た目上 Empty になる（描画層が再びドットを描かないため）
+        TEST_ASSERT_EQUAL(static_cast<int>(Tile::Empty),
+                          static_cast<int>(pac_current_tile(g, next.x, next.y)));
+        tested = true;
+        break;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(tested, "no adjacent pellet from start to test eating");
+}
+
+// 同じペレットマスを再訪しても二重加点しない
+void test_no_double_scoring() {
+    PacGame g = pac_game_init();
+
+    // ドットへ1マス進んで食べる（Left へ進める迷路前提。念のため到達可能な方向を選ぶ）
+    Dir eat_dir = Dir::None;
+    const Dir dirs[] = {Dir::Left, Dir::Right, Dir::Up, Dir::Down};
+    for (Dir d : dirs) {
+        if (!pac_can_move(g.player, d)) continue;
+        const Pos next = pac_step(g.player, d);
+        if (pac_tile_at(next.x, next.y) == Tile::Dot) { eat_dir = d; break; }
+    }
+    TEST_ASSERT_NOT_EQUAL(static_cast<int>(Dir::None), static_cast<int>(eat_dir));
+
+    pac_game_advance(g, eat_dir);        // ドットを食べる
+    const int score_after_eat = g.score;
+    const int left_after_eat  = g.dots_left;
+
+    // 逆向きに戻ってから、同じマスへ再訪する
+    const Dir back = (eat_dir == Dir::Left) ? Dir::Right :
+                     (eat_dir == Dir::Right) ? Dir::Left :
+                     (eat_dir == Dir::Up) ? Dir::Down : Dir::Up;
+    pac_game_advance(g, back);           // 元のマスへ戻る（'P'＝床、加点なし）
+    pac_game_advance(g, eat_dir);        // 食べ済みマスへ再訪
+
+    TEST_ASSERT_EQUAL_INT(score_after_eat, g.score);      // 加点されない
+    TEST_ASSERT_EQUAL_INT(left_after_eat, g.dots_left);   // 残数も変わらない
+}
+
+// 壁向きの advance は動かず（false）、スコアも変わらない
+void test_advance_into_wall_no_move() {
+    PacGame g = pac_game_init();
+    g.player = Pos{1, 1};  // 外周のすぐ内側。左＝外周壁
+    const int before = g.score;
+    const bool moved = pac_game_advance(g, Dir::Left);
+    TEST_ASSERT_FALSE(moved);
+    TEST_ASSERT_EQUAL_INT(1, g.player.x);
+    TEST_ASSERT_EQUAL_INT(1, g.player.y);
+    TEST_ASSERT_EQUAL_INT(before, g.score);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_maze_has_positive_size);
@@ -161,5 +261,10 @@ int main(int, char**) {
     RUN_TEST(test_all_floor_reachable_from_start);
     RUN_TEST(test_all_rows_have_full_width);
     RUN_TEST(test_moves_one_tile_into_open);
+    RUN_TEST(test_game_init_state);
+    RUN_TEST(test_dots_left_matches_maze);
+    RUN_TEST(test_advance_eats_pellet);
+    RUN_TEST(test_no_double_scoring);
+    RUN_TEST(test_advance_into_wall_no_move);
     return UNITY_END();
 }

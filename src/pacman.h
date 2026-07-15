@@ -46,3 +46,37 @@ bool pac_can_move(Pos p, Dir d);
 // p から d へ1マス進めた結果の位置を返す。
 //   動けない時（pac_can_move が false）は p のまま返す（すり抜けない）。
 Pos pac_step(Pos p, Dir d);
+
+// ───────── ゲーム状態（Step3：ドット回収＋スコア） ─────────
+// プレイヤー位置・進行方向・スコア・回収済みマスをまとめて持つ。実機描画には依存せず、
+// 「動く／食べる／得点する」を純粋関数として native でテストできる（gem3d と同じ思想）。
+
+// eaten 配列のコンパイル時サイズ。実迷路 15x13 に余裕を持たせた固定上限。
+// 迷路をこれ以上大きくする時はここを広げること（pac_maze_w/h が超えると回収状態を保持できない）。
+constexpr int kPacMaxW = 32;
+constexpr int kPacMaxH = 32;
+
+// 得点（本家準拠：ドット10点／パワーエサ50点）。
+constexpr int kPacScoreDot   = 10;
+constexpr int kPacScorePower = 50;
+
+struct PacGame {
+    Pos  player;                       // 現在のマス
+    Dir  dir;                          // 実際に進んでいる方向
+    int  score;                        // 累計スコア
+    int  dots_left;                    // 残りドット＋パワーエサ数（0でクリア＝Step5で使用）
+    bool eaten[kPacMaxH][kPacMaxW];    // 回収済みマス（true=食べた）。[y][x] の順で添字する
+};
+
+// ゲームを初期化して返す。プレイヤーは初期位置、スコア0、全ペレット未回収。
+PacGame pac_game_init();
+
+// 現在「見た目上」のタイル。元がドット/パワーエサでも回収済みなら Empty を返す。
+//   壁・範囲外は pac_tile_at と同じく Wall（回収状態に依存しない）。
+Tile pac_current_tile(const PacGame& g, int x, int y);
+
+// desired 方向へ1ティック進める純粋関数（状態 g を更新する）。
+//   曲がれるなら desired へ方向転換し、進めるなら1マス動く。
+//   入った先が未回収のペレットなら食べて score/dots_left/eaten を更新する。
+//   実際に動いたら true、壁などで動けなければ false を返す。
+bool pac_game_advance(PacGame& g, Dir desired);
