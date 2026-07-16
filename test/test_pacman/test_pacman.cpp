@@ -249,6 +249,77 @@ void test_advance_into_wall_no_move() {
     TEST_ASSERT_EQUAL_INT(before, g.score);
 }
 
+// ───────── Step4：ゴースト（追跡AIと衝突） ─────────
+
+// 初期状態：局面は Playing、ゴーストは壁でない床に居る
+void test_ghost_init_state() {
+    const PacGame g = pac_game_init();
+    TEST_ASSERT_EQUAL(static_cast<int>(PacPhase::Playing), static_cast<int>(g.phase));
+    TEST_ASSERT_NOT_EQUAL(static_cast<int>(Tile::Wall),
+                          static_cast<int>(pac_tile_at(g.ghost.pos.x, g.ghost.pos.y)));
+}
+
+// 追跡AIが返す方向は必ず壁でない方向（ゴーストは壁にめり込まない）
+void test_ghost_ai_never_picks_wall() {
+    PacGame g = pac_game_init();
+    // プレイヤーは動かさず、ゴーストだけ多数ティック進めても常に床の上に居る
+    for (int i = 0; i < 60; ++i) {
+        const Dir d = pac_ghost_next_dir(g);
+        if (d == Dir::None) break;  // 完全に囲まれた（この迷路では起きない想定）
+        TEST_ASSERT_TRUE(pac_can_move(g.ghost.pos, d));
+        g.ghost.dir = d;
+        g.ghost.pos = pac_step(g.ghost.pos, d);
+        TEST_ASSERT_NOT_EQUAL(static_cast<int>(Tile::Wall),
+                              static_cast<int>(pac_tile_at(g.ghost.pos.x, g.ghost.pos.y)));
+    }
+}
+
+// 停止しているプレイヤーは、追跡ゴーストにいずれ捕まる（AIが実際に近づいている証拠）
+void test_stationary_player_gets_caught() {
+    PacGame g = pac_game_init();
+    bool caught = false;
+    // 迷路は 15x13＝最大距離でも数十歩。十分な回数ティックすれば必ず捕獲されるはず。
+    for (int i = 0; i < 200; ++i) {
+        pac_game_tick(g, Dir::None);  // プレイヤーは入力なし＝その場に留まる
+        if (g.phase == PacPhase::Dead) { caught = true; break; }
+    }
+    TEST_ASSERT_TRUE_MESSAGE(caught, "ghost failed to catch a stationary player");
+}
+
+// プレイヤーが自らゴーストのマスへ突っ込むと、そのティックで捕獲され Dead になる
+// （ゴーストは逆走禁止なので「真後ろ」からは寄って来ない。衝突判定そのものを検証するため
+//   プレイヤー側から重ねるシナリオにする）。
+void test_walking_into_ghost_catches() {
+    PacGame g = pac_game_init();
+    // プレイヤーが進める方向 d を選び、その隣接マスにゴーストを置く
+    const Dir dirs[] = {Dir::Left, Dir::Right, Dir::Up, Dir::Down};
+    Dir into = Dir::None;
+    for (Dir d : dirs) {
+        if (!pac_can_move(g.player, d)) continue;
+        g.ghost.pos = pac_step(g.player, d);
+        into = d;
+        break;
+    }
+    TEST_ASSERT_NOT_EQUAL(static_cast<int>(Dir::None), static_cast<int>(into));
+
+    pac_game_tick(g, into);  // プレイヤーが d 方向へ1マス＝ゴーストのマスへ重なる
+    TEST_ASSERT_EQUAL(static_cast<int>(PacPhase::Dead), static_cast<int>(g.phase));
+}
+
+// 決着後（Dead）は tick しても状態が動かない
+void test_tick_is_noop_after_dead() {
+    PacGame g = pac_game_init();
+    g.phase = PacPhase::Dead;
+    const Pos pp = g.player;
+    const Pos gp = g.ghost.pos;
+    const PacTickResult r = pac_game_tick(g, Dir::Right);
+    TEST_ASSERT_FALSE(r.player_moved);
+    TEST_ASSERT_EQUAL_INT(pp.x, g.player.x);
+    TEST_ASSERT_EQUAL_INT(pp.y, g.player.y);
+    TEST_ASSERT_EQUAL_INT(gp.x, g.ghost.pos.x);
+    TEST_ASSERT_EQUAL_INT(gp.y, g.ghost.pos.y);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_maze_has_positive_size);
@@ -266,5 +337,10 @@ int main(int, char**) {
     RUN_TEST(test_advance_eats_pellet);
     RUN_TEST(test_no_double_scoring);
     RUN_TEST(test_advance_into_wall_no_move);
+    RUN_TEST(test_ghost_init_state);
+    RUN_TEST(test_ghost_ai_never_picks_wall);
+    RUN_TEST(test_stationary_player_gets_caught);
+    RUN_TEST(test_walking_into_ghost_catches);
+    RUN_TEST(test_tick_is_noop_after_dead);
     return UNITY_END();
 }

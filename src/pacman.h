@@ -60,15 +60,34 @@ constexpr int kPacMaxH = 32;
 constexpr int kPacScoreDot   = 10;
 constexpr int kPacScorePower = 50;
 
-struct PacGame {
-    Pos  player;                       // 現在のマス
-    Dir  dir;                          // 実際に進んでいる方向
-    int  score;                        // 累計スコア
-    int  dots_left;                    // 残りドット＋パワーエサ数（0でクリア＝Step5で使用）
-    bool eaten[kPacMaxH][kPacMaxW];    // 回収済みマス（true=食べた）。[y][x] の順で添字する
+// ゲームの局面。Dead=ゴーストに捕まった、Clear=全ペレット回収（Step5で使用）。
+enum class PacPhase : uint8_t { Playing, Dead, Clear };
+
+// 敵ゴースト（Step4：1体）。位置と進行方向を持つ。
+struct Ghost {
+    Pos pos;
+    Dir dir;
 };
 
-// ゲームを初期化して返す。プレイヤーは初期位置、スコア0、全ペレット未回収。
+struct PacGame {
+    Pos      player;                   // 現在のマス
+    Dir      dir;                      // 実際に進んでいる方向
+    int      score;                    // 累計スコア
+    int      dots_left;                // 残りドット＋パワーエサ数（0でクリア＝Step5で使用）
+    bool     eaten[kPacMaxH][kPacMaxW];// 回収済みマス（true=食べた）。[y][x] の順で添字する
+    Ghost    ghost;                    // 敵ゴースト（Step4）
+    PacPhase phase;                    // 局面（Playing/Dead/Clear）
+};
+
+// 1ティック進めた結果。描画層が「動く前の位置」を消すために使う。
+struct PacTickResult {
+    Pos  player_from;  // このティックでプレイヤーが居たマス
+    Pos  ghost_from;   // このティックでゴーストが居たマス
+    bool player_moved; // プレイヤーが実際に動いたか
+};
+
+// ゲームを初期化して返す。プレイヤーは初期位置、スコア0、全ペレット未回収、
+// ゴーストは所定の初期マス、局面は Playing。
 PacGame pac_game_init();
 
 // 現在「見た目上」のタイル。元がドット/パワーエサでも回収済みなら Empty を返す。
@@ -80,3 +99,18 @@ Tile pac_current_tile(const PacGame& g, int x, int y);
 //   入った先が未回収のペレットなら食べて score/dots_left/eaten を更新する。
 //   実際に動いたら true、壁などで動けなければ false を返す。
 bool pac_game_advance(PacGame& g, Dir desired);
+
+// ───────── ゴースト（Step4：追跡AIと衝突） ─────────
+
+// ゴーストが次に進むべき方向を返す純粋関数（追跡AI）。
+//   壁を避け、直前方向の逆走を禁じ、プレイヤーへのマンハッタン距離が最小になる方向を選ぶ。
+//   同距離が並んだ時は Up > Left > Down > Right の優先順で決定的に選ぶ（本家準拠）。
+//   逆走以外に進める道が無い袋小路のみ逆走を許す。動けなければ Dir::None。
+Dir pac_ghost_next_dir(const PacGame& g);
+
+// ゲームを1ティック進める（プレイヤー移動→ゴースト移動→衝突判定）。
+//   プレイヤーは desired 方向へ、ゴーストは追跡AIに従って各1マス動く。
+//   同じマスに重なる／すれ違って入れ替わると捕獲とみなし phase=Dead にする。
+//   phase が Playing 以外なら何もしない（動かない）。
+//   戻り値は描画層が旧位置を消すための「動く前の位置」。
+PacTickResult pac_game_tick(PacGame& g, Dir desired);
