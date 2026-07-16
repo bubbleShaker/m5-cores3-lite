@@ -1945,6 +1945,13 @@ static int      g_videoDots    = -1;  // 直近に描いたドット数（変化
 constexpr int kVideoDotFps    = 2;    // 準備中アニメの速さ（2fps＝0.5秒ごとに1コマ進む）
 constexpr int kVideoDotFrames = 4;    // ドットは 0..3 個を巡回
 
+// 巡回ドットの描画領域。幅は kVideoDotFrames-1(=3) 個の "." が収まる大きさ。
+// フレーム数を増やして "." が 80px を超える場合はここも広げること（消し残り防止）。
+constexpr int kVideoDotsX = 8;
+constexpr int kVideoDotsY = 150;
+constexpr int kVideoDotsW = 80;
+constexpr int kVideoDotsH = 18;
+
 static void videoEnter() {
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
@@ -1962,6 +1969,9 @@ static void videoEnter() {
     M5.Display.setFont(&fonts::Font0);          // 既定へ戻す（他描画への影響回避）
     M5.Display.setTextDatum(textdatum_t::top_left);
 
+    // ドット領域を明示的に初期化しておく（videoUpdate の消去に暗黙依存させない・#142 レビュー指摘）。
+    M5.Display.fillRect(kVideoDotsX, kVideoDotsY, kVideoDotsW, kVideoDotsH, kColBg);
+
     g_videoEnterMs = millis();
     g_videoDots    = -1;  // 次の update で必ず1回描く
 }
@@ -1974,14 +1984,12 @@ static void videoUpdate(uint32_t now) {
     g_videoDots = dots;
 
     // 「準備中なのだ」の下に "." を dots 個。固定幅の領域をクリアしてから描く（前フレームを消す）。
-    constexpr int kDotsX = 8;
-    constexpr int kDotsY = 150;
-    M5.Display.fillRect(kDotsX, kDotsY, 80, 18, kColBg);
+    M5.Display.fillRect(kVideoDotsX, kVideoDotsY, kVideoDotsW, kVideoDotsH, kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextColor(TFT_WHITE, kColBg);
     M5.Display.setTextDatum(textdatum_t::top_left);
     const std::string s(dots, '.');
-    M5.Display.drawString(s.c_str(), kDotsX, kDotsY);
+    M5.Display.drawString(s.c_str(), kVideoDotsX, kVideoDotsY);
     M5.Display.setFont(&fonts::Font0);  // 既定へ戻す
 }
 
