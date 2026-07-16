@@ -1852,19 +1852,26 @@ static void pacDrawScore() {
     M5.Display.printf("%d", g_pacGame.score);
 }
 
-// ゲームオーバーの帯を迷路の中央に重ねて描く（Dead になった瞬間に1回）。
-// TODO(Step5): クリア（PacPhase::Clear）を追加する時は、この "GAME OVER" 文言を局面で分岐すること
-//   （Clear でも GAME OVER と出す取りこぼしを防ぐ）。
-static void pacDrawGameOver() {
+// 全ゴーストを現在位置に描く。
+static void pacDrawGhosts() {
+    for (int i = 0; i < kPacGhostCount; ++i)
+        pacDrawGhost(g_pacGame.ghosts[i].pos.x, g_pacGame.ghosts[i].pos.y);
+}
+
+// 決着（Dead/Clear）の帯を迷路の中央に重ねて描く。局面で文言と枠色を変える。
+static void pacDrawResult(PacPhase phase) {
+    const bool clear = (phase == PacPhase::Clear);
+    const uint16_t accent = clear ? TFT_GREEN : TFT_RED;
+    const char* title = clear ? "CLEAR!" : "GAME OVER";
     const int w = 180, h = 46;
     const int x = (240 - w) / 2;               // 迷路描画域（x<240）の中央
     const int y = (kScreenH - h) / 2;
     M5.Display.fillRoundRect(x, y, w, h, 6, TFT_BLACK);
-    M5.Display.drawRoundRect(x, y, w, h, 6, TFT_RED);
+    M5.Display.drawRoundRect(x, y, w, h, 6, accent);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::middle_center);
-    M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-    M5.Display.drawString("GAME OVER", x + w / 2, y + h / 2 - 8);
+    M5.Display.setTextColor(accent, TFT_BLACK);
+    M5.Display.drawString(title, x + w / 2, y + h / 2 - 8);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.drawString("長押しでメニューへ", x + w / 2, y + h / 2 + 10);
     M5.Display.setTextDatum(textdatum_t::top_left);  // 既定に戻す（他描画への影響を避ける）
@@ -1882,7 +1889,7 @@ static void pacEnter() {
     pacDrawDpad();
     pacDrawScore();
     pacDrawPlayer(g_pacGame.player.x, g_pacGame.player.y);
-    pacDrawGhost(g_pacGame.ghost.pos.x, g_pacGame.ghost.pos.y);
+    pacDrawGhosts();
 }
 
 static void pacUpdate(uint32_t now) {
@@ -1905,15 +1912,17 @@ static void pacUpdate(uint32_t now) {
     const int prevScore = g_pacGame.score;
     const PacTickResult r = pac_game_tick(g_pacGame, g_pacDesired);
 
-    // 動く前の位置を現在の見た目に戻してから、新しい位置へプレイヤーとゴーストを描く。
+    // 動く前の位置を現在の見た目に戻してから、新しい位置へプレイヤーと全ゴーストを描く。
     // ゴーストの通過跡（ドット等）も pacDrawTile が正しく復元する。
     pacDrawTile(r.player_from.x, r.player_from.y);
-    pacDrawTile(r.ghost_from.x, r.ghost_from.y);
+    for (int i = 0; i < kPacGhostCount; ++i)
+        pacDrawTile(r.ghost_from[i].x, r.ghost_from[i].y);
     pacDrawPlayer(g_pacGame.player.x, g_pacGame.player.y);
-    pacDrawGhost(g_pacGame.ghost.pos.x, g_pacGame.ghost.pos.y);
+    pacDrawGhosts();
     if (g_pacGame.score != prevScore) pacDrawScore();  // 得点した時だけスコア再描画
 
-    if (g_pacGame.phase == PacPhase::Dead) pacDrawGameOver();  // 捕まった瞬間に1回
+    // 決着した瞬間に結果表示（Dead=GAME OVER / Clear=CLEAR!）。
+    if (g_pacGame.phase != PacPhase::Playing) pacDrawResult(g_pacGame.phase);
 }
 
 static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
