@@ -368,6 +368,86 @@ void test_clear_when_all_pellets_eaten() {
     TEST_ASSERT_EQUAL_INT(0, g.dots_left);
 }
 
+// ───────── Step5b：パワーエサ逃走モードと捕食 ─────────
+
+// テスト用のマンハッタン距離（純粋層の内部 manhattan は非公開なので同義を用意）。
+static int md(Pos a, Pos b) {
+    const int dx = a.x - b.x, dy = a.y - b.y;
+    return (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+}
+
+// パワーエサを食べると逃走タイマがセットされる
+void test_power_pellet_triggers_fright() {
+    PacGame g = pac_game_init();
+    // パワーエサ (7,5) の真下 (7,6) は床。そこから上へ進んでパワーエサを食べる。
+    g.player = Pos{7, 6};
+    g.dir    = Dir::None;
+    TEST_ASSERT_EQUAL(static_cast<int>(Tile::Power),
+                      static_cast<int>(pac_tile_at(7, 5)));  // 前提確認
+    const bool moved = pac_game_advance(g, Dir::Up);
+    TEST_ASSERT_TRUE(moved);
+    TEST_ASSERT_EQUAL_INT(kPacFrightTicks, g.fright_timer);
+}
+
+// 追跡は候補中で最も近づく方向、逃走は最も遠ざかる方向を選ぶ（AIの目的関数を直接検証）。
+void test_fright_ghost_flees() {
+    PacGame g = pac_game_init();
+    // 候補の距離が非対称なマスへ置く（(1,3) は上=遠い/下=近いと差が出る）。dir=Left のまま。
+    g.ghosts[0].pos = Pos{1, 3};
+    const Pos gp  = g.ghosts[0].pos;
+    const Dir rev = Dir::Right;  // 初期 dir=Left の逆走（AIが除外する方向）
+
+    // ゴースト0が実際に選べる候補（壁でも逆走でもない方向）の距離の最小・最大を求める。
+    const Dir dirs[] = {Dir::Up, Dir::Down, Dir::Left, Dir::Right};
+    int lo = 1 << 30, hi = -1;
+    for (Dir d : dirs) {
+        if (d == rev || !pac_can_move(gp, d)) continue;
+        const int dist = md(pac_step(gp, d), g.player);
+        if (dist < lo) lo = dist;
+        if (dist > hi) hi = dist;
+    }
+    TEST_ASSERT_TRUE(hi >= 0);  // 候補が1つ以上ある前提
+
+    g.fright_timer = 0;                          // 追跡＝最小距離
+    const Dir chase = pac_ghost_next_dir(g, 0);
+    TEST_ASSERT_EQUAL_INT(lo, md(pac_step(gp, chase), g.player));
+
+    g.fright_timer = kPacFrightTicks;            // 逃走＝最大距離
+    const Dir flee = pac_ghost_next_dir(g, 0);
+    TEST_ASSERT_EQUAL_INT(hi, md(pac_step(gp, flee), g.player));
+}
+
+// 逃走中のゴーストに触れると、死なずに捕食して加点し、ゴーストは巣へ戻る
+void test_eat_frightened_ghost() {
+    PacGame g = pac_game_init();
+    g.fright_timer = kPacFrightTicks;  // 逃走中
+
+    // プレイヤーが進める方向 d を選び、その隣接マスにゴースト0を置く
+    const Dir dirs[] = {Dir::Left, Dir::Right, Dir::Up, Dir::Down};
+    Dir into = Dir::None;
+    for (Dir d : dirs) {
+        if (!pac_can_move(g.player, d)) continue;
+        g.ghosts[0].pos = pac_step(g.player, d);
+        into = d;
+        break;
+    }
+    TEST_ASSERT_NOT_EQUAL(static_cast<int>(Dir::None), static_cast<int>(into));
+
+    const int before = g.score;
+    pac_game_tick(g, into);  // プレイヤーがゴースト0のマスへ乗る＝捕食
+
+    TEST_ASSERT_EQUAL(static_cast<int>(PacPhase::Playing), static_cast<int>(g.phase));  // 死なない
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(before + kPacScoreEatGhost, g.score);              // 200点以上増える
+}
+
+// 逃走タイマは毎ティック1ずつ減る
+void test_fright_timer_decrements() {
+    PacGame g = pac_game_init();
+    g.fright_timer = 5;
+    pac_game_tick(g, Dir::None);  // プレイヤー静止・ゴーストは逃げるので衝突しない
+    TEST_ASSERT_EQUAL_INT(4, g.fright_timer);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_maze_has_positive_size);
@@ -392,5 +472,9 @@ int main(int, char**) {
     RUN_TEST(test_tick_is_noop_after_dead);
     RUN_TEST(test_four_distinct_ghosts);
     RUN_TEST(test_clear_when_all_pellets_eaten);
+    RUN_TEST(test_power_pellet_triggers_fright);
+    RUN_TEST(test_fright_ghost_flees);
+    RUN_TEST(test_eat_frightened_ghost);
+    RUN_TEST(test_fright_timer_decrements);
     return UNITY_END();
 }

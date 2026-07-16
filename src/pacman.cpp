@@ -110,7 +110,8 @@ PacGame pac_game_init() {
         g.ghosts[i].pos = kGhostStarts[i];
         g.ghosts[i].dir = Dir::Left;  // 初期の進行方向（逆走禁止の基準）
     }
-    g.phase     = PacPhase::Playing;
+    g.fright_timer = 0;
+    g.phase        = PacPhase::Playing;
     // 迷路上のドット／パワーエサ総数を数え、クリア判定用の残数に入れる。
     for (int y = 0; y < pac_maze_h(); ++y) {
         for (int x = 0; x < pac_maze_w(); ++x) {
@@ -146,6 +147,9 @@ bool pac_game_advance(PacGame& g, Dir desired) {
             g.eaten[y][x] = true;
             g.score += (t == Tile::Power) ? kPacScorePower : kPacScoreDot;
             --g.dots_left;
+            // パワーエサを食べたら、以後 kPacFrightTicks の間ゴーストが逃走する（Step5b）。
+            // 連続で食べた時は延長ではなく上書きリセット（本家準拠：最後の1個からの時間で数える）。
+            if (t == Tile::Power) g.fright_timer = kPacFrightTicks;
         }
     }
     return true;
@@ -179,19 +183,21 @@ static const int kPacDistInf = 1 << 30;
 Dir pac_ghost_next_dir(const PacGame& g, int gi) {
     if (gi < 0 || gi >= kPacGhostCount) return Dir::None;  // 公開APIの誤用に対する防御
     const Ghost& gh = g.ghosts[gi];
-    // タイブレークの優先順（本家準拠）。order を優先順に並べ、下で厳密小なり(<)で比較するので
+    // タイブレークの優先順（本家準拠）。order を優先順に並べ、下で厳密不等号で比較するので
     // 同距離のときは配列の先頭側＝優先度の高い方向が先勝ちになる（決定的な選択）。
     const Dir order[4] = {Dir::Up, Dir::Left, Dir::Down, Dir::Right};
-    const Dir rev = opposite(gh.dir);
+    const Dir rev  = opposite(gh.dir);
+    const bool flee = (g.fright_timer > 0);  // 逃走モードならプレイヤーから離れる方向を選ぶ
 
     Dir best = Dir::None;
-    int bestDist = kPacDistInf;  // 未選択を表す番兵。実距離は迷路サイズ程度でこれを超えない。
-    // 逆走を除いた候補から、プレイヤーへ最も近づく方向を選ぶ。
+    // 追跡は距離を最小化（番兵は +∞）、逃走は最大化（番兵は -1）。
+    int bestDist = flee ? -1 : kPacDistInf;
     for (Dir d : order) {
         if (d == rev) continue;                   // 逆走は禁止（往復ジッタ防止）
         if (!pac_can_move(gh.pos, d)) continue;   // 壁は避ける
         const int dist = manhattan(pac_step(gh.pos, d), g.player);
-        if (dist < bestDist) { bestDist = dist; best = d; }
+        const bool better = flee ? (dist > bestDist) : (dist < bestDist);
+        if (better) { bestDist = dist; best = d; }
     }
     if (best != Dir::None) return best;
 
@@ -200,11 +206,21 @@ Dir pac_ghost_next_dir(const PacGame& g, int gi) {
     return Dir::None;  // 完全に囲まれている（通常は起きない）
 }
 
-// いずれかのゴーストがプレイヤーと同じマスに居るか。
-static bool any_ghost_on_player(const PacGame& g) {
-    for (int i = 0; i < kPacGhostCount; ++i)
-        if (same_tile(g.player, g.ghosts[i].pos)) return true;
-    return false;
+// プレイヤーと重なったゴーストとの接触を解決し、状態を遷移させる。
+//   逃走モード（fright_timer>0）なら、そのゴーストを食べる（加点して初期位置へ復帰）。
+//   通常モードなら、プレイヤーが捕まって Dead になる。
+//   プレイヤー移動後とゴースト移動後の両方で呼ぶ（衝突の取りこぼしを防ぐ）。
+static void resolve_player_ghost_contact(PacGame& g) {
+    for (int i = 0; i < kPacGhostCount; ++i) {
+        if (!same_tile(g.player, g.ghosts[i].pos)) continue;
+        if (g.fright_timer > 0) {
+            g.score += kPacScoreEatGhost;
+            g.ghosts[i].pos = kGhostStarts[i];  // 巣（初期位置）へ戻す
+            g.ghosts[i].dir = Dir::Left;
+        } else {
+            g.phase = PacPhase::Dead;
+        }
+    }
 }
 
 PacTickResult pac_game_tick(PacGame& g, Dir desired) {
@@ -214,14 +230,16 @@ PacTickResult pac_game_tick(PacGame& g, Dir desired) {
     for (int i = 0; i < kPacGhostCount; ++i) r.ghost_from[i] = g.ghosts[i].pos;
     if (g.phase != PacPhase::Playing) return r;  // 決着後は何もしない
 
-    // ① プレイヤーを先に進める。移動直後にゴーストのマスへ乗ったら捕獲（ゴーストは動かさず決着）。
+    // ① プレイヤーを先に進める（パワーエサを食べたらここで fright_timer がセットされる）。
+    //    移動直後の衝突を解決：逃走中なら捕食、通常なら Dead。
     r.player_moved = pac_game_advance(g, desired);
-    if (any_ghost_on_player(g)) { g.phase = PacPhase::Dead; return r; }
+    resolve_player_ghost_contact(g);
+    if (g.phase == PacPhase::Dead) return r;
 
     // ② 全ペレット回収でクリア（ゴーストを動かす前に確定させ、決着後の余計な移動を避ける）。
     if (g.dots_left == 0) { g.phase = PacPhase::Clear; return r; }
 
-    // ③ 各ゴーストを追跡AIに従って1マス進める。
+    // ③ 各ゴーストを AI に従って1マス進める（追跡 or 逃走は fright_timer で切り替わる）。
     for (int i = 0; i < kPacGhostCount; ++i) {
         const Dir gd = pac_ghost_next_dir(g, i);
         if (gd != Dir::None) {
@@ -230,11 +248,14 @@ PacTickResult pac_game_tick(PacGame& g, Dir desired) {
         }
     }
 
-    // ④ ゴースト移動後に同じマスなら捕獲。
+    // ④ ゴースト移動後の衝突を解決。
     //    プレイヤー→ゴーストの逐次解決なので、これで「すれ違い（入れ替わり）」も取りこぼさない：
     //    両者が隣接マスを入れ替わるなら、①でプレイヤーがゴーストの旧マス（＝この時点のゴースト
-    //    位置）へ乗るため、①の判定が必ず先に発火する。よって③→④は「ゴーストがプレイヤーへ突っ込む」
-    //    ケースだけを担い、別途のすれ違い判定は不要（重複するだけ）。
-    if (any_ghost_on_player(g)) g.phase = PacPhase::Dead;
+    //    位置）へ乗るため、①の解決が必ず先に発火する。よって③→④は「ゴーストがプレイヤーへ突っ込む」
+    //    ケースだけを担う。
+    resolve_player_ghost_contact(g);
+
+    // ⑤ 逃走タイマを1減らす（0で追跡モードへ戻る）。
+    if (g.fright_timer > 0) --g.fright_timer;
     return r;
 }

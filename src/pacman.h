@@ -56,9 +56,13 @@ Pos pac_step(Pos p, Dir d);
 constexpr int kPacMaxW = 32;
 constexpr int kPacMaxH = 32;
 
-// 得点（本家準拠：ドット10点／パワーエサ50点）。
-constexpr int kPacScoreDot   = 10;
-constexpr int kPacScorePower = 50;
+// 得点（本家準拠：ドット10点／パワーエサ50点／逃走ゴースト捕食200点）。
+constexpr int kPacScoreDot      = 10;
+constexpr int kPacScorePower    = 50;
+constexpr int kPacScoreEatGhost = 200;
+
+// パワーエサを食べてからゴーストが逃走する時間（ティック数）。
+constexpr int kPacFrightTicks = 30;
 
 // ゲームの局面。Dead=ゴーストに捕まった、Clear=全ペレット回収。
 enum class PacPhase : uint8_t { Playing, Dead, Clear };
@@ -79,6 +83,7 @@ struct PacGame {
     int      dots_left;                    // 残りドット＋パワーエサ数（0でクリア）
     bool     eaten[kPacMaxH][kPacMaxW];    // 回収済みマス（true=食べた）。[y][x] の順で添字する
     Ghost    ghosts[kPacGhostCount];       // 敵ゴースト4体（Step5a）
+    int      fright_timer;                 // >0 の間はゴースト逃走モード（毎ティック減る・Step5b）
     PacPhase phase;                        // 局面（Playing/Dead/Clear）
 };
 
@@ -106,7 +111,8 @@ bool pac_game_advance(PacGame& g, Dir desired);
 // ───────── ゴースト（Step4：追跡AIと衝突） ─────────
 
 // ゴースト gi（0..kPacGhostCount-1）が次に進むべき方向を返す純粋関数（追跡AI）。
-//   壁を避け、直前方向の逆走を禁じ、プレイヤーへのマンハッタン距離が最小になる方向を選ぶ。
+//   壁を避け、直前方向の逆走を禁じ、プレイヤーへのマンハッタン距離が「最小」になる方向を選ぶ。
+//   逃走モード（g.fright_timer > 0）のときは逆に距離が「最大」になる方向を選んで逃げる。
 //   同距離が並んだ時は Up > Left > Down > Right の優先順で決定的に選ぶ（本家準拠）。
 //   逆走以外に進める道が無い袋小路のみ逆走を許す。動けなければ Dir::None。
 Dir pac_ghost_next_dir(const PacGame& g, int gi);
