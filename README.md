@@ -53,6 +53,28 @@ pio run -e m5stack-cores3 -t upload  # 実機へ書き込み
 pio test -e native                   # ホストPCで純粋ロジックの単体テスト
 ```
 
+### 動画素材の変換（tools/video2frames.py）
+
+ESP32-S3 単体では YouTube 生ストリーム（H.264/VP9・DRM）を復号できないため、動画は
+PC 側で **JPEG フレーム列 + WAV** に事前変換し、microSD から再生する（`drawJpg` + `playRaw`）。
+
+```sh
+# yt-dlp + ffmpeg が必要（例: pipx install yt-dlp / apt install ffmpeg）
+python tools/video2frames.py https://youtu.be/Xbt0EqXOAjw --name sample
+# 既定で ./video/sample/ に出力。--fps / --sample-rate / --quality で調整可
+```
+
+出力レイアウト（この `<name>/` ごと microSD の `/video/` 下へ置く）:
+
+| ファイル | 内容 |
+|---------|------|
+| `frame_00001.jpg` … | 320x240 レターボックスの連番 JPEG |
+| `audio.wav` | 16bit PCM の抽出音声 |
+| `meta.txt` | manifest（`fps=` / `frames=` / `width=` / `height=` / `sample_rate=` / `channels=`） |
+
+`meta.txt` の `fps` / `frames` は端末の `video_frame_at()` にそのまま渡す時間軸の基準。
+変換後の動画アセット（`video/`）は `.gitignore` 済みで**コミットしない**（実行時のみ・非コミット）。
+
 ## 開発フロー
 
 Issue 起票 → 実装 → PR → レビュー → マージ
