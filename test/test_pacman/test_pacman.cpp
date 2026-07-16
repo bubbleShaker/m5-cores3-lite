@@ -251,26 +251,30 @@ void test_advance_into_wall_no_move() {
 
 // ───────── Step4：ゴースト（追跡AIと衝突） ─────────
 
-// 初期状態：局面は Playing、ゴーストは壁でない床に居る
+// 初期状態：局面は Playing、4体のゴーストは全て壁でない床に居る
 void test_ghost_init_state() {
     const PacGame g = pac_game_init();
     TEST_ASSERT_EQUAL(static_cast<int>(PacPhase::Playing), static_cast<int>(g.phase));
-    TEST_ASSERT_NOT_EQUAL(static_cast<int>(Tile::Wall),
-                          static_cast<int>(pac_tile_at(g.ghost.pos.x, g.ghost.pos.y)));
+    for (int i = 0; i < kPacGhostCount; ++i) {
+        TEST_ASSERT_NOT_EQUAL(static_cast<int>(Tile::Wall),
+                              static_cast<int>(pac_tile_at(g.ghosts[i].pos.x, g.ghosts[i].pos.y)));
+    }
 }
 
-// 追跡AIが返す方向は必ず壁でない方向（ゴーストは壁にめり込まない）
+// 追跡AIが返す方向は必ず壁でない方向（ゴーストは壁にめり込まない）。全ゴーストで検査する。
 void test_ghost_ai_never_picks_wall() {
     PacGame g = pac_game_init();
-    // プレイヤーは動かさず、ゴーストだけ多数ティック進めても常に床の上に居る
-    for (int i = 0; i < 60; ++i) {
-        const Dir d = pac_ghost_next_dir(g);
-        if (d == Dir::None) break;  // 完全に囲まれた（この迷路では起きない想定）
-        TEST_ASSERT_TRUE(pac_can_move(g.ghost.pos, d));
-        g.ghost.dir = d;
-        g.ghost.pos = pac_step(g.ghost.pos, d);
-        TEST_ASSERT_NOT_EQUAL(static_cast<int>(Tile::Wall),
-                              static_cast<int>(pac_tile_at(g.ghost.pos.x, g.ghost.pos.y)));
+    for (int gi = 0; gi < kPacGhostCount; ++gi) {
+        // プレイヤーは動かさず、ゴーストだけ多数ティック進めても常に床の上に居る
+        for (int i = 0; i < 60; ++i) {
+            const Dir d = pac_ghost_next_dir(g, gi);
+            if (d == Dir::None) break;  // 完全に囲まれた（この迷路では起きない想定）
+            TEST_ASSERT_TRUE(pac_can_move(g.ghosts[gi].pos, d));
+            g.ghosts[gi].dir = d;
+            g.ghosts[gi].pos = pac_step(g.ghosts[gi].pos, d);
+            TEST_ASSERT_NOT_EQUAL(static_cast<int>(Tile::Wall),
+                                  static_cast<int>(pac_tile_at(g.ghosts[gi].pos.x, g.ghosts[gi].pos.y)));
+        }
     }
 }
 
@@ -291,18 +295,18 @@ void test_stationary_player_gets_caught() {
 //   プレイヤー側から重ねるシナリオにする）。
 void test_walking_into_ghost_catches() {
     PacGame g = pac_game_init();
-    // プレイヤーが進める方向 d を選び、その隣接マスにゴーストを置く
+    // プレイヤーが進める方向 d を選び、その隣接マスにゴースト0を置く
     const Dir dirs[] = {Dir::Left, Dir::Right, Dir::Up, Dir::Down};
     Dir into = Dir::None;
     for (Dir d : dirs) {
         if (!pac_can_move(g.player, d)) continue;
-        g.ghost.pos = pac_step(g.player, d);
+        g.ghosts[0].pos = pac_step(g.player, d);
         into = d;
         break;
     }
     TEST_ASSERT_NOT_EQUAL(static_cast<int>(Dir::None), static_cast<int>(into));
 
-    pac_game_tick(g, into);  // プレイヤーが d 方向へ1マス＝ゴーストのマスへ重なる
+    pac_game_tick(g, into);  // プレイヤーが d 方向へ1マス＝ゴースト0のマスへ重なる
     TEST_ASSERT_EQUAL(static_cast<int>(PacPhase::Dead), static_cast<int>(g.phase));
 }
 
@@ -311,13 +315,57 @@ void test_tick_is_noop_after_dead() {
     PacGame g = pac_game_init();
     g.phase = PacPhase::Dead;
     const Pos pp = g.player;
-    const Pos gp = g.ghost.pos;
+    const Pos gp = g.ghosts[0].pos;
     const PacTickResult r = pac_game_tick(g, Dir::Right);
     TEST_ASSERT_FALSE(r.player_moved);
     TEST_ASSERT_EQUAL_INT(pp.x, g.player.x);
     TEST_ASSERT_EQUAL_INT(pp.y, g.player.y);
-    TEST_ASSERT_EQUAL_INT(gp.x, g.ghost.pos.x);
-    TEST_ASSERT_EQUAL_INT(gp.y, g.ghost.pos.y);
+    TEST_ASSERT_EQUAL_INT(gp.x, g.ghosts[0].pos.x);
+    TEST_ASSERT_EQUAL_INT(gp.y, g.ghosts[0].pos.y);
+}
+
+// ───────── Step5a：4体化とクリア判定 ─────────
+
+// 4体のゴーストが居て、初期位置は互いに異なる
+void test_four_distinct_ghosts() {
+    const PacGame g = pac_game_init();
+    for (int i = 0; i < kPacGhostCount; ++i)
+        for (int j = i + 1; j < kPacGhostCount; ++j) {
+            const bool same = (g.ghosts[i].pos.x == g.ghosts[j].pos.x &&
+                               g.ghosts[i].pos.y == g.ghosts[j].pos.y);
+            TEST_ASSERT_FALSE_MESSAGE(same, "two ghosts share the same start tile");
+        }
+}
+
+// 最後の1個のペレットを回収すると Clear になる（ゴーストは動かさず即確定）
+void test_clear_when_all_pellets_eaten() {
+    PacGame g = pac_game_init();
+
+    // プレイヤー初期位置から、隣接するドットの方向を1つ選ぶ（そこを「最後の1個」にする）
+    const Dir dirs[] = {Dir::Left, Dir::Right, Dir::Up, Dir::Down};
+    Dir target = Dir::None;
+    Pos targetPos{};
+    for (Dir d : dirs) {
+        if (!pac_can_move(g.player, d)) continue;
+        const Pos np = pac_step(g.player, d);
+        if (pac_tile_at(np.x, np.y) == Tile::Dot) { target = d; targetPos = np; break; }
+    }
+    TEST_ASSERT_NOT_EQUAL(static_cast<int>(Dir::None), static_cast<int>(target));
+
+    // 目標マス以外の全ペレットを「回収済み」にして、残り1個の状態を作る
+    for (int y = 0; y < pac_maze_h(); ++y)
+        for (int x = 0; x < pac_maze_w(); ++x) {
+            const Tile t = pac_tile_at(x, y);
+            if ((t == Tile::Dot || t == Tile::Power) &&
+                !(x == targetPos.x && y == targetPos.y)) {
+                g.eaten[y][x] = true;
+            }
+        }
+    g.dots_left = 1;
+
+    pac_game_tick(g, target);  // 最後のドットを食べる → dots_left=0 → Clear
+    TEST_ASSERT_EQUAL(static_cast<int>(PacPhase::Clear), static_cast<int>(g.phase));
+    TEST_ASSERT_EQUAL_INT(0, g.dots_left);
 }
 
 int main(int, char**) {
@@ -342,5 +390,7 @@ int main(int, char**) {
     RUN_TEST(test_stationary_player_gets_caught);
     RUN_TEST(test_walking_into_ghost_catches);
     RUN_TEST(test_tick_is_noop_after_dead);
+    RUN_TEST(test_four_distinct_ghosts);
+    RUN_TEST(test_clear_when_all_pellets_eaten);
     return UNITY_END();
 }

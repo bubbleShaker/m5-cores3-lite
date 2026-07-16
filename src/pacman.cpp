@@ -90,9 +90,15 @@ static bool in_eaten_bounds(int x, int y) {
     return x >= 0 && x < kPacMaxW && y >= 0 && y < kPacMaxH;
 }
 
-// ゴーストの初期マス。中央上の床（プレイヤー初期位置 (7,9) から十分離れている）。
-// 迷路データ上は床（ドット）で、連結性テストにより必ずプレイヤーへ到達できる。
-static const Pos kGhostStart{7, 3};
+// 4体のゴーストの初期マス。いずれも迷路データ上は床で、迷路は全床が連結しているため
+// （test_all_floor_reachable_from_start が保証）プレイヤーへ到達できる。
+// プレイヤー初期位置 (7,9) から散らして配置する。
+static const Pos kGhostStarts[kPacGhostCount] = {
+    {7, 3},   // 中央上
+    {1, 1},   // 左上
+    {13, 1},  // 右上
+    {7, 7},   // 中央（パワーエサ上）
+};
 
 PacGame pac_game_init() {
     PacGame g{};  // 集約の値初期化で eaten を全 false、その他を 0 にする
@@ -100,8 +106,10 @@ PacGame pac_game_init() {
     g.dir       = Dir::None;
     g.score     = 0;
     g.dots_left = 0;
-    g.ghost.pos = kGhostStart;
-    g.ghost.dir = Dir::Left;   // 初期の進行方向（逆走禁止の基準）
+    for (int i = 0; i < kPacGhostCount; ++i) {
+        g.ghosts[i].pos = kGhostStarts[i];
+        g.ghosts[i].dir = Dir::Left;  // 初期の進行方向（逆走禁止の基準）
+    }
     g.phase     = PacPhase::Playing;
     // 迷路上のドット／パワーエサ総数を数え、クリア判定用の残数に入れる。
     for (int y = 0; y < pac_maze_h(); ++y) {
@@ -168,48 +176,65 @@ static int manhattan(Pos a, Pos b) {
 // 「まだどの方向も選んでいない」ことを表す番兵距離。迷路サイズ程度の実距離を必ず上回る。
 static const int kPacDistInf = 1 << 30;
 
-Dir pac_ghost_next_dir(const PacGame& g) {
+Dir pac_ghost_next_dir(const PacGame& g, int gi) {
+    if (gi < 0 || gi >= kPacGhostCount) return Dir::None;  // 公開APIの誤用に対する防御
+    const Ghost& gh = g.ghosts[gi];
     // タイブレークの優先順（本家準拠）。order を優先順に並べ、下で厳密小なり(<)で比較するので
     // 同距離のときは配列の先頭側＝優先度の高い方向が先勝ちになる（決定的な選択）。
     const Dir order[4] = {Dir::Up, Dir::Left, Dir::Down, Dir::Right};
-    const Dir rev = opposite(g.ghost.dir);
+    const Dir rev = opposite(gh.dir);
 
     Dir best = Dir::None;
     int bestDist = kPacDistInf;  // 未選択を表す番兵。実距離は迷路サイズ程度でこれを超えない。
     // 逆走を除いた候補から、プレイヤーへ最も近づく方向を選ぶ。
     for (Dir d : order) {
-        if (d == rev) continue;                       // 逆走は禁止（往復ジッタ防止）
-        if (!pac_can_move(g.ghost.pos, d)) continue;  // 壁は避ける
-        const int dist = manhattan(pac_step(g.ghost.pos, d), g.player);
+        if (d == rev) continue;                   // 逆走は禁止（往復ジッタ防止）
+        if (!pac_can_move(gh.pos, d)) continue;   // 壁は避ける
+        const int dist = manhattan(pac_step(gh.pos, d), g.player);
         if (dist < bestDist) { bestDist = dist; best = d; }
     }
     if (best != Dir::None) return best;
 
     // 逆走以外に道が無い袋小路のときだけ、引き返す。
-    if (pac_can_move(g.ghost.pos, rev)) return rev;
+    if (pac_can_move(gh.pos, rev)) return rev;
     return Dir::None;  // 完全に囲まれている（通常は起きない）
 }
 
+// いずれかのゴーストがプレイヤーと同じマスに居るか。
+static bool any_ghost_on_player(const PacGame& g) {
+    for (int i = 0; i < kPacGhostCount; ++i)
+        if (same_tile(g.player, g.ghosts[i].pos)) return true;
+    return false;
+}
+
 PacTickResult pac_game_tick(PacGame& g, Dir desired) {
-    PacTickResult r{ g.player, g.ghost.pos, false };
+    PacTickResult r{};
+    r.player_from  = g.player;
+    r.player_moved = false;
+    for (int i = 0; i < kPacGhostCount; ++i) r.ghost_from[i] = g.ghosts[i].pos;
     if (g.phase != PacPhase::Playing) return r;  // 決着後は何もしない
 
     // ① プレイヤーを先に進める。移動直後にゴーストのマスへ乗ったら捕獲（ゴーストは動かさず決着）。
     r.player_moved = pac_game_advance(g, desired);
-    if (same_tile(g.player, g.ghost.pos)) { g.phase = PacPhase::Dead; return r; }
+    if (any_ghost_on_player(g)) { g.phase = PacPhase::Dead; return r; }
 
-    // ② ゴーストを追跡AIに従って1マス進める。
-    const Dir gd = pac_ghost_next_dir(g);
-    if (gd != Dir::None) {
-        g.ghost.dir = gd;
-        g.ghost.pos = pac_step(g.ghost.pos, gd);
+    // ② 全ペレット回収でクリア（ゴーストを動かす前に確定させ、決着後の余計な移動を避ける）。
+    if (g.dots_left == 0) { g.phase = PacPhase::Clear; return r; }
+
+    // ③ 各ゴーストを追跡AIに従って1マス進める。
+    for (int i = 0; i < kPacGhostCount; ++i) {
+        const Dir gd = pac_ghost_next_dir(g, i);
+        if (gd != Dir::None) {
+            g.ghosts[i].dir = gd;
+            g.ghosts[i].pos = pac_step(g.ghosts[i].pos, gd);
+        }
     }
 
-    // ③ ゴースト移動後に同じマスなら捕獲。
+    // ④ ゴースト移動後に同じマスなら捕獲。
     //    プレイヤー→ゴーストの逐次解決なので、これで「すれ違い（入れ替わり）」も取りこぼさない：
-    //    もし両者が隣接マスを入れ替わるなら、①でプレイヤーがゴーストの旧マス（＝この時点のゴースト
-    //    位置）へ乗るため、①の判定が必ず先に発火する。よって②→③は「ゴーストがプレイヤーへ突っ込む」
+    //    両者が隣接マスを入れ替わるなら、①でプレイヤーがゴーストの旧マス（＝この時点のゴースト
+    //    位置）へ乗るため、①の判定が必ず先に発火する。よって③→④は「ゴーストがプレイヤーへ突っ込む」
     //    ケースだけを担い、別途のすれ違い判定は不要（重複するだけ）。
-    if (same_tile(g.player, g.ghost.pos)) g.phase = PacPhase::Dead;
+    if (any_ghost_on_player(g)) g.phase = PacPhase::Dead;
     return r;
 }
