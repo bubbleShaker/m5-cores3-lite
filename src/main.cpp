@@ -1949,6 +1949,7 @@ static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
 
 // SD 上のアセット位置。PC で `python tools/video2frames.py <URL> --name sample` を実行し、
 // 出た video/sample/ を microSD の /video/sample/ にコピーしておく（アセットは非コミット）。
+static constexpr const char* kVideoDir        = "/video/sample";
 static constexpr const char* kVideoMetaPath   = "/video/sample/meta.txt";
 static constexpr const char* kVideoFrame1Path = "/video/sample/frame_00001.jpg";
 
@@ -1962,6 +1963,7 @@ static uint32_t g_videoEnterMs = 0;   // 経過時間の起点（フレーム送
 static int      g_videoFps     = 0;   // meta.txt の fps（2b で video_frame_at へ渡す）
 static int      g_videoFrames  = 0;   // meta.txt の frames（同上）
 static bool     g_videoReady   = false; // SD 初期化＋meta 読み＋1枚表示まで成功したか
+static int      g_videoLastIdx  = 0;    // 直近に描いたフレーム番号（0基点・同番号ならスキップ）
 
 // microSD を一度だけマウントする（シーン入場ごとの二重初期化を避ける・reviewer 指摘）。
 // 成功したら以降は即 true。失敗（未挿入等）時は false のままなので、カードを挿して
@@ -2034,14 +2036,32 @@ static void videoEnter() {
         return;
     }
 
+    // 経過時間の起点は「1枚目を出し終えた今」に取り直す。冒頭で取ると SD マウント/meta 読み/
+    // 初回 drawJpg のぶんだけフレームが先に飛んでしまうため。g_videoLastIdx は 0（=1枚目）に
+    // 揃えておき、videoUpdate は 2 枚目以降だけを描く。
+    g_videoLastIdx = 0;
+    g_videoEnterMs = millis();
     g_videoReady = true;
     M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
 }
 
-static void videoUpdate(uint32_t /*now*/) {
-    // Step2a は 1 枚表示のみ。連番フレーム送り（video_frame_at で g_videoFps/g_videoFrames
-    // から番号を出し、変化時だけ drawJpgFile）は 2b で実装する。ここではまだ再描画しない。
-    (void)g_videoReady;
+static void videoUpdate(uint32_t now) {
+    if (!g_videoReady) return;  // SD/meta/1枚目のどれかで失敗した入場では動かさない
+
+    // 実時刻基準でフレーム番号を出す（純粋ロジック video_frame_at）。SD 読み＋デコードが
+    // 1/fps に間に合わなければ、その番号が自然に飛ぶ＝時間軸がずれない（2c の音声同期の前提）。
+    int idx = video_frame_at(now - g_videoEnterMs, g_videoFps, g_videoFrames);
+    if (idx == g_videoLastIdx) return;  // 同じ番号なら描かない（ちらつき/SD負荷回避・既存の作法）
+
+    // 番号（0基点）→ /video/sample/frame_%05d.jpg（1基点・純粋ロジック video_frame_path）。
+    // 欠け/破損フレーム（exists 失敗や drawJpg 失敗）でもこの番号は「消化済み」にする。
+    // 更新せず return すると、恒常的に欠けた番号の時間窓（最大 1/fps 秒）ずっと毎ループ
+    // SD を叩き続けるため。同番号スキップの作法と一貫させ、次の番号まで SD に触れない。
+    char path[64];
+    if (video_frame_path(path, sizeof(path), kVideoDir, idx) && SD.exists(path)) {
+        M5.Display.drawJpgFile(SD, path);  // 失敗しても次番号まで待つ（絵は前フレームのまま）
+    }
+    g_videoLastIdx = idx;
 }
 
 static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {

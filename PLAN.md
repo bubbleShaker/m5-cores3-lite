@@ -25,8 +25,12 @@ yt-dlp 依存で不安定なため不採用）。
         純粋ロジック `meta_get_int`（src/meta.{h,cpp}・native テスト）追加。
         SD 作法は research/sd-video-playback.md にまとめた（重要: `SD.h` は `M5Unified.h` より
         **先に** include する。M5GFX が include 時に SD 対応を有効化するため）。
-  - [ ] **2b（次はここ）**: 連番フレーム送りループ（videoUpdate）。
-  - [ ] **2c**: 音声同期（audio.wav / playRaw）。
+  - [x] **2b（完了・Issue #150）**: 連番フレーム送りループ（videoUpdate）。
+        `video_frame_at` → `video_frame_path`（新・純粋関数：0基点index→1基点5桁ゼロ埋め frame_%05d.jpg、
+        snprintf 切り詰め/負値ガード・native テスト）→ 変化時だけ drawJpgFile。同番号スキップ。
+        欠け/破損フレームも「消化済み扱い」で g_videoLastIdx を更新し毎ループ SD を叩かない（reviewer 指摘）。
+        起点 g_videoEnterMs は「1枚目を出し終えた今」に取り直す。実機での再生確認/fps 実測は別 Issue。
+  - [ ] **2c（次はここ）**: 音声同期（audio.wav / playRaw）。
   - [ ] **2d**: タップ操作（一時停止/メニュー復帰）。
 
 ## Step 1: 変換ツール（tools/ に追加）— 次セッションのスコープ
