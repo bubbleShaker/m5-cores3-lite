@@ -2,6 +2,22 @@
 
 このファイルは動画再生機能の段取りを永続化するもの。会話の要約で消えないよう、次セッションはここから再開する。
 
+## 次セッションの開始点（ここから読む）
+**PC 実装（2a〜2c-1）は出揃った。次は実機確認から。**
+1. **実機確認（Issue #154）を最初にやる**。事前準備は #154 に全部書いてある:
+   PC で `python tools/video2frames.py https://youtu.be/Xbt0EqXOAjw --name sample` → 出た
+   `video/sample/` を microSD の `/video/sample/` にコピー → 最新 main を
+   `pipx run platformio run -e m5stack-cores3 -t upload`（COM3）で焼く → チェックリスト消化。
+2. **実測結果が次の分岐を決める**:
+   - drawJpgFile の実 fps → 変換 `--fps` の適正値
+   - audio.wav が PSRAM に載る尺の上限 → **2c-2（チャンクストリーミング）の要否**
+   - 音ズレの大きさ → 2c-2 の優先度
+3. 実測後、必要なら **2c-2**（純粋関数 `wav_offset_at` を TDD で切り出し）→ **2d**（タップ操作）へ。
+   2d のうち長押しメニュー復帰＆音停止は既存機構で対応済み（loop の Speaker.stop + videoExit）。
+
+※ 通勤中など実機が無い時間帯は、実機不要の 2c-2 の純粋ロジック（wav_offset_at の TDD）を
+  先に進めておける（実機確認は #154 に積んだままでよい）。開発サイクルは末尾「開発サイクル（毎回）」参照。
+
 ## ゴール
 最初の選択画面（メニュー）の「動画再生」シーンで、指定した YouTube 動画
 （https://youtu.be/Xbt0EqXOAjw）を CoreS3（ESP32-S3）で再生する。
