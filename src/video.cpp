@@ -1,4 +1,5 @@
 #include "video.h"
+#include <stdio.h>
 
 int video_frame_at(uint32_t elapsed_ms, int fps, int frame_count) {
     if (fps <= 0 || frame_count <= 0) return 0;  // 再生できない時の安全値
@@ -9,4 +10,16 @@ int video_frame_at(uint32_t elapsed_ms, int fps, int frame_count) {
     uint64_t total = static_cast<uint64_t>(elapsed_ms) * static_cast<uint64_t>(fps) / 1000u;
 
     return static_cast<int>(total % static_cast<uint64_t>(frame_count));  // 末尾で先頭へループ
+}
+
+bool video_frame_path(char* buf, size_t buf_size, const char* dir, int index) {
+    if (buf == nullptr || dir == nullptr || buf_size == 0) return false;
+    if (index < 0) return false;  // 契約: 0基点の番号のみ。負値で frame_00000/frame_-0001 を作らせない
+
+    // index は 0基点、ファイルは 1基点（frame_00001.jpg …）。
+    // snprintf は「切り詰めなければ書けたはずの長さ」を返す。戻り値が buf_size 以上なら
+    // 収まっていない＝切り詰められたので、中途半端なパスを使わせず false にする。
+    int written = snprintf(buf, buf_size, "%s/frame_%05d.jpg", dir, index + 1);
+    if (written < 0 || static_cast<size_t>(written) >= buf_size) return false;
+    return true;
 }
