@@ -1,3 +1,8 @@
+// SPI.h / SD.h は M5Unified.h より先に include する必要がある（#148）。
+// M5GFX は include 時点で SD.h のインクルードガードを見て drawJpgFile(SD,...) の
+// SD ファイルシステム対応を有効化するため。順序を変えると未定義/純粋仮想エラーになる。
+#include <SPI.h>          // microSD(SPI) バス初期化（動画フレーム再生・#148）
+#include <SD.h>           // microSD 上の JPEG フレーム / meta.txt 読み取り（#148）
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <HTTPClient.h>   // 中継サーバへの HTTP POST（ESP32 標準）
@@ -27,6 +32,7 @@
 #include "particles.h"  // particle_ring（円形パーティクルの幾何・純粋ロジック・#109）
 #include "pacman.h"   // Tile/Dir/Pos / pac_tile_at / pac_can_move / pac_step（パックマン迷路・純粋ロジック・#134）
 #include "video.h"    // video_frame_at（動画フレーム時刻・純粋ロジック・#142）
+#include "meta.h"     // meta_get_int（動画 manifest の key=value 取り出し・純粋ロジック・#148）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
 // 定番OSS「スタックチャン」の顔（#121 で lib_deps 追加 / #125 でシーン化）。
@@ -1933,68 +1939,113 @@ static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 座標が Y を含まないため、十字パッド判定には向かない）。ここは何もしない。
 }
 
-// ───────── 動画再生シーン（Issue #142：骨組み。実再生は次ステップで SD フレーム化） ─────────
-// いまは「準備中」プレースホルダ。YouTube 生ストリーム（H.264/VP9・DRM）は ESP32-S3 単体では
-// 復号・デコードできないため、最終的には「動画→JPEGフレーム列＋WAV」に事前変換して microSD から
-// drawJpg＋playRaw で再生する方針。このシーンはまず kScenes[] へ登録し（開放閉鎖の原則）、
-// フレーム時刻の純粋ロジック video_frame_at を準備中アニメ（巡回するドット）で実際に動かしておく。
-// 次ステップで、このドット数計算がそのまま「表示すべきフレーム番号」計算に置き換わる。
-static uint32_t g_videoEnterMs = 0;   // シーンに入った時刻（経過時間の起点）
-static int      g_videoDots    = -1;  // 直近に描いたドット数（変化時だけ描き直す＝ちらつき回避）
+// ───────── 動画再生シーン（Issue #148 Step2a：SD 初期化＋meta 読み＋1フレーム表示） ─────────
+// YouTube 生ストリーム（H.264/VP9・DRM）は ESP32-S3 単体では復号・デコードできないため、
+// PC 側で「動画→JPEGフレーム列＋WAV＋meta.txt」に事前変換し（tools/video2frames.py）、
+// microSD から drawJpgFile＋playRaw で再生する方針。Step2a は「SD をマウント→meta.txt から
+// fps/frames→1 枚目 frame_00001.jpg を表示」までの最小実装。連番送りは 2b、音声は 2c。
+//
+// SD 作法（CoreS3・SPI・固定ピン）は research/sd-video-playback.md 参照。
 
-constexpr int kVideoDotFps    = 2;    // 準備中アニメの速さ（2fps＝0.5秒ごとに1コマ進む）
-constexpr int kVideoDotFrames = 4;    // ドットは 0..3 個を巡回
+// SD 上のアセット位置。PC で `python tools/video2frames.py <URL> --name sample` を実行し、
+// 出た video/sample/ を microSD の /video/sample/ にコピーしておく（アセットは非コミット）。
+static constexpr const char* kVideoMetaPath   = "/video/sample/meta.txt";
+static constexpr const char* kVideoFrame1Path = "/video/sample/frame_00001.jpg";
 
-// 巡回ドットの描画領域。幅は kVideoDotFrames-1(=3) 個の "." が収まる大きさ。
-// フレーム数を増やして "." が 80px を超える場合はここも広げること（消し残り防止）。
-constexpr int kVideoDotsX = 8;
-constexpr int kVideoDotsY = 150;
-constexpr int kVideoDotsW = 80;
-constexpr int kVideoDotsH = 18;
+// CoreS3 の microSD ピン（SPI・固定）。M5.Display は M5GFX が別管理なので SD 専用に張ってよい。
+constexpr int kSdCsPin   = 4;
+constexpr int kSdSckPin  = 36;
+constexpr int kSdMisoPin = 35;
+constexpr int kSdMosiPin = 37;
+
+static uint32_t g_videoEnterMs = 0;   // 経過時間の起点（フレーム送り 2b で使う）
+static int      g_videoFps     = 0;   // meta.txt の fps（2b で video_frame_at へ渡す）
+static int      g_videoFrames  = 0;   // meta.txt の frames（同上）
+static bool     g_videoReady   = false; // SD 初期化＋meta 読み＋1枚表示まで成功したか
+
+// microSD を一度だけマウントする（シーン入場ごとの二重初期化を避ける・reviewer 指摘）。
+// 成功したら以降は即 true。失敗（未挿入等）時は false のままなので、カードを挿して
+// 再入場すればリトライできる。SPI.begin をシーン入場のたびに張り直さないための明示ガード。
+static bool g_sdMounted = false;
+static bool videoMountSd() {
+    if (g_sdMounted) return true;
+    SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
+    if (!SD.begin(kSdCsPin, SPI, 25000000)) return false;
+    g_sdMounted = true;
+    return true;
+}
+
+// SD 上の小さいテキストファイル（meta.txt・数十バイト想定）を丸ごと String に読む。
+// meta.txt は「key=value」の数行なので、これを純粋関数 meta_get_int にそのまま渡す。
+static bool videoReadTextFile(const char* path, String& out) {
+    if (!SD.exists(path)) return false;
+    File f = SD.open(path);
+    if (!f) return false;
+    out = "";
+    // SD 上のファイルは外部入力。破損や取り違えで巨大ファイルを掴んでもヒープを
+    // 食い潰さないよう上限を設ける（meta.txt は数十バイトなので実害なく安全側に倒す）。
+    constexpr size_t kMaxBytes = 1024;
+    while (f.available() && out.length() < kMaxBytes) out += static_cast<char>(f.read());
+    f.close();
+    return true;
+}
+
+// 失敗時の共通表示（原因＋補足＋戻り方）。以降の処理は打ち切る。
+// 前提: 呼び出し側（videoEnter）で font=lgfxJapanGothic_16 / datum=top_left を設定済み。
+static void videoShowError(const char* reason, const char* hint) {
+    M5.Display.setTextColor(TFT_RED, kColBg);
+    M5.Display.drawString(reason, 8, 96);
+    M5.Display.setTextColor(TFT_WHITE, kColBg);
+    M5.Display.drawString(hint, 8, 120);
+    M5.Display.drawString("長押しでメニューに戻るのだ", 8, 200);
+    M5.Display.setFont(&fonts::Font0);
+}
 
 static void videoEnter() {
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::top_left);
-
     M5.Display.setTextColor(TFT_CYAN, kColBg);
     M5.Display.drawString("動画再生", 8, 12);
 
-    // この段階の位置づけを画面にも明示する（実再生はまだ無い）。
-    M5.Display.setTextColor(TFT_WHITE, kColBg);
-    M5.Display.drawString("準備中なのだ", 8, 96);
-    M5.Display.drawString("SDフレーム再生は次のステップ", 8, 120);
-    M5.Display.drawString("長押しでメニューに戻るのだ", 8, 200);
-
-    M5.Display.setFont(&fonts::Font0);          // 既定へ戻す（他描画への影響回避）
-    M5.Display.setTextDatum(textdatum_t::top_left);
-
-    // ドット領域を明示的に初期化しておく（videoUpdate の消去に暗黙依存させない・#142 レビュー指摘）。
-    M5.Display.fillRect(kVideoDotsX, kVideoDotsY, kVideoDotsW, kVideoDotsH, kColBg);
-
     g_videoEnterMs = millis();
-    g_videoDots    = -1;  // 次の update で必ず1回描く
+    g_videoReady   = false;
+    g_videoFps     = 0;
+    g_videoFrames  = 0;
+
+    // microSD をマウント（research/sd-video-playback.md）。二重初期化ガードは videoMountSd 内。
+    if (!videoMountSd()) {
+        videoShowError("SDを認識できないのだ", "microSDを挿してね");
+        return;
+    }
+
+    // manifest を読んで fps / frames を得る（純粋ロジック meta_get_int）。
+    String meta;
+    if (!videoReadTextFile(kVideoMetaPath, meta)) {
+        videoShowError("meta.txtが無いのだ", "/video/sample/ を用意してね");
+        return;
+    }
+    g_videoFps    = meta_get_int(meta.c_str(), "fps", 0);
+    g_videoFrames = meta_get_int(meta.c_str(), "frames", 0);
+
+    // 1 枚目を表示（2a のゴール）。drawJpgFile は成功で true。画面全面(320x240)に描かれる。
+    if (!SD.exists(kVideoFrame1Path) || !M5.Display.drawJpgFile(SD, kVideoFrame1Path)) {
+        videoShowError("フレームを表示できないのだ", "frame_00001.jpg を確認してね");
+        return;
+    }
+
+    g_videoReady = true;
+    M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
 }
 
-static void videoUpdate(uint32_t now) {
-    // 「準備中」の巡回ドット数を、フレーム時刻の純粋ロジックで決める（次ステップの実フレーム
-    // 番号計算と同じ video_frame_at。ここで実際に exercise しておく＝骨組みでも死にコードにしない）。
-    const int dots = video_frame_at(now - g_videoEnterMs, kVideoDotFps, kVideoDotFrames);
-    if (dots == g_videoDots) return;  // 変化なし＝描き直さない（ちらつき回避）
-    g_videoDots = dots;
-
-    // 「準備中なのだ」の下に "." を dots 個。固定幅の領域をクリアしてから描く（前フレームを消す）。
-    M5.Display.fillRect(kVideoDotsX, kVideoDotsY, kVideoDotsW, kVideoDotsH, kColBg);
-    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
-    M5.Display.setTextColor(TFT_WHITE, kColBg);
-    M5.Display.setTextDatum(textdatum_t::top_left);
-    const std::string s(dots, '.');
-    M5.Display.drawString(s.c_str(), kVideoDotsX, kVideoDotsY);
-    M5.Display.setFont(&fonts::Font0);  // 既定へ戻す
+static void videoUpdate(uint32_t /*now*/) {
+    // Step2a は 1 枚表示のみ。連番フレーム送り（video_frame_at で g_videoFps/g_videoFrames
+    // から番号を出し、変化時だけ drawJpgFile）は 2b で実装する。ここではまだ再描画しない。
+    (void)g_videoReady;
 }
 
 static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
-    // 骨組み段階では短タップの反応は無し（実再生でシーク／一時停止に割り当てる予定）。
+    // 2a では短タップ無反応。一時停止/再開は 2d で割り当てる。
 }
 
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
