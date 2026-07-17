@@ -44,14 +44,45 @@ yt-dlp 依存で不安定なため不採用）。
 - `video_frame_at` の fps は、この変換で決めた実 fps と一致させる（メタ情報として
   フレーム数・fps を manifest（例 `meta.json` か単純テキスト）で SD に置くと端末が読める）。
 
-## Step 2: 端末側 SD 再生（その次）
-- microSD 初期化（M5Unified / SD.h）。CoreS3 は microSD スロット標準装備。
-- `videoUpdate` で `video_frame_at(now - start, fps, frameCount)` → 該当フレームの
-  JPEG を `M5.Display.drawJpg`（or drawJpgFile）で描画。
-- 音声は `audio.wav` を分割ストリーミングして `playRaw`（TTS 経路の playWavBuffer が参考）。
-  I2S は録音と共有なので排他に注意（既存 recordAndTranscribe の作法を踏襲）。
-- フレーム番号と音声再生位置の同期（時刻基準は共通の millis 経過で揃える）。
-- 短タップ = 一時停止/再開、長押し = メニュー復帰（既存の状態機械のまま）。
+## Step 2: 端末側 SD 再生（次セッションのスコープ）
+まず Issue を起票してからブランチを切る（Issue 先行サイクル）。実装は下の 2a→2d で小さく刻む。
+GitHub: bubbleShaker/m5-cores3-lite。
+
+### 前提（Step1 の成果物・すぐ使える）
+- 変換ツールは `tools/video2frames.py`（マージ済み・PR #145 / Issue #144）。使い方は README「動画素材の変換」。
+- SD の想定レイアウト: `/video/<name>/frame_%05d.jpg` + `audio.wav` + `meta.txt`。
+- `meta.txt` は key=value テキスト。端末は `fps=` と `frames=` を読み、そのまま
+  `video_frame_at(elapsed_ms, fps, frames)` に渡す（ArduinoJson 不要・1行ずつ split）。
+- 実機で試すには、事前に PC で `python tools/video2frames.py <URL> --name sample` を実行し、
+  出た `video/sample/` を microSD の `/video/sample/` にコピーしておく（アセットは非コミット）。
+
+### 着手手順（小さく刻む）
+- **2a: SD 初期化 + 1 フレーム表示**。まだ再生ループにしない。SD をマウントし、
+  `/video/sample/meta.txt` を読んで fps/frames を取得、`frame_00001.jpg` を1枚
+  `M5.Display.drawJpgFile(SD, path)` で出すところまで。videoEnter の「準備中」表示を置き換える。
+  ※ CoreS3 は microSD スロット標準装備。SD 初期化 API はこのリポジトリにまだ無い（`grep SD src/main.cpp` は無ヒット）。
+    M5Unified 併用時の SD.h/SD_MMC の作法を research/ で先に1本調べてからが安全。
+- **2b: 連番フレーム送り**。`videoUpdate(now)` で `video_frame_at(now - g_videoEnterMs, fps, frames)`
+  → その番号の `frame_%05d.jpg` を drawJpgFile。前フレームと同じ番号ならスキップ（ちらつき/SD負荷回避、
+  既存 g_videoDots と同じ「変化時だけ描く」作法）。まず音声なしで絵が動くこと。
+- **2c: 音声同期**。`audio.wav` を分割ストリーミングして `playRaw`。時刻基準はフレームと同じ
+  millis 経過で揃える。WAV ヘッダ剥がしは `playWavBuffer`（src/main.cpp:401）と
+  `parse_wav_header`（src/wav.*）を共有。I2S は録音と共有なので排他注意（recordAndTranscribe 作法）。
+  ファイル全体を PSRAM に載せられない長さなら、チャンク読み→playRaw の継ぎ足しにする。
+- **2d: 操作**。短タップ = 一時停止/再開（`videoOnTap` は現状 no-op、src/main.cpp:1996）、
+  長押し = メニュー復帰（既存の状態機械のまま／変更不要）。
+
+### 触るコードのアンカー（現在行・ズレる前提で grep 併用）
+- 動画シーン本体: src/main.cpp `videoEnter`/`videoUpdate`/`videoOnTap`（1955〜1998 付近）。
+  今は「準備中＋巡回ドット」の骨組み。ドット数計算 `video_frame_at(...)` をフレーム番号計算に置換する。
+- シーン表: src/main.cpp `kScenes[]`（2002 付近）。「動画再生」行はそのまま（enter/update/onTap 差し替えのみ）。
+- WAV 再生の共通末尾: src/main.cpp `playWavBuffer`（401）。
+- WAV ヘッダ解析（純粋・テスト済み）: src/wav.{h,cpp} `parse_wav_header`。
+- フレーム時刻の純粋ロジック: src/video.{h,cpp} `video_frame_at`（native テスト済み）。
+
+### 純粋ロジックとして先に切り出せる候補（TDD しやすい）
+- `meta.txt` の1行パース（"key=value" → 値取得）を純粋関数にして native テスト。
+- 音声チャンクの「今の millis 経過に対応する WAV バイトオフセット」計算も純粋関数化できる。
 
 ## 参考（既存コード）
 - シーン状態機械・kScenes[]: src/main.cpp（「シーン表（巡回順）」付近）
