@@ -1952,6 +1952,7 @@ static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
 static constexpr const char* kVideoDir        = "/video/sample";
 static constexpr const char* kVideoMetaPath   = "/video/sample/meta.txt";
 static constexpr const char* kVideoFrame1Path = "/video/sample/frame_00001.jpg";
+static constexpr const char* kVideoAudioPath  = "/video/sample/audio.wav";
 
 // CoreS3 の microSD ピン（SPI・固定）。M5.Display は M5GFX が別管理なので SD 専用に張ってよい。
 constexpr int kSdCsPin   = 4;
@@ -1964,6 +1965,9 @@ static int      g_videoFps     = 0;   // meta.txt の fps（2b で video_frame_a
 static int      g_videoFrames  = 0;   // meta.txt の frames（同上）
 static bool     g_videoReady   = false; // SD 初期化＋meta 読み＋1枚表示まで成功したか
 static int      g_videoLastIdx  = 0;    // 直近に描いたフレーム番号（0基点・同番号ならスキップ）
+// 動画音声（audio.wav）を丸ごと載せる PSRAM バッファ。playRaw が再生中に参照し続けるため
+// free せず保持し、videoExit で解放する（g_ttsBuf と同じ寿命管理・#152）。
+static uint8_t* g_videoAudioBuf = nullptr;
 
 // microSD を一度だけマウントする（シーン入場ごとの二重初期化を避ける・reviewer 指摘）。
 // 成功したら以降は即 true。失敗（未挿入等）時は false のままなので、カードを挿して
@@ -1989,6 +1993,43 @@ static bool videoReadTextFile(const char* path, String& out) {
     constexpr size_t kMaxBytes = 1024;
     while (f.available() && out.length() < kMaxBytes) out += static_cast<char>(f.read());
     f.close();
+    return true;
+}
+
+// audio.wav を PSRAM に丸ごと読み、parse_wav_header で PCM 本体を取り出して playRaw で鳴らす（#152）。
+// 音声はベストエフォート: 無い/読めない/壊れていてもフレーム再生は続ける（false を返すだけで打ち切らない）。
+// playRaw は非同期。呼び出し側（videoEnter）が直後に g_videoEnterMs を取り直すことで、絵と音の
+// 時間軸の起点を揃える。バッファは再生中に free できないので g_videoAudioBuf に保持し videoExit で解放。
+// ※ playWavBuffer(407) と parse→playRaw の芯は似るが、あちらは発話パーティクル用エンベロープ
+//   （g_voiceEnv/g_voicePlayStart）も設定する。動画では不要な副作用なので意図的に別実装にしている。
+static bool videoLoadAudio() {
+    if (!g_voiceEnabled) return false;  // 音声 OFF：鳴らさない（#132・OFF=無音をコードベース全体で保証）
+    if (!SD.exists(kVideoAudioPath)) return false;
+    File f = SD.open(kVideoAudioPath);
+    if (!f) return false;
+    const size_t len = f.size();
+    if (len == 0) { f.close(); return false; }
+
+    // 音声は数MB になりうるので PSRAM（ps_malloc）へ。内蔵 SRAM を食い潰さない（g_ttsBuf と同じ）。
+    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(len));
+    if (!buf) { f.close(); return false; }
+    const size_t got = f.read(buf, len);
+    f.close();
+    if (got != len) { free(buf); return false; }
+
+    WavInfo info;
+    if (!parse_wav_header(buf, len, &info)) { free(buf); return false; }  // 16bit PCM 以外/破損は諦める
+    const int16_t* pcm     = reinterpret_cast<const int16_t*>(buf + info.data_offset);
+    const size_t   samples = info.data_bytes / 2;  // 16bit = 2byte/サンプル
+    M5.Speaker.setVolume(volume_to_speaker(g_volumeLevel));
+    if (!M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2)) {
+        free(buf);
+        return false;
+    }
+    // 代入前に旧バッファを解放しておく（g_ttsBuf/g_prefetchBuf と同じ防御・540/570行）。現行フローでは
+    // enter は必ず exit を経る（=ここは常に nullptr）が、将来 enter 経路が増えても旧バッファをリークしない。
+    if (g_videoAudioBuf) free(g_videoAudioBuf);
+    g_videoAudioBuf = buf;  // 再生中は解放しない（videoExit で free）
     return true;
 }
 
@@ -2036,9 +2077,13 @@ static void videoEnter() {
         return;
     }
 
-    // 経過時間の起点は「1枚目を出し終えた今」に取り直す。冒頭で取ると SD マウント/meta 読み/
-    // 初回 drawJpg のぶんだけフレームが先に飛んでしまうため。g_videoLastIdx は 0（=1枚目）に
-    // 揃えておき、videoUpdate は 2 枚目以降だけを描く。
+    // 音声はベストエフォート（#152）。無くても絵は再生するので戻り値は使わない。playRaw を
+    // 起点取り直しの直前に呼び、絵と音の時間軸をできるだけ揃える。
+    videoLoadAudio();
+
+    // 経過時間の起点は「1枚目を出し＋音を鳴らし始めた今」に取り直す。冒頭で取ると SD マウント/
+    // meta 読み/初回 drawJpg/音声ロードのぶんだけフレームが先に飛んでしまうため。g_videoLastIdx は
+    // 0（=1枚目）に揃えておき、videoUpdate は 2 枚目以降だけを描く。
     g_videoLastIdx = 0;
     g_videoEnterMs = millis();
     g_videoReady = true;
@@ -2068,6 +2113,15 @@ static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 2a では短タップ無反応。一時停止/再開は 2d で割り当てる。
 }
 
+// シーン退場時のクリーンアップ（#152）。長押し復帰では呼び出し側(loop)が既に Speaker.stop() 済みだが、
+// ここでも停止してから解放し、DMA が g_videoAudioBuf を参照中に free する use-after-free を防ぐ
+// （g_ttsBuf と同じ「停止→解放」作法）。exit を持たせることで音声バッファを常駐させずクリーンに退場する。
+static void videoExit() {
+    M5.Speaker.stop();
+    if (g_videoAudioBuf) { free(g_videoAudioBuf); g_videoAudioBuf = nullptr; }
+    g_videoReady = false;
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
 // exit を持たないシーンは4要素目を省略する（aggregate 初期化で nullptr になる）。
 const SceneDef kScenes[] = {
@@ -2079,7 +2133,7 @@ const SceneDef kScenes[] = {
     { "声の選択",     voiceEnter,  voiceUpdate,  voiceOnTap  },  // 左右タップ・#105
     { "スタックチャン", stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
     { "パックマン",   pacEnter,    pacUpdate,    pacOnTap    },  // 自作パックマン（#134 Step2）
-    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap  },  // 骨組み（#142。実再生は SD フレーム化で後続）
+    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit },  // SD フレーム＋音声再生（#142/#148/#150/#152）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号
