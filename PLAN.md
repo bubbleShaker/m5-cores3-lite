@@ -30,7 +30,13 @@ yt-dlp 依存で不安定なため不採用）。
         snprintf 切り詰め/負値ガード・native テスト）→ 変化時だけ drawJpgFile。同番号スキップ。
         欠け/破損フレームも「消化済み扱い」で g_videoLastIdx を更新し毎ループ SD を叩かない（reviewer 指摘）。
         起点 g_videoEnterMs は「1枚目を出し終えた今」に取り直す。実機での再生確認/fps 実測は別 Issue。
-  - [ ] **2c（次はここ）**: 音声同期（audio.wav / playRaw）。
+  - [~] **2c（進行中）**: 音声同期（audio.wav / playRaw）。
+    - [x] **2c-1（完了・Issue #152）**: audio.wav 全体を PSRAM に載せ playRaw 一発で鳴らし、フレームと並走。
+          `videoLoadAudio`（ps_malloc→parse_wav_header→playRaw、ベストエフォート＝無音でも絵は継続）。
+          音声OFF(g_voiceEnabled)ガードで OFF=無音を維持。`videoExit` 新設で stop→free（use-after-free 回避、
+          kScenes 動画行に登録）。起点 g_videoEnterMs は音声ロード直後に取り直し絵と音を揃える。
+    - [ ] **2c-2（実測後・別Issue）**: 長尺で PSRAM に載らない/ズレが大きい場合のチャンクストリーミング。
+          純粋関数 `wav_offset_at(elapsed_ms, rate, ch)`（millis経過→WAVバイトオフセット）を TDD で切り出す。
   - [ ] **2d**: タップ操作（一時停止/メニュー復帰）。
 
 ## Step 1: 変換ツール（tools/ に追加）— 次セッションのスコープ
