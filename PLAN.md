@@ -19,7 +19,15 @@ yt-dlp 依存で不安定なため不採用）。
 - [x] **Step 1（完了・Issue #144）**: 変換ツール `tools/video2frames.py` を追加。
       yt-dlp + ffmpeg で「JPEGフレーム列 + WAV + meta.txt(key=value manifest)」を出力。
       出力は `<outdir>/<name>/`（SD は `/video/<name>/`）。変換アセットは非コミット（.gitignore video/）。
-- [ ] **Step 2（次はここ）**: 端末で SD からフレーム + WAV を読んで再生。
+- [~] **Step 2（進行中）**: 端末で SD からフレーム + WAV を読んで再生。
+  - [x] **2a（完了・Issue #148）**: SD 初期化（SPI・CoreS3 固定ピン）+ `/video/sample/meta.txt` から
+        fps/frames 取得 + `frame_00001.jpg` を1枚 `drawJpgFile` 表示。準備中表示を置換。
+        純粋ロジック `meta_get_int`（src/meta.{h,cpp}・native テスト）追加。
+        SD 作法は research/sd-video-playback.md にまとめた（重要: `SD.h` は `M5Unified.h` より
+        **先に** include する。M5GFX が include 時に SD 対応を有効化するため）。
+  - [ ] **2b（次はここ）**: 連番フレーム送りループ（videoUpdate）。
+  - [ ] **2c**: 音声同期（audio.wav / playRaw）。
+  - [ ] **2d**: タップ操作（一時停止/メニュー復帰）。
 
 ## Step 1: 変換ツール（tools/ に追加）— 次セッションのスコープ
 まず Issue を起票してからブランチを切る（Issue 先行サイクル）。
