@@ -38,7 +38,12 @@ Get-PnpDevice | Where-Object InstanceId -like '*VID_303A*' | Select-Object Statu
 1. **転送経路の確立（#157 M3）**
    - 本体に microSD を挿す
    - `platformio run -e m5stack-cores3-msc -t upload`（MSC 転送ファーム）
-     ※ このファームも TinyUSB なので、書き込みには毎回ダウンロードモード操作が要る
+     ※ 通常ファームが動いている状態から焼くので、ここは自動で入れるはず（ハードウェア USB が生きている）
+     ※ **MSC ファームから通常ファームへ焼き戻す時に自動リセットが効くかは未検証**。
+       M1 で失敗したのは `USB.begin()` を呼ばない壊れたファームでのテストであり、MSC ファームは
+       全経路で `USB.begin()` を呼ぶ。`USBCDC.cpp` は DTR/RTS と 1200bps タッチの両方で
+       ブートローダー再起動を実装しているので、効く可能性がある。M3 で確認すること。
+       効かなければ底面 RST の 3 秒長押しでダウンロードモードへ。
    - PC にリムーバブルドライブとして現れることを確認
 2. **アセット変換と転送**
    - `python tools/video2frames.py https://youtu.be/Xbt0EqXOAjw --name sample`（yt-dlp 導入済み）
