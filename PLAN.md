@@ -8,16 +8,19 @@
 **動画再生は Step 2 以降すべて microSD が前提。カードが手に入るまで前に進めない。**
 カード到着後の手順は下記「カード入手後の再開手順」を上から実行する。
 
-### 🔴 実機が要復旧（先にこれ）
-実機には #157 M1 の検証用ファーム（`main.cpp` を `ARDUINO_USB_MODE=0` でビルドしたもの）が
-載っており、**USB が機能しない状態**。原因は CoreS3 のボード定義に `ARDUINO_USB_ON_BOOT` が無く
-コアが `USB.begin()` を呼ばないため（`main.cpp` 自身も呼んでいない）。アプリは正常に動くが
-PC から書き込めない。
+### ✅ 実機は復旧済み（2026-07-18・#159 クローズ）
+通常ファームに焼き戻し済みで、COM3 で正常に書き込める状態。以下は再発時の手順。
 
-復旧手順:
-1. **底面の RST ボタンを 3 秒長押し** → 緑 LED 点灯＝ダウンロードモード
-2. その状態で `platformio run -e m5stack-cores3 -t upload`
-3. ポート番号は要確認（TinyUSB 時は COM4 に移動していた。通常ファームに戻れば COM3 の想定）
+ダウンロードモードへの入り方:
+1. **底面の RST ボタンを 3 秒長押し**
+2. `platformio run -e m5stack-cores3 -t upload`
+
+**緑 LED は当てにしない**。ハードウェア機能なのでファームが壊れていても動くが、"internal" LED
+なので外から見えないことがある（実際 LED 未確認のまま焼き込みに成功した）。判定はこれで:
+```powershell
+Get-PnpDevice | Where-Object InstanceId -like '*VID_303A*' | Select-Object Status,Class,FriendlyName
+```
+`USB JTAG/serial debug unit` が出ていれば入れている。迷うより upload を試す方が早い。
 
 ⚠ **ボタンを間違えないこと**（実際に間違えて時間を溶かした）:
 
