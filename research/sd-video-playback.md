@@ -58,9 +58,25 @@ f.close();
 
 ## SPI バス共有の注意
 
-CoreS3 では画面(LCD)と microSD は物理的に別バスだが、`SPI`（HSPI/VSPI）オブジェクトを
-SD 用に張る。M5.Display は M5GFX が内部で自前管理するため、上記の `SPI.begin(...)` は
-SD 専用として扱ってよい（録音/再生の I2S とは別系統）。競合が出たら排他を検討。
+⚠ **訂正（#157）**: 当初ここに「画面(LCD)と microSD は物理的に別バス」と書いていたが、**誤り**。
+M5GFX の CoreS3 初期化（`M5GFX.cpp`）は LCD に以下を割り当てており、SD と同一ピンである。
+
+```cpp
+bus_cfg.pin_mosi = GPIO_NUM_37;   // SD の MOSI と同じ
+bus_cfg.pin_miso = GPIO_NUM_35;   // SD の MISO と同じ
+bus_cfg.pin_sclk = GPIO_NUM_36;   // SD の SCK と同じ
+bus_cfg.pin_dc   = GPIO_NUM_35;   // MISOとLCD D/CをGPIO35でシェアしている
+```
+
+つまり **SD アクセスと画面描画は同じ物理バスを奪い合う**。とくに GPIO35 は SD の MISO と
+LCD の D/C の兼用なので、SD が出力している最中に LCD の D/C を駆動すると衝突する。
+
+`main.cpp` が問題なく動いているのは、SD アクセスも描画もすべて `loop` タスク内で直列に
+実行されているからであって、バスが分かれているからではない。**別タスク（USB タスク等）から
+SD と画面を同時に触らせてはいけない**。実際 #157 の転送専用ファームでは、MSC コールバックが
+USB タスクで走るため、MSC 開始後は `loop` から一切描画しない設計にしている。
+
+なお録音/再生の I2S は別系統なので、この制約とは無関係。
 
 ## この調査から Step2a に確定したこと
 
