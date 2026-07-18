@@ -18,6 +18,7 @@ void test_normal_request_ok() {
 void test_exact_end_is_ok() {
     TEST_ASSERT_TRUE(msc_range_ok(kSectors - 1, 1, kSectors));
     TEST_ASSERT_TRUE(msc_range_ok(kSectors - 8, 8, kSectors));
+    TEST_ASSERT_TRUE(msc_range_ok(0, kSectors, kSectors));  // カード全域を1要求で覆う
 }
 
 // 1 セクタでもはみ出したら弾く

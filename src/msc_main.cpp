@@ -100,6 +100,11 @@ static void drawStatus(const char* line1, const char* line2) {
 // early return して USB.begin() に到達しないと CDC(COM ポート)すら列挙されず、
 // PC からは「無反応な壊れたデバイス」に見えて切り分けが困難になる。
 // mediaPresent(false) のまま開始すれば「メディア未挿入のカードリーダ」として正しく見える。
+//
+// ⚠ 描画は必ず USB.begin() より前に済ませること（reviewer 指摘・#157）。
+//   USB.begin() が返った時点で TinyUSB タスクが動き出し、ホストは列挙が済み次第
+//   READ10 を投げてくる。その後に fillScreen（320x240 で約 30ms バスを占有）を走らせると、
+//   MSC コールバックの SD アクセスと同一 SPI バスを奪い合う窓ができる。
 static void beginUsbWithoutMedia(const char* line1, const char* line2) {
     drawStatus(line1, line2);
     g_msc.mediaPresent(false);
@@ -111,6 +116,14 @@ void setup() {
     M5.begin(cfg);
     M5.Display.setRotation(1);
     drawStatus("USB MSC mode", "mounting microSD...");
+
+    // INQUIRY の名前は成功/失敗どちらの経路でも名乗れるよう、分岐より前に設定しておく。
+    // エラー時こそ PC 側で「どのデバイスが無反応なのか」を識別できた方が切り分けに役立つ。
+    g_msc.vendorID("M5Stack");
+    // ⚠ productID は最大16文字。ちょうど16文字だと NUL 終端されず、フレームワーク側の
+    //   tud_msc_inquiry_cb の strlen が溢れる。伸ばすときは15文字以内に収めること。
+    g_msc.productID("CoreS3 microSD");
+    g_msc.productRevision("1.0");
 
     SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
     if (!SD.begin(kSdCsPin, SPI, 25000000)) {
@@ -128,11 +141,6 @@ void setup() {
         return;
     }
 
-    g_msc.vendorID("M5Stack");
-    // ⚠ productID は最大16文字。ちょうど16文字だと NUL 終端されず、フレームワーク側の
-    //   tud_msc_inquiry_cb の strlen が溢れる。伸ばすときは15文字以内に収めること。
-    g_msc.productID("CoreS3 microSD");
-    g_msc.productRevision("1.0");
     g_msc.onRead(mscOnRead);
     g_msc.onWrite(mscOnWrite);
     g_msc.onStartStop(mscOnStartStop);
@@ -146,8 +154,8 @@ void setup() {
         return;
     }
 
-    USB.begin();
-
+    // 描画を先に済ませてから USB を開始する（上記 beginUsbWithoutMedia のコメント参照）。
+    // 逆順にすると、ホストの初回 READ10 と fillScreen が競合する窓ができる。
     char detail[96];
     const uint32_t mib = static_cast<uint32_t>((static_cast<uint64_t>(g_sectorCount) * g_sectorSize) >> 20);
     snprintf(detail, sizeof(detail), "%lu MiB / %lu sectors x %lu B",
@@ -155,10 +163,15 @@ void setup() {
              static_cast<unsigned long>(g_sectorCount),
              static_cast<unsigned long>(g_sectorSize));
     drawStatus("USB MSC ready", detail);
+
+    USB.begin();
 }
 
 void loop() {
     // 何もしない。上記のとおり LCD と SD が同一 SPI バスのため、ここで描画すると
     // USB タスクの SD 転送とバスを奪い合ってデータを壊す。転送は USB タスク側で進む。
+    //
+    // M5.update() も意図的に呼んでいない（消し忘れではない）。転送中に反応させたい
+    // ボタン操作が無く、呼べば I2C ポーリングが増えるだけのため。
     delay(200);
 }

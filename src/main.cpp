@@ -1955,7 +1955,6 @@ static constexpr const char* kVideoMetaPath   = "/video/sample/meta.txt";
 static constexpr const char* kVideoFrame1Path = "/video/sample/frame_00001.jpg";
 static constexpr const char* kVideoAudioPath  = "/video/sample/audio.wav";
 
-// CoreS3 の microSD ピン（SPI・固定）。M5.Display は M5GFX が別管理なので SD 専用に張ってよい。
 // microSD(SPI) のピンは src/sd_pins.h に集約した（転送専用ファーム msc_main.cpp と共有・#157）。
 // 片方だけ直して食い違うのを防ぐため。include は先頭のブロックにある。
 

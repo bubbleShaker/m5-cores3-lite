@@ -11,7 +11,10 @@
 // 実装は減算で比較し、加算オーバーフローそのものを発生させない。
 // 純粋関数なので native env で境界値テストできる。
 inline bool msc_range_ok(uint32_t lba, uint32_t count, uint32_t sector_count) {
-    if (count == 0) return false;              // 0 セクタ要求は不正
+    // 0 長要求は TinyUSB からは到達しない想定（proc_read10 は残り転送量がある間しか呼ばない）。
+    // 万一来た場合は安全側に倒して stall させる。SCSI 的には転送長0は合法な no-op なので
+    // 厳密には 0 を返す手もあるが、生セクタを外部に明け渡す以上 fail-closed を優先する。
+    if (count == 0) return false;
     if (lba >= sector_count) return false;     // 開始位置が既に範囲外
     return count <= sector_count - lba;        // 引き算なのでラップしない
 }
