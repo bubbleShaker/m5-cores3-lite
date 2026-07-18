@@ -33,6 +33,7 @@
 #include "pacman.h"   // Tile/Dir/Pos / pac_tile_at / pac_can_move / pac_step（パックマン迷路・純粋ロジック・#134）
 #include "video.h"    // video_frame_at（動画フレーム時刻・純粋ロジック・#142）
 #include "meta.h"     // meta_get_int（動画 manifest の key=value 取り出し・純粋ロジック・#148）
+#include "sd_pins.h"  // kSdCsPin 等（microSD の SPI ピン・転送専用ファームと共有・#157）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
 // 定番OSS「スタックチャン」の顔（#121 で lib_deps 追加 / #125 でシーン化）。
@@ -1955,10 +1956,8 @@ static constexpr const char* kVideoFrame1Path = "/video/sample/frame_00001.jpg";
 static constexpr const char* kVideoAudioPath  = "/video/sample/audio.wav";
 
 // CoreS3 の microSD ピン（SPI・固定）。M5.Display は M5GFX が別管理なので SD 専用に張ってよい。
-constexpr int kSdCsPin   = 4;
-constexpr int kSdSckPin  = 36;
-constexpr int kSdMisoPin = 35;
-constexpr int kSdMosiPin = 37;
+// microSD(SPI) のピンは src/sd_pins.h に集約した（転送専用ファーム msc_main.cpp と共有・#157）。
+// 片方だけ直して食い違うのを防ぐため。include は先頭のブロックにある。
 
 static uint32_t g_videoEnterMs = 0;   // 経過時間の起点（フレーム送り 2b で使う）
 static int      g_videoFps     = 0;   // meta.txt の fps（2b で video_frame_at へ渡す）
