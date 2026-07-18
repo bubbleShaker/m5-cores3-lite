@@ -3,20 +3,52 @@
 このファイルは動画再生機能の段取りを永続化するもの。会話の要約で消えないよう、次セッションはここから再開する。
 
 ## 次セッションの開始点（ここから読む）
-**PC 実装（2a〜2c-1）は出揃った。次は実機確認から。**
-1. **実機確認（Issue #154）を最初にやる**。事前準備は #154 に全部書いてある:
-   PC で `python tools/video2frames.py https://youtu.be/Xbt0EqXOAjw --name sample` → 出た
-   `video/sample/` を microSD の `/video/sample/` にコピー → 最新 main を
-   `pipx run platformio run -e m5stack-cores3 -t upload`（COM3）で焼く → チェックリスト消化。
-2. **実測結果が次の分岐を決める**:
+
+### 🔴 現在ブロック中: microSD カード未所持（2026-07-18 時点）
+**動画再生は Step 2 以降すべて microSD が前提。カードが手に入るまで前に進めない。**
+カード到着後の手順は下記「カード入手後の再開手順」を上から実行する。
+
+### 🔴 実機が要復旧（先にこれ）
+実機には #157 M1 の検証用ファーム（`main.cpp` を `ARDUINO_USB_MODE=0` でビルドしたもの）が
+載っており、**USB が機能しない状態**。原因は CoreS3 のボード定義に `ARDUINO_USB_ON_BOOT` が無く
+コアが `USB.begin()` を呼ばないため（`main.cpp` 自身も呼んでいない）。アプリは正常に動くが
+PC から書き込めない。
+
+復旧手順:
+1. **RESET ボタン（左側面）を 3 秒長押し** → 緑 LED 点灯・画面が黒（バックライトは点灯）＝ダウンロードモード
+   ※ 2 秒では入らない。緑 LED が点くまで押し続ける
+2. その状態で `platformio run -e m5stack-cores3 -t upload`
+3. ポート番号は要確認（TinyUSB 時は COM4 に移動していた。通常ファームに戻れば COM3 の想定）
+
+### カード入手後の再開手順
+1. **転送経路の確立（#157 M3）**
+   - 本体に microSD を挿す
+   - `platformio run -e m5stack-cores3-msc -t upload`（MSC 転送ファーム）
+     ※ このファームも TinyUSB なので、書き込みには毎回ダウンロードモード操作が要る
+   - PC にリムーバブルドライブとして現れることを確認
+2. **アセット変換と転送**
+   - `python tools/video2frames.py https://youtu.be/Xbt0EqXOAjw --name sample`（yt-dlp 導入済み）
+   - 出た `video/sample/` を MSC ドライブの `/video/sample/` にコピー
+   - PC 側で取り外し操作 → 通常ファーム（`-e m5stack-cores3`）に焼き戻す
+3. **実機確認（#154）** — チェックリストは #154 のコメントにある
+4. **実測結果が次の分岐を決める**:
    - drawJpgFile の実 fps → 変換 `--fps` の適正値
    - audio.wav が PSRAM に載る尺の上限 → **2c-2（チャンクストリーミング）の要否**
    - 音ズレの大きさ → 2c-2 の優先度
-3. 実測後、必要なら **2c-2**（純粋関数 `wav_offset_at` を TDD で切り出し）→ **2d**（タップ操作）へ。
+5. 実測後、必要なら **2c-2**（純粋関数 `wav_offset_at` を TDD で切り出し）→ **2d**（タップ操作）へ。
    2d のうち長押しメニュー復帰＆音停止は既存機構で対応済み（loop の Speaker.stop + videoExit）。
 
-※ 通勤中など実機が無い時間帯は、実機不要の 2c-2 の純粋ロジック（wav_offset_at の TDD）を
-  先に進めておける（実機確認は #154 に積んだままでよい）。開発サイクルは末尾「開発サイクル（毎回）」参照。
+※ 実機・カードが無い時間帯は、実機不要の 2c-2 の純粋ロジック（`wav_offset_at` の TDD）を
+  先に進めておける。開発サイクルは末尾「開発サイクル（毎回）」参照。
+
+### ハマりどころ（#157 で判明・繰り返さないこと）
+- **LCD と microSD は同じ SPI バス**。GPIO35 が SD の MISO と LCD の D/C の兼用。
+  別タスクから SD と画面を同時に触ると書き込みデータが化ける（静かなデータ破壊）。
+  `main.cpp` が無事なのは全部 loop タスクで直列化されているからであって、バスが別だからではない。
+  （`research/sd-video-playback.md` に「別バス」と書いていたのは誤り。訂正済み）
+- **`ARDUINO_USB_MODE=0`（TinyUSB）にすると esptool の自動書き込みが効かなくなる**。
+  `default_reset` / `usb_reset` とも失敗し、毎回ダウンロードモード操作が必要になる。
+  そのため通常ファームは `USB_MODE=1` のまま残し、MSC は別 env に分離してある。
 
 ## ゴール
 最初の選択画面（メニュー）の「動画再生」シーンで、指定した YouTube 動画
