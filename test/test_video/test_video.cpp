@@ -83,6 +83,45 @@ void test_no_overflow_long_playback() {
     TEST_ASSERT_EQUAL_INT(0, video_frame_at(200000000u, 30, 100));
 }
 
+// --- video_cycle_at（周回番号・#164） ---
+
+// 1周目は 0。末尾フレームに居る間もまだ 0（境界の食い違いが無いこと）。
+void test_cycle_starts_at_zero() {
+    TEST_ASSERT_EQUAL_UINT32(0, video_cycle_at(0, 10, 100));
+    TEST_ASSERT_EQUAL_UINT32(0, video_cycle_at(9900, 10, 100));  // 100枚目(index 99)＝まだ1周目
+}
+
+// 一周ちょうどで 1 になる。video_frame_at が 0 に戻る瞬間と一致すること。
+void test_cycle_increments_at_wrap() {
+    TEST_ASSERT_EQUAL_INT(0, video_frame_at(10000, 10, 100));    // 番号は先頭へ戻り
+    TEST_ASSERT_EQUAL_UINT32(1, video_cycle_at(10000, 10, 100)); // 周回番号は繰り上がる
+}
+
+// 本命（reviewer 指摘）: 更新が飛んで一周ぶん以上進んでも取りこぼさない。
+// frames=3/fps=30 は一周 100ms。100ms と 300ms で標本を取ると、フレーム番号はどちらも 0 のまま
+// 全く動かない（戻りもしない）のに、実際には 2 周ぶん進んでいる。
+// 「番号が戻ったか」で周回を検知する実装はこの入力を取りこぼし、音を鳴らし直せなかった。
+void test_cycle_detects_skipped_wraps() {
+    TEST_ASSERT_EQUAL_INT(0, video_frame_at(100, 30, 3));
+    TEST_ASSERT_EQUAL_INT(0, video_frame_at(300, 30, 3));        // 番号は動かない＝戻りを検知できない
+    TEST_ASSERT_EQUAL_UINT32(1, video_cycle_at(100, 30, 3));
+    TEST_ASSERT_EQUAL_UINT32(3, video_cycle_at(300, 30, 3));     // 周回番号なら2周ぶん進んだと分かる
+}
+
+// 再生不能な引数は 0（video_frame_at と同じ安全値）。ゼロ除算を踏まないこと。
+void test_cycle_invalid_args_are_zero() {
+    TEST_ASSERT_EQUAL_UINT32(0, video_cycle_at(1000, 0, 100));
+    TEST_ASSERT_EQUAL_UINT32(0, video_cycle_at(1000, -1, 100));
+    TEST_ASSERT_EQUAL_UINT32(0, video_cycle_at(1000, 30, 0));
+    TEST_ASSERT_EQUAL_UINT32(0, video_cycle_at(1000, 30, -5));
+}
+
+// 長時間再生でも桁あふれしない（video_frame_at と同じ領域を商側でも踏む）。
+// 200,000,000ms×30fps/1000 = 6,000,000 → /100 = 60,000 周。
+void test_cycle_no_overflow_long_playback() {
+    TEST_ASSERT_EQUAL_UINT32(60000, video_cycle_at(200000000u, 30, 100));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_starts_at_first_frame);
@@ -97,5 +136,10 @@ int main(int, char**) {
     RUN_TEST(test_frame_path_buffer_too_small);
     RUN_TEST(test_frame_path_negative_index);
     RUN_TEST(test_frame_path_null_args);
+    RUN_TEST(test_cycle_starts_at_zero);
+    RUN_TEST(test_cycle_increments_at_wrap);
+    RUN_TEST(test_cycle_detects_skipped_wraps);
+    RUN_TEST(test_cycle_invalid_args_are_zero);
+    RUN_TEST(test_cycle_no_overflow_long_playback);
     return UNITY_END();
 }

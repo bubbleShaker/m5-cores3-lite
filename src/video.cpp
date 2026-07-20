@@ -12,6 +12,16 @@ int video_frame_at(uint32_t elapsed_ms, int fps, int frame_count) {
     return static_cast<int>(total % static_cast<uint64_t>(frame_count));  // 末尾で先頭へループ
 }
 
+uint32_t video_cycle_at(uint32_t elapsed_ms, int fps, int frame_count) {
+    if (fps <= 0 || frame_count <= 0) return 0;  // 再生できない時の安全値（video_frame_at と揃える）
+
+    // video_frame_at と同じ total を作り、あちらが捨てる商の側を返す。
+    // 計算式を揃えておかないと「番号は末尾なのに周回番号は次の周」といった境界の食い違いが出る。
+    uint64_t total = static_cast<uint64_t>(elapsed_ms) * static_cast<uint64_t>(fps) / 1000u;
+
+    return static_cast<uint32_t>(total / static_cast<uint64_t>(frame_count));
+}
+
 bool video_frame_path(char* buf, size_t buf_size, const char* dir, int index) {
     if (buf == nullptr || dir == nullptr || buf_size == 0) return false;
     if (index < 0) return false;  // 契約: 0基点の番号のみ。負値で frame_00000/frame_-0001 を作らせない
