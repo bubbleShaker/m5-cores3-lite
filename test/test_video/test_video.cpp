@@ -122,6 +122,114 @@ void test_cycle_no_overflow_long_playback() {
     TEST_ASSERT_EQUAL_UINT32(60000, video_cycle_at(200000000u, 30, 100));
 }
 
+// ───────── パック方式の索引読み取り（Issue #170） ─────────
+// 索引部は「offset(uint32 LE), length(uint32 LE)」の 8 バイト固定長レコードの並び。
+// テスト用に 3 フレームぶんの索引を組み立てる（データ部は 0..99 の 100 バイトを想定）。
+//   #0 → offset 0,  length 10
+//   #1 → offset 10, length 40
+//   #2 → offset 50, length 50（データ部の末尾ちょうどまで）
+static const uint8_t kIndex3[24] = {
+    0x00, 0x00, 0x00, 0x00,  0x0A, 0x00, 0x00, 0x00,
+    0x0A, 0x00, 0x00, 0x00,  0x28, 0x00, 0x00, 0x00,
+    0x32, 0x00, 0x00, 0x00,  0x32, 0x00, 0x00, 0x00,
+};
+
+void test_pack_entry_reads_first() {
+    uint32_t off = 0xDEAD, len = 0xBEEF;
+    TEST_ASSERT_TRUE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, 0, 100, &off, &len));
+    TEST_ASSERT_EQUAL_UINT32(0, off);
+    TEST_ASSERT_EQUAL_UINT32(10, len);
+}
+
+// レコード幅 8 バイトぶん正しく飛ぶ（幅を間違えると隣のフィールドを読む）
+void test_pack_entry_reads_middle() {
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_TRUE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, 1, 100, &off, &len));
+    TEST_ASSERT_EQUAL_UINT32(10, off);
+    TEST_ASSERT_EQUAL_UINT32(40, len);
+}
+
+// データ部の末尾ちょうどに終わる entry は有効（off-by-one で弾かないこと）
+void test_pack_entry_exact_end_is_valid() {
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_TRUE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, 2, 100, &off, &len));
+    TEST_ASSERT_EQUAL_UINT32(50, off);
+    TEST_ASSERT_EQUAL_UINT32(50, len);
+}
+
+// リトルエンディアンで読めているか（バイト順を間違えると桁が入れ替わった巨大値になる）
+void test_pack_entry_little_endian() {
+    const uint8_t idx[8] = { 0x78, 0x56, 0x34, 0x12,  0x21, 0x43, 0x00, 0x00 };
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_TRUE(video_pack_entry(idx, sizeof(idx), 1, 0, 0x20000000u, &off, &len));
+    TEST_ASSERT_EQUAL_UINT32(0x12345678u, off);
+    TEST_ASSERT_EQUAL_UINT32(0x00004321u, len);
+}
+
+// 範囲外の番号（負値・frame_count 以上）は読まない
+void test_pack_entry_out_of_range_index() {
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, -1, 100, &off, &len));
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, 3, 100, &off, &len));
+}
+
+// meta.txt の frames に対して索引部が短い（frames.bin だけ古い等）なら全て false。
+// ここを通すとデータ部の JPEG を索引として読むことになる。
+void test_pack_entry_index_too_short() {
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, 16, 3, 0, 100, &off, &len));
+}
+
+// 索引長が 8 の倍数でない（＝末尾のレコードが途中で切れている）時、その半端なぶんは
+// レコードとして数えない。切り上げてしまうと索引の外を読む。
+void test_pack_entry_partial_trailing_record() {
+    uint32_t off = 0, len = 0;
+    // 20 バイト = 2 レコード + 半端 4 バイト。3 枚を宣言していれば足りない
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, 20, 3, 0, 100, &off, &len));
+    // 2 枚の宣言なら 2 レコードぶんは揃っているので読める
+    TEST_ASSERT_TRUE(video_pack_entry(kIndex3, 20, 2, 1, 100, &off, &len));
+    TEST_ASSERT_EQUAL_UINT32(10, off);
+}
+
+// データ部をはみ出す entry は false（壊れた索引で範囲外読みをしない）
+void test_pack_entry_overruns_data() {
+    const uint8_t idx[8] = { 0x32, 0x00, 0x00, 0x00,  0x33, 0x00, 0x00, 0x00 };  // off=50 len=51
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_FALSE(video_pack_entry(idx, sizeof(idx), 1, 0, 100, &off, &len));
+}
+
+// offset+length が uint32 を回り込む値でも範囲内と誤判定しない（64bit で足している）
+void test_pack_entry_offset_length_overflow() {
+    const uint8_t idx[8] = { 0xFF, 0xFF, 0xFF, 0xFF,  0x0A, 0x00, 0x00, 0x00 };
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_FALSE(video_pack_entry(idx, sizeof(idx), 1, 0, 100, &off, &len));
+}
+
+// length==0 は描けない。0 バイト read を drawJpg に渡させない
+void test_pack_entry_zero_length() {
+    const uint8_t idx[8] = { 0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00 };
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_FALSE(video_pack_entry(idx, sizeof(idx), 1, 0, 100, &off, &len));
+}
+
+// null・frame_count<=0 の防御
+void test_pack_entry_invalid_args() {
+    uint32_t off = 0, len = 0;
+    TEST_ASSERT_FALSE(video_pack_entry(nullptr, 24, 3, 0, 100, &off, &len));
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, sizeof(kIndex3), 0, 0, 100, &off, &len));
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, 0, 100, nullptr, &len));
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, 0, 100, &off, nullptr));
+}
+
+// 失敗時に出力を書き換えない（呼び出し側が戻り値を見落としても前回値のまま seek しない…
+// ではなく、そもそも壊れた値が入らないことを保証する）
+void test_pack_entry_failure_keeps_outputs() {
+    uint32_t off = 0xAAAAAAAAu, len = 0xBBBBBBBBu;
+    TEST_ASSERT_FALSE(video_pack_entry(kIndex3, sizeof(kIndex3), 3, 99, 100, &off, &len));
+    TEST_ASSERT_EQUAL_UINT32(0xAAAAAAAAu, off);
+    TEST_ASSERT_EQUAL_UINT32(0xBBBBBBBBu, len);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_starts_at_first_frame);
@@ -141,5 +249,17 @@ int main(int, char**) {
     RUN_TEST(test_cycle_detects_skipped_wraps);
     RUN_TEST(test_cycle_invalid_args_are_zero);
     RUN_TEST(test_cycle_no_overflow_long_playback);
+    RUN_TEST(test_pack_entry_reads_first);
+    RUN_TEST(test_pack_entry_reads_middle);
+    RUN_TEST(test_pack_entry_exact_end_is_valid);
+    RUN_TEST(test_pack_entry_little_endian);
+    RUN_TEST(test_pack_entry_out_of_range_index);
+    RUN_TEST(test_pack_entry_index_too_short);
+    RUN_TEST(test_pack_entry_partial_trailing_record);
+    RUN_TEST(test_pack_entry_overruns_data);
+    RUN_TEST(test_pack_entry_offset_length_overflow);
+    RUN_TEST(test_pack_entry_zero_length);
+    RUN_TEST(test_pack_entry_invalid_args);
+    RUN_TEST(test_pack_entry_failure_keeps_outputs);
     return UNITY_END();
 }
