@@ -1963,9 +1963,19 @@ static int      g_videoFps     = 0;   // meta.txt の fps（2b で video_frame_a
 static int      g_videoFrames  = 0;   // meta.txt の frames（同上）
 static bool     g_videoReady   = false; // SD 初期化＋meta 読み＋1枚表示まで成功したか
 static int      g_videoLastIdx  = 0;    // 直近に描いたフレーム番号（0基点・同番号ならスキップ）
+static uint32_t g_videoLastCycle = 0;   // 直近の周回番号（0基点・変化したら一周した＝音を鳴らし直す・#164）
 // 動画音声（audio.wav）を丸ごと載せる PSRAM バッファ。playRaw が再生中に参照し続けるため
 // free せず保持し、videoExit で解放する（g_ttsBuf と同じ寿命管理・#152）。
 static uint8_t* g_videoAudioBuf = nullptr;
+
+// WAV ヘッダの解析結果（#164）。周回ごとに鳴らし直すために保持する。
+// これを持たずに周回のたび videoLoadAudio を呼ぶと SD 読み＋PSRAM 確保をやり直すことになり、
+// LCD と同じ SPI バスを無駄に奪う（#157 のバス競合）。解析済みの PCM を指すだけなら SD に触れない。
+// g_videoAudioBuf を指す従属ポインタなので、free と同時に nullptr にする（videoExit）。
+static const int16_t* g_videoPcm        = nullptr;
+static size_t         g_videoPcmSamples = 0;
+static uint32_t       g_videoPcmRate    = 0;
+static bool           g_videoPcmStereo  = false;
 
 // microSD を一度だけマウントする（シーン入場ごとの二重初期化を避ける・reviewer 指摘）。
 // 成功したら以降は即 true。失敗（未挿入等）時は false のままなので、カードを挿して
@@ -2000,6 +2010,26 @@ static bool videoReadTextFile(const char* path, String& out) {
 // 時間軸の起点を揃える。バッファは再生中に free できないので g_videoAudioBuf に保持し videoExit で解放。
 // ※ playWavBuffer(407) と parse→playRaw の芯は似るが、あちらは発話パーティクル用エンベロープ
 //   （g_voiceEnv/g_voicePlayStart）も設定する。動画では不要な副作用なので意図的に別実装にしている。
+// 音声バッファと解析結果をまとめて捨てる（#164）。g_videoPcm 等は g_videoAudioBuf の中身を指す
+// 従属ポインタなので、free と null 化を必ずこの一箇所で対にする。別々に書くと、解放済みメモリを
+// 指したままの g_videoPcm を周回再生が playRaw へ渡す use-after-free になる。
+// DMA が参照中でないこと（呼ぶ前に M5.Speaker.stop() 済み、または未再生）を前提にする。
+static void videoReleaseAudio() {
+    if (g_videoAudioBuf) { free(g_videoAudioBuf); g_videoAudioBuf = nullptr; }
+    g_videoPcm        = nullptr;
+    g_videoPcmSamples = 0;
+    g_videoPcmRate    = 0;
+    g_videoPcmStereo  = false;
+}
+
+// 解析済みの PCM を playRaw に流す（#164）。SD には触れないので周回のたびに呼んでよい。
+// 音声 OFF や解析失敗では g_videoPcm が nullptr のままなので、ここが無音を保証する一点になる。
+static bool videoPlayAudio() {
+    if (g_videoPcm == nullptr || g_videoPcmSamples == 0) return false;
+    M5.Speaker.setVolume(volume_to_speaker(g_volumeLevel));
+    return M5.Speaker.playRaw(g_videoPcm, g_videoPcmSamples, g_videoPcmRate, g_videoPcmStereo);
+}
+
 static bool videoLoadAudio() {
     if (!g_voiceEnabled) return false;  // 音声 OFF：鳴らさない（#132・OFF=無音をコードベース全体で保証）
     if (!SD.exists(kVideoAudioPath)) return false;
@@ -2017,17 +2047,27 @@ static bool videoLoadAudio() {
 
     WavInfo info;
     if (!parse_wav_header(buf, len, &info)) { free(buf); return false; }  // 16bit PCM 以外/破損は諦める
-    const int16_t* pcm     = reinterpret_cast<const int16_t*>(buf + info.data_offset);
-    const size_t   samples = info.data_bytes / 2;  // 16bit = 2byte/サンプル
-    M5.Speaker.setVolume(volume_to_speaker(g_volumeLevel));
-    if (!M5.Speaker.playRaw(pcm, samples, info.sample_rate, info.channels == 2)) {
-        free(buf);
+
+    // 旧バッファは videoReleaseAudio 経由で捨てる（g_ttsBuf/g_prefetchBuf と同じ防御・540/570行）。
+    // 現行フローでは enter は必ず exit を経る（=ここは常に nullptr）ので到達しないが、生の free で
+    // 済ませるとこの下に early return が1つ増えただけで g_videoPcm が解放済み領域を指す。
+    // free と従属ポインタの null 化を対にする経路を1本に保つ（reviewer 指摘）。
+    M5.Speaker.stop();     // 旧バッファを DMA が参照中なら切ってから解放する
+    videoReleaseAudio();
+    g_videoAudioBuf = buf;  // 再生中は解放しない（videoExit で free）
+
+    // 解析結果を保持してから鳴らす（#164）。周回時はこの状態だけで playRaw を呼び直せる＝SD に触らない。
+    g_videoPcm        = reinterpret_cast<const int16_t*>(buf + info.data_offset);
+    g_videoPcmSamples = info.data_bytes / 2;  // 16bit = 2byte/サンプル
+    g_videoPcmRate    = info.sample_rate;
+    g_videoPcmStereo  = (info.channels == 2);
+
+    // 鳴らせなければ保持した状態ごと捨てる。バッファだけ free して g_videoPcm を残すと、
+    // videoUpdate の周回再生が解放済みメモリを playRaw へ渡す（videoReleaseAudio で対にしてある）。
+    if (!videoPlayAudio()) {
+        videoReleaseAudio();
         return false;
     }
-    // 代入前に旧バッファを解放しておく（g_ttsBuf/g_prefetchBuf と同じ防御・540/570行）。現行フローでは
-    // enter は必ず exit を経る（=ここは常に nullptr）が、将来 enter 経路が増えても旧バッファをリークしない。
-    if (g_videoAudioBuf) free(g_videoAudioBuf);
-    g_videoAudioBuf = buf;  // 再生中は解放しない（videoExit で free）
     return true;
 }
 
@@ -2082,10 +2122,33 @@ static void videoEnter() {
     // 経過時間の起点は「1枚目を出し＋音を鳴らし始めた今」に取り直す。冒頭で取ると SD マウント/
     // meta 読み/初回 drawJpg/音声ロードのぶんだけフレームが先に飛んでしまうため。g_videoLastIdx は
     // 0（=1枚目）に揃えておき、videoUpdate は 2 枚目以降だけを描く。
-    g_videoLastIdx = 0;
+    g_videoLastIdx   = 0;
+    g_videoLastCycle = 0;  // 前回再生の周回番号が残ると入場直後に誤検知するため必ず戻す（#164）
     g_videoEnterMs = millis();
     g_videoReady = true;
     M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
+}
+
+// 番号（0基点）→ /video/sample/frame_%05d.jpg（1基点・純粋ロジック video_frame_path）を描く。
+// 欠け/破損フレーム（exists 失敗や drawJpg 失敗）は黙って諦める＝前の絵が残る。
+static void videoDrawFrame(int idx) {
+    char path[64];
+    if (video_frame_path(path, sizeof(path), kVideoDir, idx) && SD.exists(path)) {
+        M5.Display.drawJpgFile(SD, path);  // 失敗しても次番号まで待つ（絵は前フレームのまま）
+    }
+}
+
+// 一周した時の再スタート（#164）。順序は videoEnter の末尾と同じ
+// 「絵を出す → 音を鳴らす → その瞬間に起点を取る」に揃えてある。
+// 起点を先に取ると frame 0 の SD 読み＋JPEG デコードのぶん音が絵を先行し、しかもそのズレは
+// 1周目には存在しない＝周回で挙動が変わってしまう（reviewer 指摘）。
+static void videoRestartCycle() {
+    videoDrawFrame(0);
+    M5.Speaker.stop();  // 前の周の再生が残っていても切ってから鳴らし直す
+    videoPlayAudio();   // 音声 OFF / 音声無しでは false。絵のループは止めない（ベストエフォート・#152）
+    g_videoEnterMs   = millis();  // 絵を出し終えた「今」を起点にする（videoEnter と同じ）
+    g_videoLastIdx   = 0;
+    g_videoLastCycle = 0;  // 起点を取り直したので周回番号も 0 から数え直す
 }
 
 static void videoUpdate(uint32_t now) {
@@ -2093,17 +2156,30 @@ static void videoUpdate(uint32_t now) {
 
     // 実時刻基準でフレーム番号を出す（純粋ロジック video_frame_at）。SD 読み＋デコードが
     // 1/fps に間に合わなければ、その番号が自然に飛ぶ＝時間軸がずれない（2c の音声同期の前提）。
-    int idx = video_frame_at(now - g_videoEnterMs, g_videoFps, g_videoFrames);
+    const uint32_t elapsed = now - g_videoEnterMs;
+    const int      idx     = video_frame_at(elapsed, g_videoFps, g_videoFrames);
+    const uint32_t cycle   = video_cycle_at(elapsed, g_videoFps, g_videoFrames);
+
+    // 一周したか（#164）。video_frame_at は剰余で先頭へ戻るが playRaw は一発再生なので、
+    // 何もしないと 2 周目以降が無音になる。
+    //
+    // 検知に「番号が戻ったか（idx < g_videoLastIdx）」を使わないのは、SD 読みが詰まって1回の
+    // 更新間隔に一周ぶん以上進むと、番号が戻らないまま周を跨いで取りこぼすため（reviewer 指摘）。
+    // 商＝周回番号そのものを見れば原理的に起きない（純粋関数 video_cycle_at・native テスト済み）。
+    //
+    // frames<=1 を除くのは、絵が1枚しか無い素材では「一周」が 1/fps 秒しかなく、尺の異なる音声を
+    // 毎フレーム鳴らし直してしまうため。ループさせる絵が無い＝音も1回きりでよい。
+    if (g_videoFrames > 1 && cycle != g_videoLastCycle) {
+        videoRestartCycle();
+        return;
+    }
+
     if (idx == g_videoLastIdx) return;  // 同じ番号なら描かない（ちらつき/SD負荷回避・既存の作法）
 
-    // 番号（0基点）→ /video/sample/frame_%05d.jpg（1基点・純粋ロジック video_frame_path）。
-    // 欠け/破損フレーム（exists 失敗や drawJpg 失敗）でもこの番号は「消化済み」にする。
-    // 更新せず return すると、恒常的に欠けた番号の時間窓（最大 1/fps 秒）ずっと毎ループ
-    // SD を叩き続けるため。同番号スキップの作法と一貫させ、次の番号まで SD に触れない。
-    char path[64];
-    if (video_frame_path(path, sizeof(path), kVideoDir, idx) && SD.exists(path)) {
-        M5.Display.drawJpgFile(SD, path);  // 失敗しても次番号まで待つ（絵は前フレームのまま）
-    }
+    // 欠け/破損フレームでもこの番号は「消化済み」にする。更新せず return すると、恒常的に欠けた
+    // 番号の時間窓（最大 1/fps 秒）ずっと毎ループ SD を叩き続けるため。同番号スキップの作法と
+    // 一貫させ、次の番号まで SD に触れない。
+    videoDrawFrame(idx);
     g_videoLastIdx = idx;
 }
 
@@ -2116,7 +2192,7 @@ static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
 // （g_ttsBuf と同じ「停止→解放」作法）。exit を持たせることで音声バッファを常駐させずクリーンに退場する。
 static void videoExit() {
     M5.Speaker.stop();
-    if (g_videoAudioBuf) { free(g_videoAudioBuf); g_videoAudioBuf = nullptr; }
+    videoReleaseAudio();  // free と解析結果の null 化を対で行う（#164）
     g_videoReady = false;
 }
 

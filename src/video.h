@@ -12,6 +12,15 @@
 //   結果は必ず [0, frame_count) に収まる。
 int video_frame_at(uint32_t elapsed_ms, int fps, int frame_count);
 
+// 再生開始から「何周目か」を返す純粋ロジック（Issue #164）。0基点＝1周目は 0。
+// video_frame_at が剰余で捨てている商そのもの。両者は同じ total から作られる表と裏の関係にある。
+//
+// 音声のループ再生（playRaw は一発再生でループ機能を持たない）を駆動するために使う。
+// 「フレーム番号が戻ったか」で周回を検知すると、SD 読みが詰まって1回の更新間隔に一周ぶん以上
+// 進んだ時に「番号が戻らないまま周を跨ぐ」ケースを取りこぼす。商を直接見れば原理的に起きない。
+//   fps <= 0 または frame_count <= 0 のときは 0 を返す（video_frame_at と同じ安全値）。
+uint32_t video_cycle_at(uint32_t elapsed_ms, int fps, int frame_count);
+
 // フレーム番号（0基点）から SD 上のファイルパスを組み立てる純粋ロジック（Issue #150）。
 // video_frame_at が返す 0..frame_count-1 の index を受け取り、1基点・5桁ゼロ埋めの
 // "<dir>/frame_%05d.jpg" を buf に書く（例: dir="/video/sample", index=0 → "/video/sample/frame_00001.jpg"）。
