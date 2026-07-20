@@ -9,6 +9,7 @@
 #include <ArduinoJson.h>  // リクエスト body の安全な組み立て
 #include <string>
 #include <vector>
+#include <esp_heap_caps.h>  // PSRAM の空き/最大連続ブロックの診断（動画音声が載るかの判定・#166）
 #include <math.h>     // cosf / sinf（流れ場に沿った曲線の積分に使う）
 // 顔の純粋ロジック（表情/まばたき/口パク）。M5Stack-Avatar が Avatar.h / Face.h / Expression.h を
 // 持ち、Windows の case-insensitive FS ではそれらと同名のヘッダを src/ に置けないため、
@@ -2010,6 +2011,26 @@ static bool videoReadTextFile(const char* path, String& out) {
 // 時間軸の起点を揃える。バッファは再生中に free できないので g_videoAudioBuf に保持し videoExit で解放。
 // ※ playWavBuffer(407) と parse→playRaw の芯は似るが、あちらは発話パーティクル用エンベロープ
 //   （g_voiceEnv/g_voicePlayStart）も設定する。動画では不要な副作用なので意図的に別実装にしている。
+// PSRAM の確保状況を診断ログに出す（#166）。動画音声は全長素材だと 7MB 級になり、
+// 8MB の PSRAM に対して連続領域を要求するため成否が際どい。無音になった時に原因を
+// 推測で語らずに済むよう、判断材料を数値で残す。
+//
+// largest（最大連続ブロック）を free（空き合計）と並べて出すのが要点。ps_malloc は連続領域を
+// 返すので、free >= want でも largest < want なら断片化で失敗する。両方見て初めて区別がつく。
+// 対処が「サンプルレートを下げる」「常駐を解放する（#128）」「2c-2 に進む」のどれになるかを
+// この差が決める。
+//
+// ⚠ 読み方の注意（reviewer 指摘）: アロケータはブロックヘッダぶんを余分に消費するため、
+//   largest が want をわずかに上回っていても確保は失敗しうる。数十バイト差の境界では
+//   「largest >= want だから足りていたはず」と読まないこと。
+static void videoLogPsram(const char* tag, size_t want) {
+    Serial.printf("[video] %s want=%u psram_free=%u psram_largest=%u\n",
+                  tag,
+                  static_cast<unsigned>(want),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
 // 音声バッファと解析結果をまとめて捨てる（#164）。g_videoPcm 等は g_videoAudioBuf の中身を指す
 // 従属ポインタなので、free と null 化を必ずこの一箇所で対にする。別々に書くと、解放済みメモリを
 // 指したままの g_videoPcm を周回再生が playRaw へ渡す use-after-free になる。
@@ -2031,22 +2052,59 @@ static bool videoPlayAudio() {
 }
 
 static bool videoLoadAudio() {
-    if (!g_voiceEnabled) return false;  // 音声 OFF：鳴らさない（#132・OFF=無音をコードベース全体で保証）
-    if (!SD.exists(kVideoAudioPath)) return false;
+    // 無音になる経路には必ず理由を1行残す（#166・reviewer 指摘）。ベストエフォート仕様（#152）は
+    // 「黙って無音になる」＝本質的に観測できない失敗を作るので、ログがその唯一の窓になる。
+    // 理由を出さないと、シリアルに何も出なかった時に「音声OFF」「ファイル無し」「ヘッダ壊れ」
+    // 「そもそもログが届いていない」を区別できない。
+    if (!g_voiceEnabled) {  // 音声 OFF：鳴らさない（#132・OFF=無音をコードベース全体で保証）
+        Serial.println("[video] audio skip: voice disabled");
+        return false;
+    }
+    if (!SD.exists(kVideoAudioPath)) {
+        Serial.println("[video] audio skip: audio.wav not found");
+        return false;
+    }
     File f = SD.open(kVideoAudioPath);
-    if (!f) return false;
+    if (!f) {
+        Serial.println("[video] audio skip: open failed");
+        return false;
+    }
     const size_t len = f.size();
-    if (len == 0) { f.close(); return false; }
+    if (len == 0) {
+        Serial.println("[video] audio skip: empty file");
+        f.close();
+        return false;
+    }
 
     // 音声は数MB になりうるので PSRAM（ps_malloc）へ。内蔵 SRAM を食い潰さない（g_ttsBuf と同じ）。
+    // 全長素材だと 7MB 級になり 8MB の PSRAM に対して際どいので、確保の前・失敗時・成功時に
+    // 状況をログへ出す（#166。読み方は videoLogPsram の説明を参照）。
+    videoLogPsram("audio-alloc-before", len);
     uint8_t* buf = static_cast<uint8_t*>(ps_malloc(len));
-    if (!buf) { f.close(); return false; }
+    if (!buf) {
+        videoLogPsram("audio-alloc-fail", len);
+        f.close();
+        return false;
+    }
+    // 成功時の残量こそが「#128 の常駐スプライトを解放すべきか」「後続の JPEG デコードが巻き添えで
+    // 死なないか」を判断する数字なので、載った場合も必ず出す（reviewer 指摘）。
+    videoLogPsram("audio-alloc-ok", len);
+
     const size_t got = f.read(buf, len);
     f.close();
-    if (got != len) { free(buf); return false; }
+    if (got != len) {
+        Serial.printf("[video] audio skip: short read %u/%u\n",
+                      static_cast<unsigned>(got), static_cast<unsigned>(len));
+        free(buf);
+        return false;
+    }
 
     WavInfo info;
-    if (!parse_wav_header(buf, len, &info)) { free(buf); return false; }  // 16bit PCM 以外/破損は諦める
+    if (!parse_wav_header(buf, len, &info)) {  // 16bit PCM 以外/破損は諦める
+        Serial.println("[video] audio skip: wav header parse failed");
+        free(buf);
+        return false;
+    }
 
     // 旧バッファは videoReleaseAudio 経由で捨てる（g_ttsBuf/g_prefetchBuf と同じ防御・540/570行）。
     // 現行フローでは enter は必ず exit を経る（=ここは常に nullptr）ので到達しないが、生の free で
@@ -2065,9 +2123,14 @@ static bool videoLoadAudio() {
     // 鳴らせなければ保持した状態ごと捨てる。バッファだけ free して g_videoPcm を残すと、
     // videoUpdate の周回再生が解放済みメモリを playRaw へ渡す（videoReleaseAudio で対にしてある）。
     if (!videoPlayAudio()) {
+        Serial.println("[video] audio skip: playRaw failed");
         videoReleaseAudio();
         return false;
     }
+    Serial.printf("[video] audio ok: %u samples @%uHz ch=%u\n",
+                  static_cast<unsigned>(g_videoPcmSamples),
+                  static_cast<unsigned>(g_videoPcmRate),
+                  g_videoPcmStereo ? 2u : 1u);
     return true;
 }
 
