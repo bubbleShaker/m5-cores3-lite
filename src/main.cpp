@@ -1973,6 +1973,12 @@ static uint8_t* g_videoAudioBuf = nullptr;
 // これを持たずに周回のたび videoLoadAudio を呼ぶと SD 読み＋PSRAM 確保をやり直すことになり、
 // LCD と同じ SPI バスを無駄に奪う（#157 のバス競合）。解析済みの PCM を指すだけなら SD に触れない。
 // g_videoAudioBuf を指す従属ポインタなので、free と同時に nullptr にする（videoExit）。
+// 音声の実測用（#169）。フレームは millis()、音声は I2S と独立した時計で進むため、
+// 公称の再生時間と実測の差がそのままクロック比になる。絵が音から遅れる原因がここかを判定する。
+static uint32_t g_videoAudioStartMs    = 0;  // playRaw を呼んだ時刻
+static uint32_t g_videoAudioNominalMs  = 0;  // サンプル数とレートから計算した「鳴るはずの長さ」
+static bool     g_videoAudioWasPlaying = false;  // 鳴り終わる瞬間を1回だけ捉えるためのラッチ
+
 static const int16_t* g_videoPcm        = nullptr;
 static size_t         g_videoPcmSamples = 0;
 static uint32_t       g_videoPcmRate    = 0;
@@ -2036,6 +2042,7 @@ static void videoLogPsram(const char* tag, size_t want) {
 // 指したままの g_videoPcm を周回再生が playRaw へ渡す use-after-free になる。
 // DMA が参照中でないこと（呼ぶ前に M5.Speaker.stop() 済み、または未再生）を前提にする。
 static void videoReleaseAudio() {
+    g_videoAudioWasPlaying = false;  // 解放したら鳴り終わり検知のラッチも落とす（#169）
     if (g_videoAudioBuf) { free(g_videoAudioBuf); g_videoAudioBuf = nullptr; }
     g_videoPcm        = nullptr;
     g_videoPcmSamples = 0;
@@ -2046,9 +2053,25 @@ static void videoReleaseAudio() {
 // 解析済みの PCM を playRaw に流す（#164）。SD には触れないので周回のたびに呼んでよい。
 // 音声 OFF や解析失敗では g_videoPcm が nullptr のままなので、ここが無音を保証する一点になる。
 static bool videoPlayAudio() {
+    // 先にラッチを落としてから鳴らす（reviewer 指摘・#169）。ここで落とさないと、playRaw が
+    // 失敗した時に前の周の g_videoAudioStartMs が残ったままラッチだけ true で生き延び、
+    // 直後の isPlaying()==false を拾って「前の周を起点にした嘘の actual」を出力してしまう。
+    // 恒久計装なので、ログが嘘をつかないことを状態遷移で保証する。
+    g_videoAudioWasPlaying = false;
+
     if (g_videoPcm == nullptr || g_videoPcmSamples == 0) return false;
     M5.Speaker.setVolume(volume_to_speaker(g_volumeLevel));
-    return M5.Speaker.playRaw(g_videoPcm, g_videoPcmSamples, g_videoPcmRate, g_videoPcmStereo);
+    if (!M5.Speaker.playRaw(g_videoPcm, g_videoPcmSamples, g_videoPcmRate, g_videoPcmStereo)) return false;
+
+    // 実測の起点を取る（#169）。playRaw は非同期に返るので、呼んだ直後を音声の開始時刻とみなす。
+    // 公称の長さは「サンプル数 ÷ レート」。ステレオは L/R が交互に入るので 2 で割ってから割る。
+    const uint32_t frames = static_cast<uint32_t>(g_videoPcmSamples / (g_videoPcmStereo ? 2 : 1));
+    g_videoAudioStartMs    = millis();
+    g_videoAudioNominalMs  = (g_videoPcmRate > 0)
+        ? static_cast<uint32_t>(static_cast<uint64_t>(frames) * 1000u / g_videoPcmRate)
+        : 0;
+    g_videoAudioWasPlaying = true;
+    return true;
 }
 
 static bool videoLoadAudio() {
@@ -2173,7 +2196,8 @@ static void videoEnter() {
     g_videoFrames = meta_get_int(meta.c_str(), "frames", 0);
 
     // 1 枚目を表示（2a のゴール）。drawJpgFile は成功で true。画面全面(320x240)に描かれる。
-    if (!SD.exists(kVideoFrame1Path) || !M5.Display.drawJpgFile(SD, kVideoFrame1Path)) {
+    // SD.exists は挟まない（#169）。drawJpgFile がファイル不在で false を返すので二度手間になる。
+    if (!M5.Display.drawJpgFile(SD, kVideoFrame1Path)) {
         videoShowError("フレームを表示できないのだ", "frame_00001.jpg を確認してね");
         return;
     }
@@ -2193,11 +2217,36 @@ static void videoEnter() {
 }
 
 // 番号（0基点）→ /video/sample/frame_%05d.jpg（1基点・純粋ロジック video_frame_path）を描く。
-// 欠け/破損フレーム（exists 失敗や drawJpg 失敗）は黙って諦める＝前の絵が残る。
+// 欠け/破損フレーム（drawJpgFile の失敗）は次の番号まで諦める＝前の絵が残る。
 static void videoDrawFrame(int idx) {
     char path[64];
-    if (video_frame_path(path, sizeof(path), kVideoDir, idx) && SD.exists(path)) {
-        M5.Display.drawJpgFile(SD, path);  // 失敗しても次番号まで待つ（絵は前フレームのまま）
+    if (!video_frame_path(path, sizeof(path), kVideoDir, idx)) return;
+
+    // SD.exists は呼ばない（#169）。drawJpgFile はファイルが無ければ false を返すので存在確認は
+    // 元から不要であり、しかも FAT32 はディレクトリにインデックスを持たずファイル名の解決が
+    // 先頭からの線形走査になるため、exists と drawJpgFile で同じ走査を2回していた
+    // （実測: idx=1600 で exists=393ms + jpg=658ms = 1,051ms。10fps の予算は 100ms）。
+    //
+    // ここで測るのは drawJpgFile 単体の所要時間（ファイル名解決＋読み込み＋デコードの合計）。
+    // 内訳は取れないが、フレーム番号に対する傾向が分かれば走査由来かどうかは判断できる。
+    const uint32_t t0 = millis();
+    const bool ok = M5.Display.drawJpgFile(SD, path);
+    const uint32_t t1 = millis();
+
+    // 全フレームで出すとログ自体が再生を乱すので間引く。番号に対する傾向が見えれば十分。
+    if ((idx % 200) == 0) {
+        Serial.printf("[video] draw idx=%d total=%ums\n",
+                      idx, static_cast<unsigned>(t1 - t0));
+    }
+    // 描画失敗も残す（reviewer 指摘）。戻り値を捨てると、恒常的に欠けたフレームが
+    // 「前の絵が残る」だけになって観測できない。ただし全滅時に毎フレーム出ると
+    // ログ自体が再生を乱すので 1 秒に 1 回までに抑える。
+    if (!ok) {
+        static uint32_t s_lastFailLogMs = 0;
+        if (t1 - s_lastFailLogMs >= 1000) {
+            s_lastFailLogMs = t1;
+            Serial.printf("[video] draw FAILED idx=%d path=%s\n", idx, path);
+        }
     }
 }
 
@@ -2206,6 +2255,19 @@ static void videoDrawFrame(int idx) {
 // 起点を先に取ると frame 0 の SD 読み＋JPEG デコードのぶん音が絵を先行し、しかもそのズレは
 // 1周目には存在しない＝周回で挙動が変わってしまう（reviewer 指摘）。
 static void videoRestartCycle() {
+    // ズレの向きを確定させる（#169）。映像が一周した時点で、
+    //   音声がまだ鳴っている → 音声の方が遅い
+    //   音声が既に終わっている → 音声の方が速い（＝絵が音を追いかける・観察された症状）
+    // video_cycle は映像一周の実時間で、公称（frames/fps）と比べれば映像側の正確さも分かる。
+    // 音声の経過も併記する（reviewer 指摘）。音声が映像一周より長いと、この直後の stop() で
+    // 打ち切られて自然終了しないため「audio end」のサンプルが1つも取れない。ここで出しておけば
+    // どの周回でも必ず1データ点が残り、ズレの向きだけでなく量も分かる。
+    Serial.printf("[video] wrap: video_cycle=%ums audio_elapsed=%ums audio_nominal=%ums playing=%d\n",
+                  static_cast<unsigned>(millis() - g_videoEnterMs),
+                  static_cast<unsigned>(millis() - g_videoAudioStartMs),
+                  static_cast<unsigned>(g_videoAudioNominalMs),
+                  M5.Speaker.isPlaying() ? 1 : 0);
+
     videoDrawFrame(0);
     M5.Speaker.stop();  // 前の周の再生が残っていても切ってから鳴らし直す
     videoPlayAudio();   // 音声 OFF / 音声無しでは false。絵のループは止めない（ベストエフォート・#152）
@@ -2216,6 +2278,18 @@ static void videoRestartCycle() {
 
 static void videoUpdate(uint32_t now) {
     if (!g_videoReady) return;  // SD/meta/1枚目のどれかで失敗した入場では動かさない
+
+    // 音声が鳴り終わった瞬間を1回だけ捉え、実測と公称を比べる（#169）。
+    // 差がそのまま「I2S の時計が millis に対してどれだけ速い/遅いか」になる。
+    // 早期 return より前に置く。フレーム番号が変わらない周回では下まで到達しないため。
+    if (g_videoAudioWasPlaying && !M5.Speaker.isPlaying()) {
+        const uint32_t actual = millis() - g_videoAudioStartMs;
+        Serial.printf("[video] audio end: actual=%ums nominal=%ums diff=%+dms\n",
+                      static_cast<unsigned>(actual),
+                      static_cast<unsigned>(g_videoAudioNominalMs),
+                      static_cast<int>(actual) - static_cast<int>(g_videoAudioNominalMs));
+        g_videoAudioWasPlaying = false;
+    }
 
     // 実時刻基準でフレーム番号を出す（純粋ロジック video_frame_at）。SD 読み＋デコードが
     // 1/fps に間に合わなければ、その番号が自然に飛ぶ＝時間軸がずれない（2c の音声同期の前提）。
