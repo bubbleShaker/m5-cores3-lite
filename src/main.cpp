@@ -1953,7 +1953,6 @@ static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
 // 出た video/sample/ を microSD の /video/sample/ にコピーしておく（アセットは非コミット）。
 static constexpr const char* kVideoDir        = "/video/sample";
 static constexpr const char* kVideoMetaPath   = "/video/sample/meta.txt";
-static constexpr const char* kVideoFrame1Path = "/video/sample/frame_00001.jpg";
 static constexpr const char* kVideoAudioPath  = "/video/sample/audio.wav";
 
 // microSD(SPI) のピンは src/sd_pins.h に集約した（転送専用ファーム msc_main.cpp と共有・#157）。
@@ -1983,6 +1982,23 @@ static const int16_t* g_videoPcm        = nullptr;
 static size_t         g_videoPcmSamples = 0;
 static uint32_t       g_videoPcmRate    = 0;
 static bool           g_videoPcmStereo  = false;
+
+// ───────── パック方式（frames.bin）の状態（#170） ─────────
+// 連番ファイル方式は FAT32 のファイル名解決が線形走査になり、終盤で 1 枚 1 秒かかった（#169）。
+// 全フレームを 1 本にまとめ、番号→位置の索引を自前で持てば名前解決は入場時の 1 回だけになる。
+// ファイルは開いたまま保持するのが要点で、毎フレーム開き直すと名前解決が復活して本末転倒。
+static File     g_videoPackFile;             // 入場中ずっと開いたまま（videoExit で close）
+static bool     g_videoPackOpen     = false; // 上の File が有効か（File 自体は bool 変換できるが意図を明示）
+static uint8_t* g_videoPackIndex    = nullptr;  // 索引部を丸ごと載せた PSRAM バッファ（frames×8B）
+static size_t   g_videoPackIndexLen = 0;     // その長さ。データ部の先頭オフセットでもある
+static uint32_t g_videoPackDataSize = 0;     // データ部のバイト数（範囲検証の上限）
+static uint8_t* g_videoJpgBuf       = nullptr;  // 1 フレーム読み込み用（最大フレーム長ぶん）
+static size_t   g_videoJpgCap       = 0;
+
+// videoOpenPack の結果。「pack= が無い（旧アセット）」と「pack= はあるが使えない」を
+// 呼び出し側が区別できるようにする。bool + グローバルフラグで表すと、失敗経路で
+// フラグをリセットする/しないの順序に正しさが依存してしまう（reviewer 指摘の nit を潰す形）。
+enum class VideoPackResult { kNone, kOk, kError };
 
 // microSD を一度だけマウントする（シーン入場ごとの二重初期化を避ける・reviewer 指摘）。
 // 成功したら以降は即 true。失敗（未挿入等）時は false のままなので、カードを挿して
@@ -2157,6 +2173,180 @@ static bool videoLoadAudio() {
     return true;
 }
 
+// パック方式の資源をまとめて捨てる（#170）。videoReleaseAudio と同じ「確保と解放を対にする」作法。
+// 開いたままの File を close せずに再入場すると、SD のファイルハンドルを食い潰す。
+static void videoReleasePack() {
+    if (g_videoPackOpen) { g_videoPackFile.close(); g_videoPackOpen = false; }
+    if (g_videoPackIndex) { free(g_videoPackIndex); g_videoPackIndex = nullptr; }
+    if (g_videoJpgBuf)    { free(g_videoJpgBuf);    g_videoJpgBuf    = nullptr; }
+    g_videoPackIndexLen = 0;
+    g_videoPackDataSize = 0;
+    g_videoJpgCap       = 0;
+}
+
+// meta.txt の pack= を見て frames.bin を開き、索引を PSRAM に載せる（#170）。
+// pack= が無ければ kNone（従来の連番ファイル方式で再生する＝旧アセット互換）。
+// 宣言されているのに開けなかった場合は kError（呼び出し側が理由を出して止める）。
+static VideoPackResult videoOpenPack(const char* meta) {
+    videoReleasePack();  // 再入場で前回の File/バッファが残らないよう必ず先に捨てる
+
+    // 「宣言があるか」と「値が取れたか」を分けて見る（reviewer 指摘）。両者を混同すると、
+    // pack= の値が長すぎる/空のときに「旧アセット」と誤読して遅い連番方式へ黙って落ちる。
+    if (!meta_has_key(meta, "pack")) return VideoPackResult::kNone;  // 旧アセット
+
+    char name[32];
+    if (!meta_get_str(meta, "pack", name, sizeof(name))) {
+        Serial.println("[video] pack: bad value (empty or too long)");
+        return VideoPackResult::kError;
+    }
+
+    // meta.txt は SD 上の外部入力。区切り文字を含む値で /video/sample の外を開かせない
+    // （tools 側 safe_subdir_name と同じ考え方を、読む側にも置く）。
+    if (strchr(name, '/') || strchr(name, '\\') || strstr(name, "..")) {
+        Serial.printf("[video] pack: rejected name=%s\n", name);
+        return VideoPackResult::kError;
+    }
+    // 上限を課すのは frames が meta.txt 由来の外部入力だから（reviewer 指摘）。
+    // 下の frames×8 が size_t を溢れると索引長が小さな値に化ける。video_pack_entry の
+    // 長さ検証が結果的に弾いてくれるが、安全性を離れた関数の性質に頼らず自明にしておく。
+    // 100,000 フレームは 10fps で約 2.8 時間ぶん。この用途で超えることはない。
+    constexpr int kMaxFrames = 100000;
+    if (g_videoFrames <= 0 || g_videoFrames > kMaxFrames) {
+        Serial.printf("[video] pack: bad frames=%d\n", g_videoFrames);
+        return VideoPackResult::kError;
+    }
+
+    char path[80];
+    const int written = snprintf(path, sizeof(path), "%s/%s", kVideoDir, name);
+    if (written < 0 || written >= static_cast<int>(sizeof(path))) {
+        // 負値も弾く（エンコードエラー時に未定義の path で SD.open へ進ませない）。
+        // video_frame_path と同じ「中途半端な文字列は使わせない」作法に揃える。
+        Serial.println("[video] pack: path too long");
+        return VideoPackResult::kError;
+    }
+
+    g_videoPackFile = SD.open(path, FILE_READ);
+    if (!g_videoPackFile) {
+        Serial.printf("[video] pack: open failed %s\n", path);
+        return VideoPackResult::kError;
+    }
+    g_videoPackOpen = true;
+
+    // 索引部は frames×8 バイト固定長。ファイルがそれより小さければ meta と frames.bin が
+    // 食い違っている（片方だけ古い SD に残るのは普通に起きる）。データ部を索引と誤読させない。
+    const size_t index_len = static_cast<size_t>(g_videoFrames) * kVideoPackEntrySize;
+    const size_t file_size = g_videoPackFile.size();
+    if (file_size <= index_len) {
+        Serial.printf("[video] pack: too small size=%u index=%u\n",
+                      static_cast<unsigned>(file_size), static_cast<unsigned>(index_len));
+        videoReleasePack();
+        return VideoPackResult::kError;
+    }
+
+    // 索引は約 19KB（2,355 フレーム）。PSRAM に丸ごと載せる。毎フレーム索引を seek して
+    // 読むと SD アクセスが 2 倍になり、せっかく名前解決を消した利得を削ってしまう。
+    uint8_t* index = static_cast<uint8_t*>(ps_malloc(index_len));
+    if (index == nullptr) {
+        videoLogPsram("pack-index-alloc-fail", index_len);
+        videoReleasePack();
+        return VideoPackResult::kError;
+    }
+    if (g_videoPackFile.read(index, index_len) != static_cast<int>(index_len)) {
+        Serial.println("[video] pack: index short read");
+        free(index);
+        videoReleasePack();
+        return VideoPackResult::kError;
+    }
+    g_videoPackIndex    = index;
+    g_videoPackIndexLen = index_len;
+    g_videoPackDataSize = static_cast<uint32_t>(file_size - index_len);
+
+    // 全 entry を入場時に一度検証し、同時に最大フレーム長を求める。
+    // 読み込みバッファをこの最大値ちょうどにできるうえ、壊れた索引を「再生中に1枚だけ描けない」
+    // ではなく入場時点で弾ける（原因が分かる場所で失敗させる）。2,355 回のループだが SD には
+    // 触らないので一瞬で終わる。
+    uint32_t max_len = 0;
+    for (int i = 0; i < g_videoFrames; i++) {
+        uint32_t off = 0, len = 0;
+        if (!video_pack_entry(g_videoPackIndex, g_videoPackIndexLen, g_videoFrames,
+                              i, g_videoPackDataSize, &off, &len)) {
+            Serial.printf("[video] pack: bad index entry at %d\n", i);
+            videoReleasePack();
+            return VideoPackResult::kError;
+        }
+        if (len > max_len) max_len = len;
+    }
+
+    g_videoJpgBuf = static_cast<uint8_t*>(ps_malloc(max_len));
+    if (g_videoJpgBuf == nullptr) {
+        videoLogPsram("pack-jpg-alloc-fail", max_len);
+        videoReleasePack();
+        return VideoPackResult::kError;
+    }
+    g_videoJpgCap = max_len;
+
+    Serial.printf("[video] pack ok: %s frames=%d index=%uB data=%uB maxjpg=%uB\n",
+                  path, g_videoFrames,
+                  static_cast<unsigned>(g_videoPackIndexLen),
+                  static_cast<unsigned>(g_videoPackDataSize),
+                  static_cast<unsigned>(max_len));
+    return VideoPackResult::kOk;
+}
+
+// パック方式で 1 枚描く（#170）。索引→seek→read→メモリからデコード。
+// ファイル名の解決が一切発生しないのが要点で、#169 で測った「1 枚 1 秒」の主因が原理的に消える。
+static bool videoDrawFromPack(int idx) {
+    // 索引から位置を引く（純粋ロジック video_pack_entry・範囲検証込み・native テスト済み）。
+    // ここで false が返るのは索引が壊れている時だけ（入場時に全件検証済みなので通常は起きない）。
+    uint32_t off = 0, len = 0;
+    if (!video_pack_entry(g_videoPackIndex, g_videoPackIndexLen, g_videoFrames,
+                          idx, g_videoPackDataSize, &off, &len)) return false;
+    if (len > g_videoJpgCap) return false;  // 入場時の検証と冗長だが、読み込み前の最後の砦として残す
+
+    // データ部は索引部の直後から始まるので、ファイル先頭からは index_len を足した位置。
+    if (!g_videoPackFile.seek(g_videoPackIndexLen + off)) return false;
+    if (g_videoPackFile.read(g_videoJpgBuf, len) != static_cast<int>(len)) return false;
+    return M5.Display.drawJpg(g_videoJpgBuf, len);
+}
+
+// 従来の連番ファイル方式で 1 枚描く（旧アセット互換・pack= の無い meta.txt）。
+static bool videoDrawFromFiles(int idx) {
+    char path[64];
+    if (!video_frame_path(path, sizeof(path), kVideoDir, idx)) return false;
+    // SD.exists は呼ばない（#169）。drawJpgFile はファイルが無ければ false を返すので存在確認は
+    // 元から不要であり、しかも FAT32 はディレクトリにインデックスを持たずファイル名の解決が
+    // 先頭からの線形走査になるため、exists と drawJpgFile で同じ走査を2回していた
+    // （実測: idx=1600 で exists=393ms + jpg=658ms = 1,051ms。10fps の予算は 100ms）。
+    return M5.Display.drawJpgFile(SD, path);
+}
+
+// 番号（0基点）のフレームを描く。方式の選択と計測だけを担い、実際の読み書きは上の2つに委ねる。
+// 欠け/破損フレーム（描画失敗）は次の番号まで諦める＝前の絵が残る。
+static bool videoDrawFrame(int idx) {
+    const bool use_pack = (g_videoPackOpen && g_videoPackIndex && g_videoJpgBuf);
+
+    const uint32_t t0 = millis();
+    const bool ok = use_pack ? videoDrawFromPack(idx) : videoDrawFromFiles(idx);
+    const uint32_t t1 = millis();
+    // 全フレームで出すとログ自体が再生を乱すので間引く。番号に対する傾向が見えれば十分
+    // （パック方式なら番号によらず一定になるはず、が #170 の受け入れ条件）。
+    if ((idx % 200) == 0) {
+        Serial.printf("[video] draw idx=%d total=%ums pack=%d\n",
+                      idx, static_cast<unsigned>(t1 - t0), use_pack ? 1 : 0);
+    }
+    // 描画失敗も残す（reviewer 指摘）。戻り値を捨てると、恒常的に欠けたフレームが
+    // 「前の絵が残る」だけになって観測できない。ただし全滅時に毎フレーム出ると
+    // ログ自体が再生を乱すので 1 秒に 1 回までに抑える。
+    if (!ok) {
+        static uint32_t s_lastFailLogMs = 0;
+        if (t1 - s_lastFailLogMs >= 1000) {
+            s_lastFailLogMs = t1;
+            Serial.printf("[video] draw FAILED idx=%d\n", idx);
+        }
+    }
+    return ok;
+}
+
 // 失敗時の共通表示（原因＋補足＋戻り方）。以降の処理は打ち切る。
 // 前提: 呼び出し側（videoEnter）で font=lgfxJapanGothic_16 / datum=top_left を設定済み。
 static void videoShowError(const char* reason, const char* hint) {
@@ -2195,10 +2385,20 @@ static void videoEnter() {
     g_videoFps    = meta_get_int(meta.c_str(), "fps", 0);
     g_videoFrames = meta_get_int(meta.c_str(), "frames", 0);
 
-    // 1 枚目を表示（2a のゴール）。drawJpgFile は成功で true。画面全面(320x240)に描かれる。
-    // SD.exists は挟まない（#169）。drawJpgFile がファイル不在で false を返すので二度手間になる。
-    if (!M5.Display.drawJpgFile(SD, kVideoFrame1Path)) {
-        videoShowError("フレームを表示できないのだ", "frame_00001.jpg を確認してね");
+    // パック方式なら frames.bin を開いて索引を PSRAM へ（#170）。pack= が無ければ旧アセットとして
+    // 従来の連番ファイル方式で再生する。ここが「入場時 1 回だけの名前解決」になる。
+    if (videoOpenPack(meta.c_str()) == VideoPackResult::kError) {
+        // pack= を宣言しているのに使えない＝素材の食い違い。連番ファイルへ黙って落ちると
+        // 「なぜか遅い」だけの状態になって原因が見えなくなるので、ここで止めて理由を出す。
+        videoShowError("frames.binを読めないのだ", "変換し直して転送してね");
+        videoReleasePack();  // videoOpenPack 内で後始末済みだが、失敗経路すべてで対称に呼ぶ
+        return;
+    }
+
+    // 1 枚目を表示（2a のゴール）。画面全面(320x240)に描かれる。
+    if (!videoDrawFrame(0)) {
+        videoShowError("フレームを表示できないのだ", "/video/sample/ を確認してね");
+        videoReleasePack();
         return;
     }
 
@@ -2214,40 +2414,6 @@ static void videoEnter() {
     g_videoEnterMs = millis();
     g_videoReady = true;
     M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
-}
-
-// 番号（0基点）→ /video/sample/frame_%05d.jpg（1基点・純粋ロジック video_frame_path）を描く。
-// 欠け/破損フレーム（drawJpgFile の失敗）は次の番号まで諦める＝前の絵が残る。
-static void videoDrawFrame(int idx) {
-    char path[64];
-    if (!video_frame_path(path, sizeof(path), kVideoDir, idx)) return;
-
-    // SD.exists は呼ばない（#169）。drawJpgFile はファイルが無ければ false を返すので存在確認は
-    // 元から不要であり、しかも FAT32 はディレクトリにインデックスを持たずファイル名の解決が
-    // 先頭からの線形走査になるため、exists と drawJpgFile で同じ走査を2回していた
-    // （実測: idx=1600 で exists=393ms + jpg=658ms = 1,051ms。10fps の予算は 100ms）。
-    //
-    // ここで測るのは drawJpgFile 単体の所要時間（ファイル名解決＋読み込み＋デコードの合計）。
-    // 内訳は取れないが、フレーム番号に対する傾向が分かれば走査由来かどうかは判断できる。
-    const uint32_t t0 = millis();
-    const bool ok = M5.Display.drawJpgFile(SD, path);
-    const uint32_t t1 = millis();
-
-    // 全フレームで出すとログ自体が再生を乱すので間引く。番号に対する傾向が見えれば十分。
-    if ((idx % 200) == 0) {
-        Serial.printf("[video] draw idx=%d total=%ums\n",
-                      idx, static_cast<unsigned>(t1 - t0));
-    }
-    // 描画失敗も残す（reviewer 指摘）。戻り値を捨てると、恒常的に欠けたフレームが
-    // 「前の絵が残る」だけになって観測できない。ただし全滅時に毎フレーム出ると
-    // ログ自体が再生を乱すので 1 秒に 1 回までに抑える。
-    if (!ok) {
-        static uint32_t s_lastFailLogMs = 0;
-        if (t1 - s_lastFailLogMs >= 1000) {
-            s_lastFailLogMs = t1;
-            Serial.printf("[video] draw FAILED idx=%d path=%s\n", idx, path);
-        }
-    }
 }
 
 // 一周した時の再スタート（#164）。順序は videoEnter の末尾と同じ
@@ -2330,6 +2496,7 @@ static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
 static void videoExit() {
     M5.Speaker.stop();
     videoReleaseAudio();  // free と解析結果の null 化を対で行う（#164）
+    videoReleasePack();   // frames.bin を閉じ、索引と読み込みバッファを返す（#170）
     g_videoReady = false;
 }
 
