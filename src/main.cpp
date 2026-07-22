@@ -1954,9 +1954,12 @@ static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
 // 入場時の選択画面で1つ選んで再生する（#175）。PC で `python3 tools/video2frames.py <URL> --name <名前>`
 // を実行し、出た video/<名前>/ を microSD の /video/<名前>/ にコピーしておく（アセットは非コミット）。
 //
+// 初期値は選択前の未使用プレースホルダ。videoEnter は必ず選択画面を先に出し、決定時に
+// video_build_dir が /video/<選んだ名前> で上書きするので、この値は実再生には使われない。
+// 特定のアセット名を焼き込まないのが #175 の狙い（名前を固定しない）に沿う。
 // 選択で確定したら videoExit まで書き換えない。再生中に書き換わると videoOpenPack で開いた
 // File／索引と食い違うため（#175 の保証事項＝videoEnter で確定し videoExit まで固定）。
-static char g_videoDir[64] = "/video/sample";
+static char g_videoDir[64] = "/video";
 
 // コンパイル時にバッファ境界を保証する（#175・reviewer 指摘）。video_build_dir は "/video/<name>" を
 // g_videoDir に、videoSubPath は "<g_videoDir>/<leaf>" を [80] バッファに snprintf で組む。名前は
@@ -2232,8 +2235,8 @@ static VideoPackResult videoOpenPack(const char* meta) {
         return VideoPackResult::kError;
     }
 
-    // meta.txt は SD 上の外部入力。区切り文字を含む値で /video/sample の外を開かせない
-    // （tools 側 safe_subdir_name と同じ考え方を、読む側にも置く）。
+    // meta.txt は SD 上の外部入力。区切り文字を含む値で g_videoDir（/video/<選んだ名前>）の外を
+    // 開かせない（tools 側 safe_subdir_name と同じ考え方を、読む側にも置く）。
     if (strchr(name, '/') || strchr(name, '\\') || strstr(name, "..")) {
         Serial.printf("[video] pack: rejected name=%s\n", name);
         return VideoPackResult::kError;
