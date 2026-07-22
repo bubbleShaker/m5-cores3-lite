@@ -2330,7 +2330,13 @@ static VideoPackResult videoOpenPack(const char* meta) {
 
 // パック方式で 1 枚描く（#170）。索引→seek→read→メモリからデコード。
 // ファイル名の解決が一切発生しないのが要点で、#169 で測った「1 枚 1 秒」の主因が原理的に消える。
-static bool videoDrawFromPack(int idx) {
+//
+// out 引数（#176・30fps 可否判断の計装）: draw total の内訳を分けて返す。sd_us=SD読み（seek+read）、
+// draw_us=デコード+LCD転送（drawJpg）、jpg_len=このフレームの JPEG バイト数。nullptr 可。micros で
+// 測るのは SD 読みが数ms オーダーで millis(1ms 刻み)では粗すぎるため。計時失敗時（早期 return）は
+// out を書かないので、呼び出し側は初期値 0 のまま扱う。
+static bool videoDrawFromPack(int idx, uint32_t* sd_us = nullptr,
+                              uint32_t* draw_us = nullptr, uint32_t* jpg_len = nullptr) {
     // 索引から位置を引く（純粋ロジック video_pack_entry・範囲検証込み・native テスト済み）。
     // ここで false が返るのは索引が壊れている時だけ（入場時に全件検証済みなので通常は起きない）。
     uint32_t off = 0, len = 0;
@@ -2339,9 +2345,16 @@ static bool videoDrawFromPack(int idx) {
     if (len > g_videoJpgCap) return false;  // 入場時の検証と冗長だが、読み込み前の最後の砦として残す
 
     // データ部は索引部の直後から始まるので、ファイル先頭からは index_len を足した位置。
+    const uint32_t ta = micros();
     if (!g_videoPackFile.seek(g_videoPackIndexLen + off)) return false;
     if (g_videoPackFile.read(g_videoJpgBuf, len) != static_cast<int>(len)) return false;
-    return M5.Display.drawJpg(g_videoJpgBuf, len);
+    const uint32_t tb = micros();
+    const bool ok = M5.Display.drawJpg(g_videoJpgBuf, len);
+    const uint32_t tc = micros();
+    if (sd_us)   *sd_us   = tb - ta;
+    if (draw_us) *draw_us = tc - tb;
+    if (jpg_len) *jpg_len = len;
+    return ok;
 }
 
 // 従来の連番ファイル方式で 1 枚描く（旧アセット互換・pack= の無い meta.txt）。
@@ -2360,14 +2373,21 @@ static bool videoDrawFromFiles(int idx) {
 static bool videoDrawFrame(int idx) {
     const bool use_pack = (g_videoPackOpen && g_videoPackIndex && g_videoJpgBuf);
 
-    const uint32_t t0 = millis();
-    const bool ok = use_pack ? videoDrawFromPack(idx) : videoDrawFromFiles(idx);
-    const uint32_t t1 = millis();
+    uint32_t sd_us = 0, draw_us = 0, jpg_len = 0;
+    const uint32_t t0 = micros();
+    const bool ok = use_pack ? videoDrawFromPack(idx, &sd_us, &draw_us, &jpg_len)
+                             : videoDrawFromFiles(idx);
+    const uint32_t t1 = micros();
     // 全フレームで出すとログ自体が再生を乱すので間引く。番号に対する傾向が見えれば十分
     // （パック方式なら番号によらず一定になるはず、が #170 の受け入れ条件）。
+    // 内訳（#176・30fps 可否判断）: sd=SD読み(seek+read) / draw=デコード+LCD転送。連番方式(旧アセット)は
+    // drawJpgFile が両者を分離できないので sd=draw=0・total だけが出る。jpg はフレームの JPEG バイト数で、
+    // 小さいフレームと大きいフレームでデコード時間が変わるはずなので内訳と一緒に読む（Issue #176）。
     if ((idx % 200) == 0) {
-        Serial.printf("[video] draw idx=%d total=%ums pack=%d\n",
-                      idx, static_cast<unsigned>(t1 - t0), use_pack ? 1 : 0);
+        Serial.printf("[video] draw idx=%d total=%uus sd=%uus draw=%uus jpg=%uB pack=%d\n",
+                      idx, static_cast<unsigned>(t1 - t0),
+                      static_cast<unsigned>(sd_us), static_cast<unsigned>(draw_us),
+                      static_cast<unsigned>(jpg_len), use_pack ? 1 : 0);
     }
     // 描画失敗も残す（reviewer 指摘）。戻り値を捨てると、恒常的に欠けたフレームが
     // 「前の絵が残る」だけになって観測できない。ただし全滅時に毎フレーム出ると
@@ -2380,6 +2400,57 @@ static bool videoDrawFrame(int idx) {
         }
     }
     return ok;
+}
+
+// LCD 転送のみを実測する（#176・再生開始時に1回）。drawJpg は「デコード＋LCD転送」の合計なので、
+// フルスクリーン Sprite を1枚 pushSprite する時間を測れば、そこから転送ぶんを引いてデコード時間を
+// 分離できる（draw_us − push = デコード）。合わせて LCD バスの実クロック（M5GFX が内部で決めるため
+// 自前コードには現れない値）も出す。仮説「LCD と SD が同一 SPI バスで転送時間が足し算」の検証材料。
+//
+// ⚠ フルスクリーン Sprite は #128 の「解放されず常駐」の当事者。ここでは必ず deleteSprite で即返す。
+// 前提: g_videoPack* が有効（videoOpenPack 済み）で、g_videoJpgBuf に読み込む余地がある状態で呼ぶ。
+static void videoBenchLcd() {
+    // 非パック方式（旧アセット）は内訳計時の対象外なので測らない（reviewer 指摘・#176）。150KB Sprite
+    // 確保と 30 回転送を無駄に走らせず、frame 0 の実絵も入らない（真っ黒）ので測る意味が無いため。
+    if (!(g_videoPackOpen && g_videoJpgBuf)) return;
+
+    // バス→クロック取得。getBus()->getClock() は Bus_SPI では freq_write（Hz）を返す。
+    const uint32_t clk = M5.Display.getPanel()->getBus()->getClock();
+
+    M5Canvas spr(&M5.Display);
+    spr.setPsram(true);      // フルスクリーンぶん(150KB)で内蔵RAMを圧迫しないよう PSRAM に置く（既存作法）
+    spr.setColorDepth(16);   // 実再生と同じ RGB565。転送バイト数を一致させる
+    if (!spr.createSprite(M5.Display.width(), M5.Display.height())) {
+        Serial.printf("[video] bench: sprite alloc failed (lcd clk=%uHz)\n",
+                      static_cast<unsigned>(clk));
+        return;
+    }
+
+    // 実画像を1枚入れておく（真っ黒でも DMA 転送量は同じだが、実絵のほうが代表性が高い）。frame 0 を
+    // pack から読み直して Sprite にデコードする。失敗しても転送は測れるので戻らない。デコード成否は
+    // img としてログに出す（真っ黒転送を実絵の代表値と誤読しないため・reviewer 指摘）。
+    // ⚠ この seek+read は g_videoPackFile の位置と g_videoJpgBuf を動かすが、後続の videoDrawFromPack は
+    //   毎フレーム必ず seek し直す（同関数の seek 参照）ので副作用は無い。
+    bool img_ok = false;
+    uint32_t off = 0, len = 0;
+    if (video_pack_entry(g_videoPackIndex, g_videoPackIndexLen, g_videoFrames,
+                         0, g_videoPackDataSize, &off, &len) &&
+        len <= g_videoJpgCap &&
+        g_videoPackFile.seek(g_videoPackIndexLen + off) &&
+        g_videoPackFile.read(g_videoJpgBuf, len) == static_cast<int>(len)) {
+        img_ok = spr.drawJpg(g_videoJpgBuf, len);
+    }
+
+    const int N = 30;  // 1回だと micros の量子化と初回 DMA 立ち上げが乗るので平均する
+    const uint32_t t0 = micros();
+    for (int i = 0; i < N; ++i) spr.pushSprite(&M5.Display, 0, 0);
+    const uint32_t t1 = micros();
+    spr.deleteSprite();  // #128 を踏まないよう即解放
+
+    Serial.printf("[video] bench: lcd clk=%uHz push=%uus/frame (%dx%d 16bit avg of %d img=%d)\n",
+                  static_cast<unsigned>(clk),
+                  static_cast<unsigned>((t1 - t0) / N),
+                  M5.Display.width(), M5.Display.height(), N, img_ok ? 1 : 0);
 }
 
 // 失敗時の共通表示（原因＋補足＋戻り方）。以降の処理は打ち切る。
@@ -2502,6 +2573,10 @@ static const char* videoStartPlayback() {
     if (!videoDrawFrame(0)) {
         return videoFailToSelect("フレームを表示できないのだ");
     }
+
+    // LCD 転送のみ＋実クロックを1回だけ実測する（#176）。音声ロード前に呼ぶのは、フルスクリーン
+    // Sprite(150KB) を確保する余地が PSRAM に一番ある瞬間だから（音声 7.5MB を載せた後だと逼迫する）。
+    videoBenchLcd();
 
     // 音声はベストエフォート（#152）。無くても絵は再生するので戻り値は使わない。playRaw を
     // 起点取り直しの直前に呼び、絵と音の時間軸をできるだけ揃える。
