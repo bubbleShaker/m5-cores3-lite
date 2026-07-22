@@ -34,6 +34,7 @@
 #include "pacman.h"   // Tile/Dir/Pos / pac_tile_at / pac_can_move / pac_step（パックマン迷路・純粋ロジック・#134）
 #include "video.h"    // video_frame_at（動画フレーム時刻・純粋ロジック・#142）
 #include "meta.h"     // meta_get_int（動画 manifest の key=value 取り出し・純粋ロジック・#148）
+#include "video_list.h"  // video_name_valid / VideoList 等（動画選択の純粋ロジック・#175）
 #include "sd_pins.h"  // kSdCsPin 等（microSD の SPI ピン・転送専用ファームと共有・#157）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
@@ -1949,11 +1950,40 @@ static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
 //
 // SD 作法（CoreS3・SPI・固定ピン）は research/sd-video-playback.md 参照。
 
-// SD 上のアセット位置。PC で `python tools/video2frames.py <URL> --name sample` を実行し、
-// 出た video/sample/ を microSD の /video/sample/ にコピーしておく（アセットは非コミット）。
-static constexpr const char* kVideoDir        = "/video/sample";
-static constexpr const char* kVideoMetaPath   = "/video/sample/meta.txt";
-static constexpr const char* kVideoAudioPath  = "/video/sample/audio.wav";
+// SD 上のアセット位置。/video/ 直下に動画ごとのサブディレクトリ（frames.bin/audio.wav/meta.txt）を置き、
+// 入場時の選択画面で1つ選んで再生する（#175）。PC で `python3 tools/video2frames.py <URL> --name <名前>`
+// を実行し、出た video/<名前>/ を microSD の /video/<名前>/ にコピーしておく（アセットは非コミット）。
+//
+// 初期値は選択前の未使用プレースホルダ。videoEnter は必ず選択画面を先に出し、決定時に
+// video_build_dir が /video/<選んだ名前> で上書きするので、この値は実再生には使われない。
+// 特定のアセット名を焼き込まないのが #175 の狙い（名前を固定しない）に沿う。
+// 選択で確定したら videoExit まで書き換えない。再生中に書き換わると videoOpenPack で開いた
+// File／索引と食い違うため（#175 の保証事項＝videoEnter で確定し videoExit まで固定）。
+static char g_videoDir[64] = "/video";
+
+// コンパイル時にバッファ境界を保証する（#175・reviewer 指摘）。video_build_dir は "/video/<name>" を
+// g_videoDir に、videoSubPath は "<g_videoDir>/<leaf>" を [80] バッファに snprintf で組む。名前は
+// kVideoNameMax 文字まで許すので、その最長名でも切り詰めが起きないことをここで機械的に固める
+// （kVideoNameMax を増やしたら、コメントの約束ではなくビルドが破綻を教える）。
+static_assert(sizeof("/video/") - 1 + kVideoNameMax < sizeof(g_videoDir),
+              "g_videoDir too small for /video/<kVideoNameMax>");
+static_assert(sizeof("/video/") - 1 + kVideoNameMax + sizeof("/audio.wav") <= 80,
+              "sub-path buffer[80] too small for /video/<name>/<leaf>");
+
+// /video/ 直下の列挙結果と選択カーソル・画面状態（#175）。列挙は選択画面の入場時に1回だけ。
+static VideoList g_videoList;
+static int       g_videoSel = 0;  // 選択カーソル（[0, count) を巡回。左タップで video_list_next）
+// 動画シーンの2状態: 入場直後は候補から選ぶ kSelecting、決定したら kPlaying。
+// 長押しは loop 側が「メニューへ戻る」に固定なので、決定はタップ（右半分）で行う（#175）。
+enum class VideoPhase { kSelecting, kPlaying };
+static VideoPhase g_videoPhase = VideoPhase::kSelecting;
+
+// g_videoDir を親にした子パス（"meta.txt" / "audio.wav"）を組み立てる。収まらなければ false
+// （切り詰めたパスで SD.open を呼ばせない・video_frame_path と同じ作法）。
+static bool videoSubPath(char* buf, size_t buf_size, const char* leaf) {
+    const int w = snprintf(buf, buf_size, "%s/%s", g_videoDir, leaf);
+    return w > 0 && w < static_cast<int>(buf_size);
+}
 
 // microSD(SPI) のピンは src/sd_pins.h に集約した（転送専用ファーム msc_main.cpp と共有・#157）。
 // 片方だけ直して食い違うのを防ぐため。include は先頭のブロックにある。
@@ -2099,11 +2129,16 @@ static bool videoLoadAudio() {
         Serial.println("[video] audio skip: voice disabled");
         return false;
     }
-    if (!SD.exists(kVideoAudioPath)) {
+    char audioPath[80];
+    if (!videoSubPath(audioPath, sizeof(audioPath), "audio.wav")) {
+        Serial.println("[video] audio skip: path too long");
+        return false;
+    }
+    if (!SD.exists(audioPath)) {
         Serial.println("[video] audio skip: audio.wav not found");
         return false;
     }
-    File f = SD.open(kVideoAudioPath);
+    File f = SD.open(audioPath);
     if (!f) {
         Serial.println("[video] audio skip: open failed");
         return false;
@@ -2200,8 +2235,8 @@ static VideoPackResult videoOpenPack(const char* meta) {
         return VideoPackResult::kError;
     }
 
-    // meta.txt は SD 上の外部入力。区切り文字を含む値で /video/sample の外を開かせない
-    // （tools 側 safe_subdir_name と同じ考え方を、読む側にも置く）。
+    // meta.txt は SD 上の外部入力。区切り文字を含む値で g_videoDir（/video/<選んだ名前>）の外を
+    // 開かせない（tools 側 safe_subdir_name と同じ考え方を、読む側にも置く）。
     if (strchr(name, '/') || strchr(name, '\\') || strstr(name, "..")) {
         Serial.printf("[video] pack: rejected name=%s\n", name);
         return VideoPackResult::kError;
@@ -2217,7 +2252,7 @@ static VideoPackResult videoOpenPack(const char* meta) {
     }
 
     char path[80];
-    const int written = snprintf(path, sizeof(path), "%s/%s", kVideoDir, name);
+    const int written = snprintf(path, sizeof(path), "%s/%s", g_videoDir, name);
     if (written < 0 || written >= static_cast<int>(sizeof(path))) {
         // 負値も弾く（エンコードエラー時に未定義の path で SD.open へ進ませない）。
         // video_frame_path と同じ「中途半端な文字列は使わせない」作法に揃える。
@@ -2312,7 +2347,7 @@ static bool videoDrawFromPack(int idx) {
 // 従来の連番ファイル方式で 1 枚描く（旧アセット互換・pack= の無い meta.txt）。
 static bool videoDrawFromFiles(int idx) {
     char path[64];
-    if (!video_frame_path(path, sizeof(path), kVideoDir, idx)) return false;
+    if (!video_frame_path(path, sizeof(path), g_videoDir, idx)) return false;
     // SD.exists は呼ばない（#169）。drawJpgFile はファイルが無ければ false を返すので存在確認は
     // 元から不要であり、しかも FAT32 はディレクトリにインデックスを持たずファイル名の解決が
     // 先頭からの線形走査になるため、exists と drawJpgFile で同じ走査を2回していた
@@ -2358,29 +2393,99 @@ static void videoShowError(const char* reason, const char* hint) {
     M5.Display.setFont(&fonts::Font0);
 }
 
-static void videoEnter() {
+// /video/ 直下のサブディレクトリを列挙して g_videoList に詰める（#175・選択画面の入場時に1回だけ）。
+// 名前は SD 上の外部入力なので video_list_add 内で検証してから入れる（不正名・上限超えは黙って捨てる）。
+// FAT32 でも数個の列挙は一瞬（#169 で遅かったのは 1 ディレクトリ 2,355 個の名前解決であって、
+// 数個のエントリの列挙そのものではない）。毎ループ SD を叩かず、ここでだけ列挙する。
+static void videoEnumerate() {
+    video_list_clear(&g_videoList);
+    File root = SD.open("/video");
+    if (!root) return;
+    int dropped = 0;  // 妥当だが上限超で捨てた／不正名で弾いた件数（観測用・reviewer 指摘）
+    for (File e = root.openNextFile(); e; e = root.openNextFile()) {
+        if (e.isDirectory()) {
+            // name() はコア実装によって絶対パス／basename どちらも返しうるので、末尾の
+            // '/' 以降を取り出して basename に正規化してから検証・追加する。
+            const char* full  = e.name();
+            const char* slash = strrchr(full, '/');
+            const char* base  = slash ? slash + 1 : full;
+            if (!video_list_add(&g_videoList, base)) dropped++;
+        }
+        e.close();
+    }
+    root.close();
+    // 捨てた件数を残す。上限超・不正名は黙って捨てる仕様（video_list_add）なので、
+    // 「SDに入れたのに一覧に出ない」時にここが唯一の手掛かりになる（0件と全捨てを区別できる）。
+    Serial.printf("[video] enumerate: listed=%d dropped=%d\n", g_videoList.count, dropped);
+}
+
+// 選択画面を1枚描く（#175）。menuRender と同じ縦リストの流儀。0件なら理由を出す（固まらせない）。
+// err を渡すと画面下部に赤字で理由を出す（選んだ動画が壊れていて再生に入れず戻した時・#175 設計メモ）。
+static void videoRenderSelect(const char* err = nullptr) {
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::top_left);
     M5.Display.setTextColor(TFT_CYAN, kColBg);
-    M5.Display.drawString("動画再生", 8, 12);
+    M5.Display.drawString("動画を選ぶのだ（左=次へ / 右=決定）", 6, 4);
+
+    if (g_videoList.count == 0) {
+        M5.Display.setTextColor(TFT_WHITE, kColBg);
+        M5.Display.drawString("/video/ に動画が無いのだ", 8, 44);
+        M5.Display.drawString("PCで変換してSDへ入れてね", 8, 68);
+        M5.Display.drawString("長押しでメニューに戻るのだ", 8, 200);
+        M5.Display.setFont(&fonts::Font0);
+        return;
+    }
+    // 1行 21px・先頭 y=40。kVideoListCap=8 行なら 240px に収まる（ヘッダの上限と対）。
+    for (int i = 0; i < g_videoList.count; ++i) {
+        const int  y   = 40 + i * 21;
+        const bool sel = (i == g_videoSel);
+        if (sel) M5.Display.fillTriangle(8, y + 2, 8, y + 14, 16, y + 8, TFT_YELLOW);
+        M5.Display.setTextColor(sel ? TFT_YELLOW : TFT_WHITE, kColBg);
+        M5.Display.drawString(video_list_name_at(&g_videoList, i), 24, y);
+    }
+    if (err) {
+        M5.Display.setTextColor(TFT_RED, kColBg);
+        M5.Display.drawString(err, 8, 216);  // 画面下部（最大 8 行の下・kScreenH=240 に収まる）
+    }
+    M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
+}
+
+// 再生開始に失敗した時の後始末（#175・reviewer 指摘）。確保済み資源を対称に解放し、状態を
+// 選択へ戻してから理由を返す。3つの失敗経路（meta/pack/frame）で解放の呼び忘れ・非対称や、
+// 「自分で倒した phase を呼び出し側に戻させる」責務の散らばりが起きないよう1箇所に閉じる。
+// videoReleaseAudio/videoReleasePack はどちらも未確保なら安全な no-op（前回再生の残存分だけ返す）。
+static const char* videoFailToSelect(const char* reason) {
+    videoReleasePack();
+    // videoReleaseAudio は「鳴っていないこと」を前提にバッファを返す。現状ここへ来る経路では
+    // まだ再生していないが、前提をコード側で閉じておく（将来「再生中に選択へ戻る」操作を足した
+    // 時に、DMA が参照中のバッファを解放する use-after-free になるため・reviewer 指摘）。
+    M5.Speaker.stop();
+    videoReleaseAudio();
+    g_videoPhase = VideoPhase::kSelecting;  // 再生に入れなかったので選択へ戻す（g_videoReady は既に false）
+    return reason;
+}
+
+// 確定した g_videoDir で再生を始める（#175）。旧 videoEnter の「meta 読み→pack→1枚目→音声」部分。
+// 呼び出し前に g_videoDir が確定していること（videoExit まで書き換えない保証・#175）。
+// 成功なら nullptr、失敗ならその理由（呼び出し側が選択画面へ戻して赤字で出す・#175 設計メモ）。
+static const char* videoStartPlayback() {
+    M5.Display.fillScreen(kColBg);
+    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+    M5.Display.setTextDatum(textdatum_t::top_left);
 
     g_videoEnterMs = millis();
     g_videoReady   = false;
     g_videoFps     = 0;
     g_videoFrames  = 0;
+    g_videoPhase   = VideoPhase::kPlaying;  // 決定済み。以降 videoUpdate は再生ロジックへ進む
 
-    // microSD をマウント（research/sd-video-playback.md）。二重初期化ガードは videoMountSd 内。
-    if (!videoMountSd()) {
-        videoShowError("SDを認識できないのだ", "microSDを挿してね");
-        return;
-    }
-
-    // manifest を読んで fps / frames を得る（純粋ロジック meta_get_int）。
+    // manifest を読んで fps / frames を得る（純粋ロジック meta_get_int）。パスは g_videoDir 由来。
+    char metaPath[80];
     String meta;
-    if (!videoReadTextFile(kVideoMetaPath, meta)) {
-        videoShowError("meta.txtが無いのだ", "/video/sample/ を用意してね");
-        return;
+    if (!videoSubPath(metaPath, sizeof(metaPath), "meta.txt") ||
+        !videoReadTextFile(metaPath, meta)) {
+        return videoFailToSelect("meta.txtが読めないのだ");
     }
     g_videoFps    = meta_get_int(meta.c_str(), "fps", 0);
     g_videoFrames = meta_get_int(meta.c_str(), "frames", 0);
@@ -2389,17 +2494,13 @@ static void videoEnter() {
     // 従来の連番ファイル方式で再生する。ここが「入場時 1 回だけの名前解決」になる。
     if (videoOpenPack(meta.c_str()) == VideoPackResult::kError) {
         // pack= を宣言しているのに使えない＝素材の食い違い。連番ファイルへ黙って落ちると
-        // 「なぜか遅い」だけの状態になって原因が見えなくなるので、ここで止めて理由を出す。
-        videoShowError("frames.binを読めないのだ", "変換し直して転送してね");
-        videoReleasePack();  // videoOpenPack 内で後始末済みだが、失敗経路すべてで対称に呼ぶ
-        return;
+        // 「なぜか遅い」だけの状態になって原因が見えなくなるので、ここで止めて理由を返す。
+        return videoFailToSelect("frames.binを読めないのだ");
     }
 
     // 1 枚目を表示（2a のゴール）。画面全面(320x240)に描かれる。
     if (!videoDrawFrame(0)) {
-        videoShowError("フレームを表示できないのだ", "/video/sample/ を確認してね");
-        videoReleasePack();
-        return;
+        return videoFailToSelect("フレームを表示できないのだ");
     }
 
     // 音声はベストエフォート（#152）。無くても絵は再生するので戻り値は使わない。playRaw を
@@ -2414,6 +2515,33 @@ static void videoEnter() {
     g_videoEnterMs = millis();
     g_videoReady = true;
     M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
+    return nullptr;
+}
+
+// 動画シーンへ入る（#175）。まず /video/ を列挙して選択画面を出す。決定は videoOnTap（右タップ）で。
+static void videoEnter() {
+    M5.Speaker.stop();               // 前シーンの音声を確実に止めてから選択画面へ
+    g_videoReady = false;            // 選択中は videoUpdate を素通しにする（再生ロジックを動かさない）
+    g_videoPhase = VideoPhase::kSelecting;
+    g_videoSel   = 0;
+
+    M5.Display.fillScreen(kColBg);
+    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+    M5.Display.setTextDatum(textdatum_t::top_left);
+
+    // microSD をマウント（research/sd-video-playback.md）。二重初期化ガードは videoMountSd 内。
+    if (!videoMountSd()) {
+        // 前回入場で作った候補が残っていると、この後の左右タップで「存在しない一覧」を描いたり
+        // 再生を試みて誤った理由（meta が読めない）を出す。真因は SD 未検出なので必ず空にする
+        // （reviewer 指摘）。
+        video_list_clear(&g_videoList);
+        M5.Display.setTextColor(TFT_CYAN, kColBg);
+        M5.Display.drawString("動画を選ぶのだ", 6, 4);
+        videoShowError("SDを認識できないのだ", "microSDを挿してね");
+        return;
+    }
+    videoEnumerate();     // 選択画面の入場時に1回だけ列挙する
+    videoRenderSelect();
 }
 
 // 一周した時の再スタート（#164）。順序は videoEnter の末尾と同じ
@@ -2444,6 +2572,15 @@ static void videoRestartCycle() {
 
 static void videoUpdate(uint32_t now) {
     if (!g_videoReady) return;  // SD/meta/1枚目のどれかで失敗した入場では動かさない
+
+    // 起点より前の now では何もしない（#175・reviewer 指摘）。loop は先頭で now を取り、
+    // タップ委譲の「後に」同じ now で update を呼ぶ。決定タップで videoStartPlayback が走ると
+    // その中で g_videoEnterMs = millis() が now より後の時刻になる（索引読み＋音声ロードで
+    // 数百ms〜数秒かかるため事実上必ず）。ガードが無いと下の now - g_videoEnterMs が uint32 で
+    // アンダーフローして約42億msになり、cycle が飛んで videoRestartCycle が誤発火する
+    // （＝再生開始のたびに音の頭が切れ、[video] wrap にデタラメな計測が1件混ざる）。
+    // 符号付きで見るのは millis の 49.7 日ラップでも同じ形で正しく効くため。
+    if (static_cast<int32_t>(now - g_videoEnterMs) < 0) return;
 
     // 音声が鳴り終わった瞬間を1回だけ捉え、実測と公称を比べる（#169）。
     // 差がそのまま「I2S の時計が millis に対してどれだけ速い/遅いか」になる。
@@ -2486,8 +2623,26 @@ static void videoUpdate(uint32_t now) {
     g_videoLastIdx = idx;
 }
 
-static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
-    // 2a では短タップ無反応。一時停止/再開は 2d で割り当てる。
+static void videoOnTap(uint32_t /*now*/, int touchX) {
+    // 再生中は短タップ無反応（既存の作法）。選択中だけタップに反応する（#175）。
+    if (g_videoPhase != VideoPhase::kSelecting) return;
+    if (g_videoList.count == 0) return;  // 候補なしは長押しで戻るだけ
+
+    if (video_is_decide_tap(touchX, kScreenW)) {
+        // 右半分=決定。選んだ名前で /video/<name> を確定してから再生へ入る（#175 の保証：
+        // ここで g_videoDir を確定し、videoExit まで書き換えない）。組み立て失敗なら何もしない。
+        const char* name = video_list_name_at(&g_videoList, g_videoSel);
+        if (!name || !video_build_dir(g_videoDir, sizeof(g_videoDir), name)) return;
+        // 再生開始。meta 欠け/壊れ等で入れなかったら選択画面へ戻して理由を出す（#175 設計メモ）。
+        // 失敗時の状態の後始末（資源解放・phase を kSelecting へ）は videoStartPlayback 側に閉じて
+        // あるので、ここは戻ってきた理由を選択画面に描くだけでよい。長押しでメニューにも戻れる。
+        const char* err = videoStartPlayback();
+        if (err) videoRenderSelect(err);
+    } else {
+        // 左半分=次の候補へカーソル移動（巡回・純粋ロジック video_list_next）。変化時だけ描き直す。
+        const int next = video_list_next(g_videoSel, g_videoList.count);
+        if (next != g_videoSel) { g_videoSel = next; videoRenderSelect(); }
+    }
 }
 
 // シーン退場時のクリーンアップ（#152）。長押し復帰では呼び出し側(loop)が既に Speaker.stop() 済みだが、
@@ -2511,7 +2666,7 @@ const SceneDef kScenes[] = {
     { "声の選択",     voiceEnter,  voiceUpdate,  voiceOnTap  },  // 左右タップ・#105
     { "スタックチャン", stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
     { "パックマン",   pacEnter,    pacUpdate,    pacOnTap    },  // 自作パックマン（#134 Step2）
-    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit },  // SD フレーム＋音声再生（#142/#148/#150/#152）
+    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit },  // /video/ から選んで再生（#142/#148/#150/#152/#170/#175）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号
