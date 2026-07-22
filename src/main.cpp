@@ -2457,6 +2457,10 @@ static void videoRenderSelect(const char* err = nullptr) {
 // videoReleaseAudio/videoReleasePack はどちらも未確保なら安全な no-op（前回再生の残存分だけ返す）。
 static const char* videoFailToSelect(const char* reason) {
     videoReleasePack();
+    // videoReleaseAudio は「鳴っていないこと」を前提にバッファを返す。現状ここへ来る経路では
+    // まだ再生していないが、前提をコード側で閉じておく（将来「再生中に選択へ戻る」操作を足した
+    // 時に、DMA が参照中のバッファを解放する use-after-free になるため・reviewer 指摘）。
+    M5.Speaker.stop();
     videoReleaseAudio();
     g_videoPhase = VideoPhase::kSelecting;  // 再生に入れなかったので選択へ戻す（g_videoReady は既に false）
     return reason;
@@ -2527,6 +2531,10 @@ static void videoEnter() {
 
     // microSD をマウント（research/sd-video-playback.md）。二重初期化ガードは videoMountSd 内。
     if (!videoMountSd()) {
+        // 前回入場で作った候補が残っていると、この後の左右タップで「存在しない一覧」を描いたり
+        // 再生を試みて誤った理由（meta が読めない）を出す。真因は SD 未検出なので必ず空にする
+        // （reviewer 指摘）。
+        video_list_clear(&g_videoList);
         M5.Display.setTextColor(TFT_CYAN, kColBg);
         M5.Display.drawString("動画を選ぶのだ", 6, 4);
         videoShowError("SDを認識できないのだ", "microSDを挿してね");
@@ -2564,6 +2572,15 @@ static void videoRestartCycle() {
 
 static void videoUpdate(uint32_t now) {
     if (!g_videoReady) return;  // SD/meta/1枚目のどれかで失敗した入場では動かさない
+
+    // 起点より前の now では何もしない（#175・reviewer 指摘）。loop は先頭で now を取り、
+    // タップ委譲の「後に」同じ now で update を呼ぶ。決定タップで videoStartPlayback が走ると
+    // その中で g_videoEnterMs = millis() が now より後の時刻になる（索引読み＋音声ロードで
+    // 数百ms〜数秒かかるため事実上必ず）。ガードが無いと下の now - g_videoEnterMs が uint32 で
+    // アンダーフローして約42億msになり、cycle が飛んで videoRestartCycle が誤発火する
+    // （＝再生開始のたびに音の頭が切れ、[video] wrap にデタラメな計測が1件混ざる）。
+    // 符号付きで見るのは millis の 49.7 日ラップでも同じ形で正しく効くため。
+    if (static_cast<int32_t>(now - g_videoEnterMs) < 0) return;
 
     // 音声が鳴り終わった瞬間を1回だけ捉え、実測と公称を比べる（#169）。
     // 差がそのまま「I2S の時計が millis に対してどれだけ速い/遅いか」になる。
