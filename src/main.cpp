@@ -1994,6 +1994,10 @@ static int      g_videoFrames  = 0;   // meta.txt の frames（同上）
 static bool     g_videoReady   = false; // SD 初期化＋meta 読み＋1枚表示まで成功したか
 static int      g_videoLastIdx  = 0;    // 直近に描いたフレーム番号（0基点・同番号ならスキップ）
 static uint32_t g_videoLastCycle = 0;   // 直近の周回番号（0基点・変化したら一周した＝音を鳴らし直す・#164）
+// 実測 fps（実際に描けたフレーム数/秒）の計測状態（#181）。公称 g_videoFps ではなく実描画数を数える。
+static uint32_t g_videoFpsWindowMs = 0; // 計測窓の起点ms（0=未初期化。初回描画で開く／入場ごとに開き直す）
+static int      g_videoFpsCount    = 0; // 現在の窓内で実際に描けたフレーム数
+static int      g_videoShownFps    = 0; // 左上に出す確定済みの実測 fps（1秒ごとに更新）
 // 動画音声（audio.wav）を丸ごと載せる PSRAM バッファ。playRaw が再生中に参照し続けるため
 // free せず保持し、videoExit で解放する（g_ttsBuf と同じ寿命管理・#152）。
 static uint8_t* g_videoAudioBuf = nullptr;
@@ -2402,6 +2406,27 @@ static bool videoDrawFrame(int idx) {
     return ok;
 }
 
+// 実測 fps（実際に描けたフレーム数/秒）を数え、左上に小さく重ねる（#181）。
+// 公称 fps(g_videoFps) ではなく実描画数なので、SD 読み＋デコードが詰まって番号が飛べば下がる
+// ＝30fps 化(#176) の体感確認に使える。drawJpg はフルスクリーンで毎フレーム上書きされるため、
+// 描画に成功した直後だけ呼び、そのたびテキストを重ね直す（失敗フレームは前の絵＝前の表示が残る）。
+static void videoDrawFpsOverlay(uint32_t now) {
+    if (g_videoFpsWindowMs == 0) g_videoFpsWindowMs = now;  // 初回描画で窓を開く
+    g_videoFpsCount++;
+    const uint32_t span = now - g_videoFpsWindowMs;
+    if (span >= 1000) {  // 1秒窓が閉じたら fps を確定してリセット（端数ぶんは次窓の起点に繰り込む）
+        g_videoShownFps    = static_cast<int>(
+            static_cast<uint64_t>(g_videoFpsCount) * 1000u / span);
+        g_videoFpsCount    = 0;
+        g_videoFpsWindowMs = now;
+    }
+    // 背景色つきテキストなので、塗るのは文字の矩形だけ＝周囲の絵は残る（既存の HUD と同じ作法）。
+    M5.Display.setTextColor(TFT_GREEN, kColBg);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(2, 2);
+    M5.Display.printf("%2d fps", g_videoShownFps);
+}
+
 // LCD 転送のみを実測する（#176・再生開始時に1回）。drawJpg は「デコード＋LCD転送」の合計なので、
 // フルスクリーン Sprite を1枚 pushSprite する時間を測れば、そこから転送ぶんを引いてデコード時間を
 // 分離できる（draw_us − push = デコード）。合わせて LCD バスの実クロック（M5GFX が内部で決めるため
@@ -2694,7 +2719,9 @@ static void videoUpdate(uint32_t now) {
     // 欠け/破損フレームでもこの番号は「消化済み」にする。更新せず return すると、恒常的に欠けた
     // 番号の時間窓（最大 1/fps 秒）ずっと毎ループ SD を叩き続けるため。同番号スキップの作法と
     // 一貫させ、次の番号まで SD に触れない。
-    videoDrawFrame(idx);
+    if (videoDrawFrame(idx)) {
+        videoDrawFpsOverlay(now);  // 描けた時だけ数える＝実測 fps（#181）。上書きされる前に重ねる
+    }
     g_videoLastIdx = idx;
 }
 
@@ -2728,6 +2755,10 @@ static void videoExit() {
     videoReleaseAudio();  // free と解析結果の null 化を対で行う（#164）
     videoReleasePack();   // frames.bin を閉じ、索引と読み込みバッファを返す（#170）
     g_videoReady = false;
+    // 次の入場でゼロから測り直す（前回の残り値を最大1秒出さない・#181）
+    g_videoFpsWindowMs = 0;
+    g_videoFpsCount    = 0;
+    g_videoShownFps    = 0;
 }
 
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
