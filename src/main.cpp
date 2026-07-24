@@ -2507,14 +2507,24 @@ static void videoRenderSelect(const char* err = nullptr) {
         M5.Display.setFont(&fonts::Font0);
         return;
     }
-    // 1行 21px・先頭 y=40。kVideoListCap=8 行なら 240px に収まる（ヘッダの上限と対）。
-    for (int i = 0; i < g_videoList.count; ++i) {
-        const int  y   = 40 + i * 21;
+    // 1行 21px・先頭 y=40。一度に kVideoVisibleRows(=8) 行だけ描く。件数がそれを超える時は
+    // video_scroll_top が選択を必ず含む窓の先頭を返すので、その窓 [top, top+rows) を描く（#189）。
+    const int top = video_scroll_top(g_videoSel, g_videoList.count, kVideoVisibleRows);
+    const int end = (top + kVideoVisibleRows < g_videoList.count)
+                        ? top + kVideoVisibleRows : g_videoList.count;
+    for (int i = top; i < end; ++i) {
+        const int  y   = 40 + (i - top) * 21;
         const bool sel = (i == g_videoSel);
         if (sel) M5.Display.fillTriangle(8, y + 2, 8, y + 14, 16, y + 8, TFT_YELLOW);
         M5.Display.setTextColor(sel ? TFT_YELLOW : TFT_WHITE, kColBg);
         M5.Display.drawString(video_list_name_at(&g_videoList, i), 24, y);
     }
+    // 窓の外に隠れた項目がある向きへ▲▼を出す（スクロールできることの手掛かり・#189）。
+    // ▼は最下行の右端(y=187)に置く。y=208 だと下部の err 赤字(y=216)と縦に重なるため
+    // （9本以上あって再生失敗で選択へ戻された時に同時に出る・reviewer 指摘）。
+    M5.Display.setTextColor(TFT_DARKGREY, kColBg);
+    if (top > 0)                    M5.Display.drawString("▲", 300, 40);
+    if (end < g_videoList.count)    M5.Display.drawString("▼", 300, 187);
     if (err) {
         M5.Display.setTextColor(TFT_RED, kColBg);
         M5.Display.drawString(err, 8, 216);  // 画面下部（最大 8 行の下・kScreenH=240 に収まる）
