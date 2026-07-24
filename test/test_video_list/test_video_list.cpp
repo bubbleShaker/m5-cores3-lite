@@ -142,6 +142,55 @@ void test_list_next_robust() {
     TEST_ASSERT_EQUAL_INT(0, video_list_next(-1, 3));  // -1≡2 →次は 0
 }
 
+// ───────── スクロール開始位置（#189・9本以上を8行窓で見せる） ─────────
+
+// 全件が窓に収まる（count<=rows）ときは常に先頭から（スクロール不要）
+void test_scroll_top_fits() {
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(0, 5, 8));
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(4, 5, 8));
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(7, 8, 8));  // ちょうど収まる
+}
+
+// 溢れる（count>rows）ときは選択を中央寄りに置き、両端でクランプする
+void test_scroll_top_scrolls() {
+    // count 16 / rows 8。窓は [top, top+8)
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(0, 16, 8));   // 先頭
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(3, 16, 8));   // 3-4=-1 → 0 でクランプ
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(4, 16, 8));   // 4-4=0
+    TEST_ASSERT_EQUAL_INT(4, video_scroll_top(8, 16, 8));   // 8-4=4（中央寄せ）
+    TEST_ASSERT_EQUAL_INT(8, video_scroll_top(15, 16, 8));  // 末尾は count-rows=8 でクランプ
+    TEST_ASSERT_EQUAL_INT(8, video_scroll_top(12, 16, 8));  // 12-4=8（末尾クランプと一致）
+}
+
+// count=rows+1 の「溢れるが余白1しか無い」中間帯（中央寄せが末尾クランプに飲まれる・reviewer 指摘）
+void test_scroll_top_barely_overflows() {
+    // count 9 / rows 8。top は 0 か 1 しか取れない
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(0, 9, 8));
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(4, 9, 8));  // 4-4=0
+    TEST_ASSERT_EQUAL_INT(1, video_scroll_top(5, 9, 8));  // 5-4=1（末尾クランプ count-rows=1 と一致）
+    TEST_ASSERT_EQUAL_INT(1, video_scroll_top(8, 9, 8));  // 末尾もクランプで 1
+}
+
+// 選択は必ず窓 [top, top+rows) の中に入る（見えない項目を選ばせない不変条件）
+void test_scroll_top_keeps_selection_visible() {
+    const int count = 13, rows = 8;
+    for (int sel = 0; sel < count; ++sel) {
+        int top = video_scroll_top(sel, count, rows);
+        TEST_ASSERT_TRUE(top <= sel);
+        TEST_ASSERT_TRUE(sel < top + rows);
+        TEST_ASSERT_TRUE(top >= 0);
+        TEST_ASSERT_TRUE(top <= count - rows);
+    }
+}
+
+// 異常入力でも 0 を返して落ちない（rows<=0 / 範囲外 sel / count<=0）
+void test_scroll_top_robust() {
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(3, 16, 0));   // rows<=0
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(3, 0, 8));    // count<=0
+    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(-5, 16, 8));  // 負の sel はクランプ
+    TEST_ASSERT_EQUAL_INT(8, video_scroll_top(999, 16, 8)); // 範囲超の sel は末尾へ
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_name_valid_ok);
@@ -158,5 +207,10 @@ int main(int, char**) {
     RUN_TEST(test_is_decide_tap);
     RUN_TEST(test_list_next_cycles);
     RUN_TEST(test_list_next_robust);
+    RUN_TEST(test_scroll_top_fits);
+    RUN_TEST(test_scroll_top_scrolls);
+    RUN_TEST(test_scroll_top_barely_overflows);
+    RUN_TEST(test_scroll_top_keeps_selection_visible);
+    RUN_TEST(test_scroll_top_robust);
     return UNITY_END();
 }

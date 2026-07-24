@@ -57,3 +57,16 @@ int video_list_next(int index, int count) {
     i = (i + 1) % count;
     return i;
 }
+
+int video_scroll_top(int sel, int count, int rows) {
+    if (rows <= 0 || count <= 0) return 0;  // 異常入力は先頭固定で落とさない
+    if (count <= rows) return 0;            // 全件収まるならスクロール不要
+    // 範囲外の sel を [0, count) にクランプ（描画側が渡し損ねても窓を壊さない）。
+    if (sel < 0) sel = 0;
+    if (sel >= count) sel = count - 1;
+    // sel を窓の中央寄りに置く。rows/2 は整数除算（8→4）。両端は 0 と count-rows で頭打ち。
+    int top = sel - rows / 2;
+    if (top < 0) top = 0;
+    if (top > count - rows) top = count - rows;
+    return top;
+}

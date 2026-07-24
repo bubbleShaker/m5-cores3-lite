@@ -17,9 +17,13 @@ static const size_t kVideoNameMax = 31;
 
 // 保持する候補の最大件数（固定長配列で持つ・#175 設計メモ「件数上限」）。
 // これを超える分は列挙側で黙って捨て、呼び出し側は count が頭打ちになることで気づく。
-// 8 なのは選択画面が縦リスト（1行 21px・先頭 y=40）で、8 行なら 240px に収まるため
-// （端末側 videoRenderSelect のレイアウトと対。増やすときはページングが要る）。
-static const int kVideoListCap = 8;
+// #189 で 8→16 に拡張（10曲＋既存動画を全部選べるように）。画面には一度に 8 行しか収まらないので、
+// videoRenderSelect は video_scroll_top で決めた窓を描くスクロール表示にした（対の関係）。
+static const int kVideoListCap = 16;
+
+// 選択画面に一度に描ける行数（1行 21px・先頭 y=40 で 8 行なら 240px に収まる）。
+// count がこれを超えたら video_scroll_top でスクロール窓を出す。
+static const int kVideoVisibleRows = 8;
 
 // エントリ名が「単一のディレクトリ名」として妥当か（#175 設計メモ「エントリ名の妥当性判定」）。
 // 弾く条件: null / 空 / "." / 区切り文字('/'・'\\')を含む / ".." を含む / kVideoNameMax 超え。
@@ -58,3 +62,10 @@ bool video_is_decide_tap(int x, int screenW);
 // 単方向の巡回にするのは操作が「左タップ=次へ」の一方向だから。menu_move（クランプ）と違い、
 // 末尾からは先頭へ戻して全件へ到達できるようにする。
 int video_list_next(int index, int count);
+
+// 選択(sel)が必ず見える 8 行窓の先頭インデックスを返す純粋関数（#189）。
+// count<=rows なら全件収まるので 0。溢れる時は sel を窓の中央寄りに置き、両端でクランプする
+// （先頭付近は 0、末尾付近は count-rows で頭打ち）。返り値 top は常に
+// [0, max(0, count-rows)] に入り、sel は [top, top+rows) に収まる（描画側の不変条件）。
+// rows<=0 / count<=0 は 0、範囲外の sel は [0, count) にクランプしてから計算する（堅牢性）。
+int video_scroll_top(int sel, int count, int rows);
