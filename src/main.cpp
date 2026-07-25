@@ -1965,8 +1965,10 @@ static void pacOnTap(uint32_t /*now*/, int /*touchX*/) {
 // 初期値は選択前の未使用プレースホルダ。videoEnter は必ず選択画面を先に出し、決定時に
 // video_build_dir が /video/<選んだ名前> で上書きするので、この値は実再生には使われない。
 // 特定のアセット名を焼き込まないのが #175 の狙い（名前を固定しない）に沿う。
-// 選択で確定したら videoExit まで書き換えない。再生中に書き換わると videoOpenPack で開いた
-// File／索引と食い違うため（#175 の保証事項＝videoEnter で確定し videoExit まで固定）。
+// 選択で確定したら「再生を抜ける」まで書き換えない。再生中に書き換わると videoOpenPack で
+// 開いた File／索引と食い違うため（#175 の保証事項）。再生を抜ける経路は videoExit と、
+// 長押しで選択へ1段戻る videoOnLongPress（#198・pack を閉じてから kSelecting へ戻すので、
+// その後の再決定で上書きされても開いている File と食い違わない）の2つ。
 static char g_videoDir[64] = "/video";
 
 // コンパイル時にバッファ境界を保証する（#175・reviewer 指摘）。video_build_dir は "/video/<name>" を
@@ -1982,7 +1984,8 @@ static_assert(sizeof("/video/") - 1 + kVideoNameMax + sizeof("/audio.wav") <= 80
 static VideoList g_videoList;
 static int       g_videoSel = 0;  // 選択カーソル（[0, count) を巡回。左右スワイプで next/prev・#193）
 // 動画シーンの2状態: 入場直後は候補から選ぶ kSelecting、決定したら kPlaying。
-// 長押しは loop 側が「メニューへ戻る」に固定なので、決定はタップ（画面のどこでも・#193）で行う。
+// 決定はタップ（画面のどこでも・#193）。長押しは kSelecting ではメニューへ（loop 側・従来どおり）、
+// kPlaying では曲選択へ1段戻る（videoOnLongPress が消費・#198）。
 enum class VideoPhase { kSelecting, kPlaying };
 static VideoPhase g_videoPhase = VideoPhase::kSelecting;
 
@@ -2008,7 +2011,8 @@ static bool     g_videoReady   = false; // SD 初期化＋meta 読み＋1枚表�
 static int      g_videoLastIdx  = 0;    // 直近に描いたフレーム番号（0基点・同番号ならスキップ）
 static uint32_t g_videoLastCycle = 0;   // 直近の周回番号（0基点・変化したら一周した＝音を鳴らし直す・#164）
 // 動画音声（audio.wav）を丸ごと載せる PSRAM バッファ。playRaw が再生中に参照し続けるため
-// free せず保持し、videoExit で解放する（g_ttsBuf と同じ寿命管理・#152）。
+// free せず保持し、再生を抜ける時（videoExit / 長押しの videoOnLongPress・#198）に解放する
+// （g_ttsBuf と同じ寿命管理・#152）。
 static uint8_t* g_videoAudioBuf = nullptr;
 
 // WAV ヘッダの解析結果（#164）。周回ごとに鳴らし直すために保持する。
@@ -2507,7 +2511,8 @@ static void videoEnumerate() {
 // テキストの縦リスト（#175/#189）を置き換え、選択中の曲のサムネイルを CD ディスク風に中央へ
 // 出すカルーセル。サムネイルは SD 上の frames.bin から中間フレームを 1 枚だけ読んでデコード
 // する（PC 側の再変換・SD への再転送が一切不要＝今入っている素材がそのまま対象になる）。
-// 操作: 左右スワイプ=曲送り（巡回）/ タップ（どこでも）=決定 / 長押し=メニュー復帰（loop 側・従来どおり）。
+// 操作: 左右スワイプ=曲送り（巡回）/ タップ（どこでも）=決定 / 長押し=メニュー復帰（loop 側）。
+// 再生中の長押しはこの選択画面へ1段戻る（videoOnLongPress・#198）。
 
 static constexpr int kDiscSize    = 132;  // ディスク Sprite の一辺（=CD の直径）
 static constexpr int kDiscCanvasS = 160;  // 合成キャンバスの一辺（浮遊 ±5px と回転の余白ぶん大きく）
@@ -3033,7 +3038,8 @@ static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
 
     // タップ＝決定（#193）。曲送りがスワイプになったので、左右の二分（旧 video_is_decide_tap）は
     // 廃止し、画面のどこをタップしても決定にする。選んだ名前で /video/<name> を確定してから
-    // 再生へ入る（#175 の保証: ここで g_videoDir を確定し、videoExit まで書き換えない）。
+    // 再生へ入る（#175 の保証: ここで g_videoDir を確定し、再生を抜けるまで書き換えない。
+    // 長押しで選択へ戻った後の再決定は pack を閉じた後なので上書きしてよい・#198）。
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
     if (!name || !video_build_dir(g_videoDir, sizeof(g_videoDir), name)) return;
     // 再生開始。meta 欠け/壊れ等で入れなかったら選択画面へ戻して理由を出す（#175 設計メモ）。
