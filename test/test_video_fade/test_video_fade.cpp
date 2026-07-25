@@ -203,6 +203,72 @@ void test_now_before_start_is_full_level() {
     TEST_ASSERT_EQUAL_INT(-1, swap_to);
 }
 
+// --- 画素の輝度スケール（Issue #213） ---------------------------------------
+
+// 等倍は恒等・0 は真っ黒（フェードの両端が「元の絵」と「黒」になることの担保）。
+void test_scale565_endpoints() {
+    const uint16_t colors[] = {0x0000, 0xFFFF, 0xF800, 0x07E0, 0x001F, 0x7BEF, 0xF81F};
+    for (uint16_t c : colors) {
+        TEST_ASSERT_EQUAL_HEX16(c, video_fade_scale565(c, 256));
+        TEST_ASSERT_EQUAL_HEX16(0x0000, video_fade_scale565(c, 0));
+    }
+}
+
+// 純色は他チャンネルへ漏れない。これが #213 の本体（R をまとめて掛けていた頃は、
+// 中間の level で B フィールドに最大 24/31 が湧いて CD が青くなった）。
+void test_scale565_no_channel_bleed() {
+    for (uint32_t level = 0; level <= 256; ++level) {
+        const uint16_t r = video_fade_scale565(0xF800, level);  // 純赤
+        TEST_ASSERT_EQUAL_UINT16(0, r & ~0xF800u);
+        const uint16_t g = video_fade_scale565(0x07E0, level);  // 純緑
+        TEST_ASSERT_EQUAL_UINT16(0, g & ~0x07E0u);
+        const uint16_t b = video_fade_scale565(0x001F, level);  // 純青
+        TEST_ASSERT_EQUAL_UINT16(0, b & ~0x001Fu);
+    }
+}
+
+// 各チャンネルが level に比例する（#213 の再現ケースを数値で固定する）。
+// 期待値は実装と同じ式ではなく直値で置く（式をなぞると同じ間違いを一緒に通してしまう）。
+void test_scale565_scales_each_channel() {
+    const uint16_t v = (15u << 11) | (31u << 5) | 15u;  // 中間調グレー
+    const uint16_t out = video_fade_scale565(v, 130);   // 半分弱の明るさ
+    TEST_ASSERT_EQUAL_UINT16(7,  (out >> 11) & 0x1Fu);  // 15 * 130/256 = 7.6 → 7
+    TEST_ASSERT_EQUAL_UINT16(15, (out >>  5) & 0x3Fu);  // 31 * 130/256 = 15.7 → 15
+    TEST_ASSERT_EQUAL_UINT16(7,  (out      ) & 0x1Fu);  // 同上（旧実装はここが 23 だった）
+}
+
+// level を上げると各チャンネルは単調に増える（暗転の途中で明るさが跳ねない）。
+void test_scale565_monotonic() {
+    const uint16_t v = 0xC618;  // 白寄りのグレー（3チャンネルとも中間より上）
+    uint16_t pr = 0, pg = 0, pb = 0;
+    for (uint32_t level = 0; level <= 256; ++level) {
+        const uint16_t out = video_fade_scale565(v, level);
+        const uint16_t r = (out >> 11) & 0x1Fu, g = (out >> 5) & 0x3Fu, b = out & 0x1Fu;
+        // チャンネルごとに分けて見る（落ちた時にどれが跳ねたか分かるように）
+        TEST_ASSERT_GREATER_OR_EQUAL_UINT16(pr, r);
+        TEST_ASSERT_GREATER_OR_EQUAL_UINT16(pg, g);
+        TEST_ASSERT_GREATER_OR_EQUAL_UINT16(pb, b);
+        pr = r; pg = g; pb = b;
+    }
+    TEST_ASSERT_EQUAL_HEX16(v, video_fade_scale565(v, 256));
+}
+
+// スケール結果が透明キー 0xF81F に化けない（reviewer 指摘 🟡）。
+// videoDiscFadeApply はこの性質に寄りかかって「フェード中に CD へ穴が空かない」ことを
+// 担保している（キーに一致した画素は pushRotateZoom で抜かれる）。切り捨てをやめて丸めを
+// 入れると level=255 で R=31 に届き成立しなくなるため、モジュールを跨ぐ契約として固定する。
+void test_scale565_never_hits_transparent_key() {
+    const uint16_t colors[] = {0xFFFF, 0xF81F, 0xF800, 0x001F, 0xFFE0, 0xC618};
+    for (uint16_t c : colors) {
+        for (uint32_t level = 0; level < 256; ++level) {
+            const uint16_t out = video_fade_scale565(c, level);
+            TEST_ASSERT_TRUE(out != 0xF81Fu);
+            TEST_ASSERT_LESS_OR_EQUAL_UINT16(30, (out >> 11) & 0x1Fu);  // R は 31 に届かない
+            TEST_ASSERT_LESS_OR_EQUAL_UINT16(30, (out      ) & 0x1Fu);  // B も同様
+        }
+    }
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_idle_is_full_level);
@@ -217,5 +283,10 @@ int main(int, char**) {
     RUN_TEST(test_rebase_restarts_fade_in);
     RUN_TEST(test_wraps_around_millis);
     RUN_TEST(test_now_before_start_is_full_level);
+    RUN_TEST(test_scale565_endpoints);
+    RUN_TEST(test_scale565_no_channel_bleed);
+    RUN_TEST(test_scale565_scales_each_channel);
+    RUN_TEST(test_scale565_monotonic);
+    RUN_TEST(test_scale565_never_hits_transparent_key);
     return UNITY_END();
 }
