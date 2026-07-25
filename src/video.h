@@ -65,3 +65,21 @@ static const int kVideoMaxFrames = 100000;
 bool video_pack_entry(const uint8_t* index, size_t index_len, int frame_count,
                       int idx, uint32_t data_size,
                       uint32_t* out_offset, uint32_t* out_length);
+
+// ───────── 選択画面の背景グラデーション（#195） ─────────
+// サムネイルの平均色から背景の色を作る算術。0xRRGGBB のパック表現で受け渡しする
+// （RGB565 への変換は表示側 M5GFX の color565 に任せ、ここは 8bit/成分で計算する）。
+
+// 平均色の「色味」だけを使い、明るさを target_max に正規化する純粋関数。
+// 最大成分が target_max になるよう 3 成分を等比でスケールするので、色相はそのまま
+// 明るさだけが揃う（暗い素材でも白飛びした素材でも、背景のトーンが一定になる）。
+//   rgb の実効値は各成分 8bit（超えたぶんのビットは無視する）。
+//   全成分 0（真っ黒）は色味が無いので 0（黒）のまま返す。
+//   スケール結果が 255 を超える成分は 255 で飽和させる（target_max <= 255 なら起きないが、
+//   計算の性質として保証しておく）。
+uint32_t video_bg_tone(uint32_t rgb, uint8_t target_max);
+
+// 縦グラデーションの i 行目（全 n 行）の色を top→bottom の線形補間で返す純粋関数。
+//   i=0 は top、i=n-1 は bottom に一致する（両端が正確に出ることを保証）。
+//   n<=1 は top を返す。i は [0, n) にクランプしてから補間する（堅牢性）。
+uint32_t video_bg_lerp(uint32_t top, uint32_t bottom, int i, int n);

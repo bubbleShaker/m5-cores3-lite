@@ -72,3 +72,43 @@ bool video_pack_entry(const uint8_t* index, size_t index_len, int frame_count,
     *out_length = length;
     return true;
 }
+
+uint32_t video_bg_tone(uint32_t rgb, uint8_t target_max) {
+    const uint32_t r = (rgb >> 16) & 0xFF;
+    const uint32_t g = (rgb >> 8) & 0xFF;
+    const uint32_t b = rgb & 0xFF;
+    uint32_t mx = r;
+    if (g > mx) mx = g;
+    if (b > mx) mx = b;
+    if (mx == 0) return 0;  // 真っ黒には色味が無い。0 除算も避ける
+
+    // 等比スケール（四捨五入）。mx がそのまま target_max になり、他の成分は比率を保つ。
+    const uint32_t t = target_max;
+    uint32_t nr = (r * t + mx / 2) / mx;
+    uint32_t ng = (g * t + mx / 2) / mx;
+    uint32_t nb = (b * t + mx / 2) / mx;
+    if (nr > 255) nr = 255;
+    if (ng > 255) ng = 255;
+    if (nb > 255) nb = 255;
+    return (nr << 16) | (ng << 8) | nb;
+}
+
+uint32_t video_bg_lerp(uint32_t top, uint32_t bottom, int i, int n) {
+    if (n <= 1) return top;
+    if (i < 0) i = 0;
+    if (i >= n) i = n - 1;
+
+    // 成分ごとの重み付き平均 (a*(d-i) + b*i) / d。a,b,重みが全部非負なので切り捨ての向きが
+    // 揺れず、i=0 で正確に a、i=d で正確に b になる（差の符号で丸めがずれる a+(b-a)*i/d 形を
+    // 避けた）。最大値 255*239 + 119 は 32bit に余裕で収まる。
+    const uint32_t d  = static_cast<uint32_t>(n - 1);
+    const uint32_t wi = static_cast<uint32_t>(i);
+    uint32_t out = 0;
+    for (int shift = 16; shift >= 0; shift -= 8) {
+        const uint32_t a = (top >> shift) & 0xFF;
+        const uint32_t b = (bottom >> shift) & 0xFF;
+        const uint32_t v = (a * (d - wi) + b * wi + d / 2) / d;
+        out |= v << shift;
+    }
+    return out;
+}
