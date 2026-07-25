@@ -1011,6 +1011,11 @@ struct SceneDef {
     // 「1段だけ戻る」を表現するために使う。消費する場合の音声停止・資源解放はシーン側の責務
     // （loop のメニュー復帰路にある Speaker.stop / exit() は通らないため）。
     bool (*onLongPress)(uint32_t now);
+    // ペーシングの締切（省略可 = nullptr・#207）。「次に描くものが生まれる時刻までの残り ms」を
+    // 返すと、loop 末尾の framePace が寝る長さをそこまでに縮める（締切なしは UINT32_MAX）。
+    // 一律 33ms 寝ると締切に最大 33ms 気づき遅れるため、実時刻基準で動くシーン（動画再生）が
+    // 描画予算をフルに使うために使う。共通機構側にシーン固有の状態を持ち込まないための口。
+    uint32_t (*paceLimitMs)(uint32_t now);
 };
 
 // --- 羊シーンの状態とアダプタ ---
@@ -3040,6 +3045,37 @@ static void videoRestartCycle() {
     g_videoLastCycle = 0;  // 起点を取り直したので周回番号も 0 から数え直す
 }
 
+// 再生の時間軸が有効なら true を返し、経過 ms を out へ書く（#207 で videoUpdate から共通化）。
+// 「再生中か（phase/ready）」と「起点より前の now でないか」の三点ガードを一点に閉じる。
+// このガードは videoUpdate（フレーム送り）と videoPaceLimitMs（ペーシング締切）の両方が使い、
+// 二重管理だと将来 phase が増えた時に片方だけ意図とズレる（reviewer 指摘）。
+//
+// 起点より前の now を弾く理由（#175・reviewer 指摘）: loop は先頭で now を取り、タップ委譲の
+// 「後に」同じ now で update を呼ぶ。決定タップで videoStartPlayback が走ると、その中で
+// g_videoEnterMs = millis() が now より後の時刻になる（索引読み＋音声ロードで時間がかかるため
+// 事実上必ず）。ガードが無いと now - g_videoEnterMs が uint32 でアンダーフローして約42億msになり、
+// cycle が飛んで videoRestartCycle が誤発火する（＝再生開始のたびに音の頭が切れる）。
+// 符号付きで見るのは millis の 49.7 日ラップでも同じ形で正しく効くため。
+static bool videoElapsedMs(uint32_t now, uint32_t* out) {
+    if (g_videoPhase != VideoPhase::kPlaying || !g_videoReady) return false;
+    if (static_cast<int32_t>(now - g_videoEnterMs) < 0) return false;
+    *out = now - g_videoEnterMs;
+    return true;
+}
+
+// ペーシングの締切（SceneDef::paceLimitMs・#207）。再生中だけ「次フレームの締切までの残り ms」を
+// 返し、それ以外は UINT32_MAX（＝締切なし。framePace の min() で自然に効かなくなる）。
+// 締切の計算は純粋関数 video_until_next_frame_ms（native テスト済み）に委譲し、ここは状態の
+// ガードだけを担う。frames<=1 の素材はフレーム番号が原理的に進まない（videoUpdate は必ず
+// 同番号スキップ）ので締切を出さない。壊れた meta の巨大 fps で締切が常に 1ms になり
+// delay(1) が空回りする経路もこれで塞がる（reviewer 指摘）。
+static uint32_t videoPaceLimitMs(uint32_t now) {
+    uint32_t elapsed = 0;
+    if (!videoElapsedMs(now, &elapsed)) return UINT32_MAX;
+    if (g_videoFrames <= 1) return UINT32_MAX;
+    return video_until_next_frame_ms(elapsed, g_videoFps);
+}
+
 static void videoUpdate(uint32_t now) {
     // 選択中は背景の模様とディスクのカルーセルを毎フレーム合成する（#193/#199）。SD 無し・0件・
     // Sprite 確保失敗の時は UI が立っていない（g_videoDiscUiUp=false）ので静止画面のまま＝固まらない。
@@ -3048,16 +3084,9 @@ static void videoUpdate(uint32_t now) {
         return;
     }
 
-    if (!g_videoReady) return;  // SD/meta/1枚目のどれかで失敗した入場では動かさない
-
-    // 起点より前の now では何もしない（#175・reviewer 指摘）。loop は先頭で now を取り、
-    // タップ委譲の「後に」同じ now で update を呼ぶ。決定タップで videoStartPlayback が走ると
-    // その中で g_videoEnterMs = millis() が now より後の時刻になる（索引読み＋音声ロードで
-    // 数百ms〜数秒かかるため事実上必ず）。ガードが無いと下の now - g_videoEnterMs が uint32 で
-    // アンダーフローして約42億msになり、cycle が飛んで videoRestartCycle が誤発火する
-    // （＝再生開始のたびに音の頭が切れ、[video] wrap にデタラメな計測が1件混ざる）。
-    // 符号付きで見るのは millis の 49.7 日ラップでも同じ形で正しく効くため。
-    if (static_cast<int32_t>(now - g_videoEnterMs) < 0) return;
+    // 再生中でない・起点より前の now は動かさない（三点ガード。理由は videoElapsedMs の説明を参照）。
+    uint32_t elapsed = 0;
+    if (!videoElapsedMs(now, &elapsed)) return;
 
     // 音声が鳴り終わった瞬間を1回だけ捉え、実測と公称を比べる（#169）。
     // 差がそのまま「I2S の時計が millis に対してどれだけ速い/遅いか」になる。
@@ -3073,8 +3102,7 @@ static void videoUpdate(uint32_t now) {
 
     // 実時刻基準でフレーム番号を出す（純粋ロジック video_frame_at）。SD 読み＋デコードが
     // 1/fps に間に合わなければ、その番号が自然に飛ぶ＝時間軸がずれない（2c の音声同期の前提）。
-    const uint32_t elapsed = now - g_videoEnterMs;
-    const int      idx     = video_frame_at(elapsed, g_videoFps, g_videoFrames);
+    const int idx = video_frame_at(elapsed, g_videoFps, g_videoFrames);
     const uint32_t cycle   = video_cycle_at(elapsed, g_videoFps, g_videoFrames);
 
     // 一周したか（#164）。video_frame_at は剰余で先頭へ戻るが playRaw は一発再生なので、
@@ -3169,7 +3197,7 @@ const SceneDef kScenes[] = {
     { "声の選択",     voiceEnter,  voiceUpdate,  voiceOnTap  },  // 左右タップ・#105
     { "スタックチャン", stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
     { "パックマン",   pacEnter,    pacUpdate,    pacOnTap    },  // 自作パックマン（#134 Step2）
-    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit, videoOnSwipe, videoOnLongPress },  // CDカルーセルで選んで再生（#142/#148/#150/#152/#170/#175/#193/#198）
+    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit, videoOnSwipe, videoOnLongPress, videoPaceLimitMs },  // CDカルーセルで選んで再生（#142/#148/#150/#152/#170/#175/#193/#198/#207）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号
@@ -3262,13 +3290,29 @@ void setup() {
     menuEnter();  // 起動時はまずメニュー画面（シーン選択のハブ・#132）
 }
 
+// 1コマの基準周期（≈30fps・#199）。タッチサンプリング（M5.update）の間隔でもあるので、
+// これより長く寝る変更はタップ・スワイプの取りこぼしに直結する。
+static constexpr uint32_t kFramePaceMs = 33;
+
 // 1コマの「残り時間」だけ寝て約 30fps に整える（#199 reviewer 指摘）。固定 delay(33) だと
 // 重いコマ（曲選択の全画面合成 ≈50ms）の後にさらに 33ms 上乗せで寝てしまい、M5.update() の
 // タッチサンプリング間隔が 80ms 超に開いて素早いタップ・スワイプを取りこぼす。
 // 33ms 未満で終わる軽いコマ（他の全シーン）では従来の delay(33) と同じ周期になる。
+//
+// さらにシーンが締切（SceneDef::paceLimitMs・#207）を持つなら、寝る長さをそこまでに縮める。
+// 動画再生中に一律 33ms 寝ると締切に最大 33ms 気づき遅れ、「気づき遅れ＋描画 65〜94ms」が
+// 予算 100ms（10fps）を超えてコマ落ちしていた。締切のタイミングで起きれば描画に予算を
+// フルに使える。締切は必ず 1 以上（video_until_next_frame_ms の契約）なので、クランプが
+// delay(0) の busy-loop を作ることはない。メニュー中はシーン表を引かない＝締切は構造的に効かない。
 static void framePace(uint32_t frameStartMs) {
-    const uint32_t spent = millis() - frameStartMs;
-    if (spent < 33u) delay(33u - spent);
+    const uint32_t now   = millis();
+    const uint32_t spent = now - frameStartMs;
+    uint32_t sleep_ms = (spent < kFramePaceMs) ? (kFramePaceMs - spent) : 0u;
+    if (!g_inMenu && kScenes[g_sceneIdx].paceLimitMs) {
+        const uint32_t limit = kScenes[g_sceneIdx].paceLimitMs(now);
+        if (limit < sleep_ms) sleep_ms = limit;
+    }
+    if (sleep_ms > 0) delay(sleep_ms);
 }
 
 void loop() {
