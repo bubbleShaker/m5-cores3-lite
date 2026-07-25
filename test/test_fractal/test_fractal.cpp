@@ -100,41 +100,28 @@ void test_split_matches_combined() {
     }
 }
 
-// --- fractal_shade ---
+// --- fractal_gray ---
+// （トーン着色 fractal_shade は #203 の白黒統一で1成分版 fractal_gray に置き換えた。
+//   固定する性質は同じ: 両端・単調・上限超過なし）
 
-// 両端: v=0 は黒、v=255 はトーン色そのもの
-void test_shade_endpoints() {
-    TEST_ASSERT_EQUAL_UINT32(0u, fractal_shade(0x80C0FF, 0));
-    TEST_ASSERT_EQUAL_UINT32(0x80C0FFu, fractal_shade(0x80C0FF, 255));
+// 両端: v=0 は 0、v=255 は max そのもの
+void test_gray_endpoints() {
+    TEST_ASSERT_EQUAL_UINT8(0, fractal_gray(120, 0));
+    TEST_ASSERT_EQUAL_UINT8(120, fractal_gray(120, 255));
+    TEST_ASSERT_EQUAL_UINT8(0, fractal_gray(0, 255));  // max=0 なら常に真っ黒
 }
 
-// 各成分は v について単調非減少（明るさの段階が逆転しない）
-void test_shade_monotonic_per_channel() {
-    const uint32_t tone = 0x60A0E0;
-    uint32_t prev = 0;
-    for (int v = 0; v <= 255; ++v) {
-        const uint32_t c = fractal_shade(tone, static_cast<uint8_t>(v));
-        TEST_ASSERT_TRUE(((c >> 16) & 0xFF) >= ((prev >> 16) & 0xFF));
-        TEST_ASSERT_TRUE(((c >> 8) & 0xFF) >= ((prev >> 8) & 0xFF));
-        TEST_ASSERT_TRUE((c & 0xFF) >= (prev & 0xFF));
-        prev = c;
-    }
-}
-
-// tone の 24bit を超えるビットは無視される（video_bg_tone と同じ契約）
-void test_shade_masks_high_bits() {
-    TEST_ASSERT_EQUAL_UINT32(fractal_shade(0x00123456u, 200),
-                             fractal_shade(0xFF123456u, 200));
-}
-
-// 出力の各成分は入力トーンを超えない（v<255 で必ず暗くなる方向）
-void test_shade_never_exceeds_tone() {
-    const uint32_t tone = 0x40FF80;
-    for (int v = 0; v <= 255; v += 5) {
-        const uint32_t c = fractal_shade(tone, static_cast<uint8_t>(v));
-        TEST_ASSERT_TRUE(((c >> 16) & 0xFF) <= 0x40u);
-        TEST_ASSERT_TRUE(((c >> 8) & 0xFF) <= 0xFFu);
-        TEST_ASSERT_TRUE((c & 0xFF) <= 0x80u);
+// v について単調非減少、かつ max を超えない（明るさの段階が逆転しない・帯が主役を食わない）
+void test_gray_monotonic_and_capped() {
+    const uint8_t maxes[] = { 40, 120, 255 };
+    for (size_t m = 0; m < sizeof(maxes) / sizeof(maxes[0]); ++m) {
+        uint8_t prev = 0;
+        for (int v = 0; v <= 255; ++v) {
+            const uint8_t g = fractal_gray(maxes[m], static_cast<uint8_t>(v));
+            TEST_ASSERT_TRUE(g >= prev);
+            TEST_ASSERT_TRUE(g <= maxes[m]);
+            prev = g;
+        }
     }
 }
 
@@ -163,10 +150,8 @@ int main(int, char**) {
     RUN_TEST(test_value_matches_unmasked_reference);
     RUN_TEST(test_value_uses_wide_range_in_one_frame);
     RUN_TEST(test_split_matches_combined);
-    RUN_TEST(test_shade_endpoints);
-    RUN_TEST(test_shade_monotonic_per_channel);
-    RUN_TEST(test_shade_masks_high_bits);
-    RUN_TEST(test_shade_never_exceeds_tone);
+    RUN_TEST(test_gray_endpoints);
+    RUN_TEST(test_gray_monotonic_and_capped);
     RUN_TEST(test_gamma_endpoints_and_monotonic);
     return UNITY_END();
 }

@@ -29,13 +29,10 @@ uint8_t fractal_value(int x, int y, uint32_t t_ms) {
     return fractal_at(x + dx0, y + dy0, phase);
 }
 
-uint32_t fractal_shade(uint32_t tone, uint8_t v) {
-    const uint32_t r = ((tone >> 16) & 0xFFu) * v / 255u;
-    const uint32_t g = ((tone >> 8) & 0xFFu) * v / 255u;
-    const uint32_t b = (tone & 0xFFu) * v / 255u;
-    return (r << 16) | (g << 8) | b;
-}
-
 uint8_t fractal_gamma(uint8_t v) {
     return static_cast<uint8_t>(static_cast<uint32_t>(v) * v / 255u);
+}
+
+uint8_t fractal_gray(uint8_t max, uint8_t v) {
+    return static_cast<uint8_t>(static_cast<uint32_t>(max) * v / 255u);
 }
