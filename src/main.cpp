@@ -1005,6 +1005,11 @@ struct SceneDef {
     // 左右スワイプ反応（省略可 = nullptr・#193）。dir=+1 が「指を左へ払った＝次へ」、
     // -1 が「右へ払った＝前へ」。今は動画（曲選択カルーセル）だけが使う。
     void (*onSwipe)(uint32_t now, int dir);
+    // 長押しの横取り（省略可 = nullptr・#198）。true を返すとシーン内で消費し、loop は
+    // メニューへ戻らない。シーンが内部に多段の画面（動画の 選択→再生）を持つ時、
+    // 「1段だけ戻る」を表現するために使う。消費する場合の音声停止・資源解放はシーン側の責務
+    // （loop のメニュー復帰路にある Speaker.stop / exit() は通らないため）。
+    bool (*onLongPress)(uint32_t now);
 };
 
 // --- 羊シーンの状態とアダプタ ---
@@ -3050,6 +3055,23 @@ static void videoOnSwipe(uint32_t /*now*/, int dir) {
     videoShowSelect();  // サムネイル読み直し＋静的部（曲名・件数）の描き直し
 }
 
+// 再生中の長押しは「メニュー」ではなく「曲選択」へ1段だけ戻す（#198）。選択中の長押しは
+// false を返し、従来どおり loop がメニューへ戻す。再生資源（音声7MB級＋pack）はここで必ず
+// 返してから選択画面を作り直す。順序は videoExit と同じ「停止→解放」（DMA が音声バッファを
+// 参照中に free する use-after-free を防ぐ）。ディスク Sprite は再生開始時に解放済みなので、
+// 音声を返した後の videoShowSelect が改めて確保する（確保順も再生開始時と対称になる）。
+static bool videoOnLongPress(uint32_t /*now*/) {
+    if (g_videoPhase != VideoPhase::kPlaying) return false;
+    M5.Speaker.stop();
+    videoReleaseAudio();
+    videoReleasePack();
+    g_videoReady      = false;
+    g_videoPhase      = VideoPhase::kSelecting;
+    g_videoDiscAnimMs = millis();  // 回転・浮遊アニメの時刻起点を取り直す（videoEnter と同じ）
+    videoShowSelect();
+    return true;
+}
+
 // シーン退場時のクリーンアップ（#152）。長押し復帰では呼び出し側(loop)が既に Speaker.stop() 済みだが、
 // ここでも停止してから解放し、DMA が g_videoAudioBuf を参照中に free する use-after-free を防ぐ
 // （g_ttsBuf と同じ「停止→解放」作法）。exit を持たせることで音声バッファを常駐させずクリーンに退場する。
@@ -3072,7 +3094,7 @@ const SceneDef kScenes[] = {
     { "声の選択",     voiceEnter,  voiceUpdate,  voiceOnTap  },  // 左右タップ・#105
     { "スタックチャン", stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
     { "パックマン",   pacEnter,    pacUpdate,    pacOnTap    },  // 自作パックマン（#134 Step2）
-    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit, videoOnSwipe },  // CDカルーセルで選んで再生（#142/#148/#150/#152/#170/#175/#193）
+    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit, videoOnSwipe, videoOnLongPress },  // CDカルーセルで選んで再生（#142/#148/#150/#152/#170/#175/#193/#198）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号
@@ -3203,6 +3225,12 @@ void loop() {
 
     // ── シーン表示中 ──
     if (ev == TouchEvent::LongPress) {
+        // シーンが長押しを消費するか先に問い合わせる（#198・動画の「再生→曲選択へ1段戻る」）。
+        // 消費された時は音声停止・資源解放もシーン側で済んでいるので、ここでは何もしない。
+        if (kScenes[g_sceneIdx].onLongPress && kScenes[g_sceneIdx].onLongPress(now)) {
+            delay(33);
+            return;
+        }
         // 長押し → メニューへ戻る（ローテーション巡回は廃止・#132）。
         M5.Speaker.stop();         // 前シーンの音声を打ち切る（再生中の切替で発話ハロー誤描画を防ぐ・#119）
         resetSpeakingParticles();  // 前シーンの残り粒を捨てる（#117）
