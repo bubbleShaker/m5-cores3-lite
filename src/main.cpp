@@ -36,6 +36,7 @@
 #include "meta.h"     // meta_get_int（動画 manifest の key=value 取り出し・純粋ロジック・#148）
 #include "fractal.h"  // fractal_offsets / fractal_at / fractal_gamma / fractal_gray（曲選択背景の動く幾何学模様・純粋ロジック・#199）
 #include "video_list.h"  // video_name_valid / VideoList 等（動画選択の純粋ロジック・#175）
+#include "video_fade.h"  // 曲選択スワイプの CD フェード遷移（状態機械の純粋ロジック・#209）
 #include "sd_pins.h"  // kSdCsPin 等（microSD の SPI ピン・転送専用ファームと共有・#157）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
 
@@ -2618,6 +2619,24 @@ static M5Canvas g_videoSelCanvas(&M5.Display);
 static bool     g_videoDiscUiUp   = false;  // 2枚とも確保できたか（false なら文字だけの退避表示）
 static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊・模様アニメの時刻起点（シーン入場時に1回）
 
+// ── スワイプ時のフェード遷移（#209） ──
+// スワイプ → 現ディスクを kDiscFadeMs でフェードアウト → 暗転の底でサムネイル・曲名を
+// 差し替え → フェードイン。状態遷移と輝度は純粋関数 video_fade_*（native テスト済み）。
+// pushRotateZoom にアルファ合成は無いので、フェードは「元絵の輝度スケーリング複写」で表現する
+// （背景の模様が暗いので、輝度フェードで自然なクロスフェードに見える）。元絵は
+// g_videoDiscSrc（132²×2B ≈ 35KB の PSRAM・ディスク UI と同じ寿命）に保持し、毎コマ
+// level/256 を掛けて g_videoDiscSpr へ複写する（フェード中のみ・17,424 画素で 1ms 未満）。
+static constexpr uint32_t kDiscFadeMs = 160;  // 片道の長さ。両道でも 1/3 秒＝待たされ感が出ない
+static constexpr int      kDiscPixels = kDiscSize * kDiscSize;   // 元絵の画素数（複写ループの境界）
+static constexpr size_t   kDiscBytes  = kDiscPixels * 2;         // 16bit 固定（下の static_assert）
+static VideoFade g_videoDiscFade;
+static uint16_t* g_videoDiscSrc = nullptr;    // マスク適用済みディスクの元絵（swap565 生バッファ）
+// ⚠ 元絵の複写は「Sprite の生バッファが 16bit・行パディング無しで連続」を前提にした memcpy。
+// 現状 setColorDepth(16) と対で成り立つ（M5GFX の Panel_Sprite は 16bpp だと幅方向のアライン
+// 調整をしない＝x_mask が 0）が、これはコンパイル時には確かめられない。深度やパディングが
+// 変わったら実バッファ長が縮むので、確保直後に bufferLength() で実測して食い違いを検出し、
+// フェードだけ無効化する（videoDiscUiCreate）。static_assert では守れない種類の前提。
+
 // ── 選択画面の背景（#195 グラデーション → #199 動く模様 → #203 白黒化） ──
 // 通常経路の背景は XOR フラクタル模様（fractal.h・下の LUT 2本）に置き換えた。
 // この行テーブルは静的フォールバック（SD 無し・0件・Sprite 確保失敗）の縦グラデーション
@@ -2706,6 +2725,10 @@ static void videoDiscUiRelease() {
     // deleteSprite は未確保でも安全な no-op。確保と解放を必ず対にする（videoReleasePack と同じ作法）。
     g_videoDiscSpr.deleteSprite();
     g_videoSelCanvas.deleteSprite();
+    if (g_videoDiscSrc) { free(g_videoDiscSrc); g_videoDiscSrc = nullptr; }  // 元絵も同じ寿命（#209）
+    // フェード状態も UI と同じ寿命にする（reviewer 指摘）。進行中のまま解放して再確保すると、
+    // 解放前の pending が新しい UI で後から発火し、意図しない曲へ swap する。
+    video_fade_init(&g_videoDiscFade);
     g_videoDiscUiUp = false;
 }
 
@@ -2715,8 +2738,28 @@ static bool videoDiscUiCreate() {
     g_videoDiscSpr.setColorDepth(16);
     g_videoSelCanvas.setPsram(true);
     g_videoSelCanvas.setColorDepth(16);
+    // フェードの元絵（#209）は optional。取れなくてもカルーセル自体は成立するので、
+    // ここでの失敗はディスク UI 全体を諦める理由にしない（フェードだけ無効になる。
+    // videoOnSwipe / videoDiscFadeApply / videoDiscPrepare はいずれも null 安全）。
+    g_videoDiscSrc = static_cast<uint16_t*>(ps_malloc(kDiscBytes));
     if (g_videoDiscSpr.createSprite(kDiscSize, kDiscSize) &&
         g_videoSelCanvas.createSprite(kScreenW, kScreenH)) {
+        // 生バッファの実長を確かめる（宣言部の ⚠ 参照）。深度変更や行パディングが入ると
+        // ここが縮み、memcpy と輝度複写が Sprite の外へはみ出す。食い違ったらフェードだけ
+        // 捨てて、カルーセル自体は従来どおり動かす。
+        if (g_videoDiscSrc && g_videoDiscSpr.bufferLength() < kDiscBytes) {
+            Serial.printf("[video] disc ui: sprite buffer %u < %u (fade disabled)\n",
+                          static_cast<unsigned>(g_videoDiscSpr.bufferLength()),
+                          static_cast<unsigned>(kDiscBytes));
+            free(g_videoDiscSrc);
+            g_videoDiscSrc = nullptr;
+        }
+        if (g_videoDiscSrc == nullptr) {
+            // 断片化か総量不足かを切り分けられるよう空きを添える（既存キャンバス群と同じ流儀）。
+            Serial.printf("[video] disc ui: fade disabled (psram free=%u largest=%u)\n",
+                          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                          static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+        }
         // 模様の行データは swap565_t 型で持つため、pushImage は setSwapBytes の状態に
         // 依存しない（#205・LUT 宣言のコメント参照）。ここでフラグを触る必要はない。
         g_videoDiscUiUp = true;
@@ -2857,6 +2900,29 @@ static void videoDiscPrepare() {
         videoDiscDrawFallback();
     }
     videoDiscApplyMask();
+    // マスク適用済みの完成形を元絵として控える（#209）。フェード中は毎コマ、ここから輝度を
+    // 掛けて Sprite へ複写する（Sprite 内の絵は複写で上書きされるため、元絵が別に要る）。
+    const void* src = g_videoDiscSpr.getBuffer();
+    if (g_videoDiscSrc && src) memcpy(g_videoDiscSrc, src, kDiscBytes);
+}
+
+// フェード中の1コマ: 元絵（g_videoDiscSrc）を輝度 level/256 で表示用 Sprite へ複写する（#209）。
+// バッファは swap565（パネル送出順。LUT の static_assert と #205 参照）なので、bswap で
+// RGB565 に戻してから R/B（0xF81F）と G（0x07E0）を分けてスケールする定石を使う。
+// 透明色（円の外とセンターホール）はスケールせずそのまま通す。スケール結果が偶然
+// 透明色に一致することは無い（0xF81F には R=B=31 が要るが、level<256 では 31 に届かない）。
+static void videoDiscFadeApply(uint32_t level) {
+    uint16_t* dst = static_cast<uint16_t*>(g_videoDiscSpr.getBuffer());
+    if (dst == nullptr || g_videoDiscSrc == nullptr) return;
+    const uint16_t keyRaw = __builtin_bswap16(kDiscTransp);
+    for (int i = 0; i < kDiscPixels; ++i) {
+        const uint16_t raw = g_videoDiscSrc[i];
+        if (raw == keyRaw) { dst[i] = raw; continue; }
+        const uint16_t v  = __builtin_bswap16(raw);
+        const uint32_t rb = ((v & 0xF81Fu) * level) >> 8;
+        const uint32_t g  = ((v & 0x07E0u) * level) >> 8;
+        dst[i] = __builtin_bswap16(static_cast<uint16_t>((rb & 0xF81Fu) | (g & 0x07E0u)));
+    }
 }
 
 // 選択画面のテキスト（曲名・件数・左右矢印・エラー）を dst へ透明背景で重ねる（#199 で共通化）。
@@ -2956,25 +3022,48 @@ static void videoSelectCompose(uint32_t now) {
         g_videoSelCanvas.pushImage(0, y, kScreenW, 1, row);
     }
     const uint32_t t1 = micros();  // 模様まで
+    // フェード遷移の進行（#209）。暗転の底（swap）でサムネイルと曲名を差し替える。差し替えを
+    // overlay より先に済ませるのは、直後に描く曲名が新しい g_videoSel を見るようにするため
+    //（ディスクと曲名が別のタイミングで切り替わると「別の曲が一瞬見える」）。
+    int fade_swap = -1;
+    uint32_t fade_level = video_fade_level(&g_videoDiscFade, now, kDiscFadeMs, &fade_swap);
+    if (fade_swap >= 0) {
+        g_videoSel = fade_swap;
+        videoDiscPrepare();  // SD 読み（数十ms）は輝度 0 の底＝一番目立たない瞬間に行う
+        // フェードインの起点を読み終わりに揃える（reviewer 指摘）。底で打った起点のままだと
+        // SD 読みのぶん先に進み、輝度 0 から一気に明るい値へ飛ぶ（片道が数コマしかないため
+        // 1 コマの損失がそのまま「ポップ」に見える）。
+        video_fade_rebase(&g_videoDiscFade, millis());
+        // このコマは底のまま出す（読み直した絵をいきなり明るく見せない）。
+        // kDiscFadeMs > 0 前提の枝: dur=0（フェード無し）では底の swap が来ないので到達しない。
+        fade_level = 0;
+    }
+    // 描き直しが要るコマだけ複写する。フェード完了コマ（level=256）も1回だけ true になり、
+    // 等倍に戻す（これが無いと最後に適用した暗い絵が次のスワイプまで残る・reviewer 指摘 🔴）。
+    if (video_fade_needs_redraw(&g_videoDiscFade)) videoDiscFadeApply(fade_level);
+    const uint32_t t2 = micros();  // フェード複写まで（底の SD 読みを含む）
     videoDrawSelectOverlay(g_videoSelCanvas, g_videoSelErr[0] ? g_videoSelErr : nullptr);
-    const uint32_t t2 = micros();  // 文字まで
+    const uint32_t t3 = micros();  // 文字まで
     // pushRotateZoom は Sprite の中心（既定ピボット）を dst 座標に合わせて回転描画する。
     // 透明色 kDiscTransp を抜くので、円の外とセンターホールは模様が残る。
     g_videoDiscSpr.pushRotateZoom(&g_videoSelCanvas,
                                   kScreenW * 0.5f, kDiscAreaY + kDiscAreaS * 0.5f + dy,
                                   angle, 1.0f, 1.0f, kDiscTransp);
-    const uint32_t t3 = micros();  // ディスク合成まで
+    const uint32_t t4 = micros();  // ディスク合成まで
     g_videoSelCanvas.pushSprite(&M5.Display, 0, 0);
     // 1コマの合成コストを間引き＋内訳付きで実測ログに出す（reviewer 指摘・#176 で「分解した
     // 計装が削る場所の判断を可能にした」のと同じ流儀。合計だけだと 34ms 級の全画面転送が
     // 支配的なのか模様計算が重いのか切り分けられない）。150 コマに1回。
+    // fade はフェード中だけ非ゼロになるバケット（#209。底のコマはサムネイルの SD 読みを含むので
+    // 突出する＝それが正常。txt と混ぜると「文字が急に重くなった」と誤読する）。
     static uint32_t s_frameCount = 0;
     if ((++s_frameCount % 150u) == 0) {
-        const uint32_t t4 = micros();
-        Serial.printf("[video] select frame=%uus pat=%u txt=%u disc=%u push=%u\n",
-                      static_cast<unsigned>(t4 - t0),
+        const uint32_t t5 = micros();
+        Serial.printf("[video] select frame=%uus pat=%u fade=%u txt=%u disc=%u push=%u\n",
+                      static_cast<unsigned>(t5 - t0),
                       static_cast<unsigned>(t1 - t0), static_cast<unsigned>(t2 - t1),
-                      static_cast<unsigned>(t3 - t2), static_cast<unsigned>(t4 - t3));
+                      static_cast<unsigned>(t3 - t2), static_cast<unsigned>(t4 - t3),
+                      static_cast<unsigned>(t5 - t4));
     }
 }
 
@@ -2989,6 +3078,9 @@ static void videoShowSelect(const char* err = nullptr) {
     } else {
         g_videoSelErr[0] = '\0';
     }
+    // 入場・エラー復帰・再生からの戻りは即時表示（フェードはスワイプ起点のみ・#209）。
+    // 進行中のフェードが残っていると、直後の compose が古い行き先へ swap してしまう。
+    video_fade_init(&g_videoDiscFade);
     if (g_videoList.count > 0 && videoDiscUiCreate()) {
         videoDiscPrepare();
         videoSelectCompose(millis());  // 次の loop を待たず1コマ目を出す（前画面の残像を見せない）
@@ -3298,6 +3390,9 @@ static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 廃止し、画面のどこをタップしても決定にする。選んだ名前で /video/<name> を確定してから
     // 再生へ入る（#175 の保証: ここで g_videoDir を確定し、再生を抜けるまで書き換えない。
     // 長押しで選択へ戻った後の再決定は pack を閉じた後なので上書きしてよい・#198）。
+    // フェード中の決定は「UI が向かっている曲」を選ぶ（#209）。スワイプ直後の素早いタップで
+    // 消えかけの古い曲が再生される違和感を避ける。
+    g_videoSel = video_fade_target(&g_videoDiscFade, g_videoSel);
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
     if (!name || !video_build_dir(g_videoDir, sizeof(g_videoDir), name)) return;
     // 再生開始。meta 欠け/壊れ等で入れなかったら選択画面へ戻して理由を出す（#175 設計メモ）。
@@ -3309,14 +3404,23 @@ static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
 
 // 左右スワイプで曲送り（#193・純粋ロジック video_list_next/prev で巡回）。
 // dir=+1（指を左へ払う=次の曲）/ -1（右へ払う=前の曲）。再生中のスワイプは無反応（タップと同じ作法）。
-static void videoOnSwipe(uint32_t /*now*/, int dir) {
+// #209: 即時切替からフェード遷移へ。実際の差し替え（g_videoSel の更新とサムネイル読み）は
+// videoSelectCompose が暗転の底で行う。連打は「今向かっている曲」を基点に送る＝2回払えば
+// 2曲進む（video_fade_target。暗転はやり直さないので引っかからない）。
+static void videoOnSwipe(uint32_t now, int dir) {
     if (g_videoPhase != VideoPhase::kSelecting) return;
     if (g_videoList.count == 0) return;
-    const int next = (dir >= 0) ? video_list_next(g_videoSel, g_videoList.count)
-                                : video_list_prev(g_videoSel, g_videoList.count);
-    if (next == g_videoSel) return;  // 1曲しか無い時は読み直しも描き直しもしない
-    g_videoSel = next;
-    videoShowSelect();  // サムネイル読み直し＋静的部（曲名・件数）の描き直し
+    const int base = video_fade_target(&g_videoDiscFade, g_videoSel);
+    const int next = (dir >= 0) ? video_list_next(base, g_videoList.count)
+                                : video_list_prev(base, g_videoList.count);
+    if (next == base) return;  // 1曲しか無い時は読み直しも描き直しもしない
+    if (g_videoDiscUiUp && g_videoDiscSrc) {
+        video_fade_request(&g_videoDiscFade, now, next, kDiscFadeMs);
+    } else {
+        // 静的フォールバック（Sprite 確保失敗）は毎コマ合成が無い＝フェードできないので従来どおり即時。
+        g_videoSel = next;
+        videoShowSelect();
+    }
 }
 
 // 再生中の長押しは「メニュー」ではなく「曲選択」へ1段だけ戻す（#198）。選択中の長押しは
