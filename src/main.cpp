@@ -2549,8 +2549,13 @@ static_assert(kDiscAreaY + kDiscAreaS <= kScreenH,
 // #203: 色はサムネイル平均色連動をやめ、白黒（グレースケール）に統一した。
 // 通常用と、曲名帯だけ暗くする「スモーク」用の2本を持ち、行ごとに引き分ける
 // （毎フレームのアルファ合成は 76,800 画素では重い。LUT の引き分けなら追加コストほぼゼロ）。
-static uint16_t g_videoFractalLut[256];
-static uint16_t g_videoFractalLutDim[256];
+// 型は swap565_t（上下バイト入替済み・パネル送出順の RGB565）。uint16_t で持つと
+// pushImage の解釈が setSwapBytes の状態に依存する（false だと swap565 扱い・#80 #205 で
+// 化けた）。型で表現すれば pushImage はテンプレート版を選び、フラグと無関係に正しく写る。
+static lgfx::swap565_t g_videoFractalLut[256];
+static lgfx::swap565_t g_videoFractalLutDim[256];
+// swap565 のバイト順の前提をビルド時に固定（M5GFX 更新でセマンティクスが変わったら気付ける）。
+static_assert(lgfx::swap565(0, 0, 255) == 0x1F00, "LUT assumes panel byte order (swap565)");
 // 明るさ上限。文字（白）とディスクが背景に埋もれない「柄は分かるが主役より暗い」水準。
 static constexpr uint8_t kVideoFractalMax = 120;
 // スモーク帯の明るさ上限。白文字とのコントラストを確保しつつ、模様がうっすら透けて見える水準
@@ -2598,13 +2603,17 @@ static void videoBgBuild(uint32_t avg) {
 // 色は入力に依らないのでシーン入場時に1回焼けば足りる（#199 時代は曲ごとの色味だったため
 // 曲送りのたびに焼き直していた）。強度には fractal_gamma（v²/255・native テスト済み）を
 // かけて暗部を締める（線形だと中間調が支配的になり、模様の輪郭がぼやけて安っぽくなる）。
+// 値は swap565_t（パネル送出順）で焼く（#205）。color565 のネイティブ順で焼いて uint16_t の
+// まま pushImage すると、setSwapBytes(false) では swap565 として解釈され、グレーが上下バイト
+// 逆に読まれて緑・紫の縞に化ける（#80 と同じ罠）。setSwapBytes(true) で毎フレーム 76,800 画素
+// を変換させるより、焼き時の1回で済ませる（行 push は無変換の memcpy 経路のまま）。
 static void videoFractalBuildLut() {
     for (int i = 0; i < 256; ++i) {
         const uint8_t v = fractal_gamma(static_cast<uint8_t>(i));
         const uint8_t g = fractal_gray(kVideoFractalMax, v);
         const uint8_t d = fractal_gray(kVideoFractalSmokeMax, v);
-        g_videoFractalLut[i]    = M5.Display.color565(g, g, g);
-        g_videoFractalLutDim[i] = M5.Display.color565(d, d, d);
+        g_videoFractalLut[i]    = lgfx::swap565_t(g, g, g);
+        g_videoFractalLutDim[i] = lgfx::swap565_t(d, d, d);
     }
 }
 
@@ -2623,9 +2632,8 @@ static bool videoDiscUiCreate() {
     g_videoSelCanvas.setColorDepth(16);
     if (g_videoDiscSpr.createSprite(kDiscSize, kDiscSize) &&
         g_videoSelCanvas.createSprite(kScreenW, kScreenH)) {
-        // 模様の行データは color565 のネイティブ 565 値なので送り込み時のバイト入替は不要。
-        // 既定値のままだが、pokePushSprite（#80）で嵌った箇所なので明示しておく。
-        g_videoSelCanvas.setSwapBytes(false);
+        // 模様の行データは swap565_t 型で持つため、pushImage は setSwapBytes の状態に
+        // 依存しない（#205・LUT 宣言のコメント参照）。ここでフラグを触る必要はない。
         g_videoDiscUiUp = true;
         return true;
     }
@@ -2852,11 +2860,11 @@ static void videoSelectCompose(uint32_t now) {
     int dx0 = 0, dy0 = 0;
     uint32_t phase = 0;
     fractal_offsets(t, &dx0, &dy0, &phase);
-    static uint16_t row[kScreenW];
+    static lgfx::swap565_t row[kScreenW];
     for (int y = 0; y < kScreenH; ++y) {
         const int ry = y + dy0;
         // 曲名帯（kVideoSmokeY 以降）はスモーク用の暗い LUT で引き、白文字を浮かせる（#203）。
-        const uint16_t* lut = (y >= kVideoSmokeY) ? g_videoFractalLutDim : g_videoFractalLut;
+        const lgfx::swap565_t* lut = (y >= kVideoSmokeY) ? g_videoFractalLutDim : g_videoFractalLut;
         for (int x = 0; x < kScreenW; ++x) {
             row[x] = lut[fractal_at(x + dx0, ry, phase)];
         }
