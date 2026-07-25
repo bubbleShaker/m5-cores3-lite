@@ -2534,7 +2534,7 @@ static bool     g_videoDiscUiUp   = false;  // 2枚とも確保できたか（fa
 static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊・模様アニメの時刻起点（シーン入場時に1回）
 
 // ── サムネイル連動の背景（#195 グラデーション → #199 動く模様） ──
-// 通常経路の背景は XOR フラクタル模様（fractal.h・下の g_videoFxLut）に置き換えた。
+// 通常経路の背景は XOR フラクタル模様（fractal.h・下の g_videoFractalLut）に置き換えた。
 // この行テーブルは静的フォールバック（SD 無し・0件・Sprite 確保失敗）の縦グラデーション
 // 専用に残す。色の算術は純粋関数 video_bg_tone / video_bg_lerp（native テスト済み）。
 static uint16_t g_videoBgRows[kScreenH];
@@ -2544,15 +2544,16 @@ static_assert(kDiscAreaY + kDiscAreaS <= kScreenH,
               "disc area must fit on screen");
 
 // ── 動く模様のパレット LUT（#199） ──
-// fractal_value の強度 0..255 → RGB565 の 256 段テーブル。曲送り時（videoFxBuildLut）に
+// fractal_value の強度 0..255 → RGB565 の 256 段テーブル。曲送り時（videoFractalBuildLut）に
 // 一度だけ焼き、毎フレームは引くだけにする（76,800 画素 × 毎フレームの色計算をしないため）。
 // 色はサムネイル平均色のトーン（#195 の資産 video_bg_tone を再利用）を暗→明に段階づける。
-static uint16_t g_videoFxLut[256];
+static uint16_t g_videoFractalLut[256];
 // トーンの明るさ上限。文字（白）とディスクが背景に埋もれない「柄は分かるが主役より暗い」水準。
-static constexpr uint8_t kVideoFxMax = 120;
-// 選択画面に出す失敗理由（再生に入れなかった時・#175）。毎フレーム合成し直すため保持する。
-// videoStartPlayback 系が返す文字列リテラルのみを指す前提（寿命が静的なので保持してよい）。
-static const char* g_videoSelErr = nullptr;
+static constexpr uint8_t kVideoFractalMax = 120;
+// 選択画面に出す失敗理由（再生に入れなかった時・#175）。毎フレーム合成し直すためコピーで
+// 保持する（ポインタ保持だと、将来 snprintf した局所バッファを渡した瞬間に「毎フレーム
+// 解放済みスタックを読む」発見しにくい壊れ方をする・reviewer 指摘）。空文字列＝エラー無し。
+static char g_videoSelErr[48] = "";
 // サムネイルが無い/読めない時の基準色（落ち着いたスレートブルー）。トーンは
 // video_bg_tone が揃えるので、ここは色味だけの指定でよい。
 static constexpr uint32_t kVideoBgDefaultAvg = 0x3C5068;
@@ -2563,6 +2564,8 @@ static constexpr uint8_t kVideoBgBottomMax = 14;
 
 // 平均色 avg（0xRRGGBB）から全行の色テーブルを作る。avg が真っ黒（トーンが作れない）なら
 // 既定色に差し替える（黒背景に戻さない＝「必ず何かしらの色味が付く」保証をここに閉じる）。
+// #199 以降の呼び出し元は videoEnter の既定色1箇所のみ（静的フォールバック専用。
+// サムネイル連動の役目は videoFractalBuildLut に移った）。
 static void videoBgBuild(uint32_t avg) {
     uint32_t top = video_bg_tone(avg, kVideoBgTopMax);
     if (top == 0) {
@@ -2577,14 +2580,15 @@ static void videoBgBuild(uint32_t avg) {
 }
 
 // 平均色 avg から模様パレット（256 段 RGB565）を焼く（#199）。avg が真っ黒（トーンが作れない）
-// なら既定色に差し替える（videoBgBuild と同じ「必ず色味が付く」保証）。強度に i²/255 のガンマを
-// かけて暗部を締める（線形だと中間調が支配的になり、模様の輪郭がぼやけて安っぽくなる）。
-static void videoFxBuildLut(uint32_t avg) {
-    uint32_t tone = video_bg_tone(avg, kVideoFxMax);
-    if (tone == 0) tone = video_bg_tone(kVideoBgDefaultAvg, kVideoFxMax);
+// なら既定色に差し替える（videoBgBuild と同じ「必ず色味が付く」保証）。強度には fractal_gamma
+// （v²/255・native テスト済み）をかけて暗部を締める（線形だと中間調が支配的になり、模様の
+// 輪郭がぼやけて安っぽくなる）。
+static void videoFractalBuildLut(uint32_t avg) {
+    uint32_t tone = video_bg_tone(avg, kVideoFractalMax);
+    if (tone == 0) tone = video_bg_tone(kVideoBgDefaultAvg, kVideoFractalMax);
     for (int i = 0; i < 256; ++i) {
-        const uint32_t c = fractal_shade(tone, static_cast<uint8_t>(i * i / 255));
-        g_videoFxLut[i] = M5.Display.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+        const uint32_t c = fractal_shade(tone, fractal_gamma(static_cast<uint8_t>(i)));
+        g_videoFractalLut[i] = M5.Display.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
     }
 }
 
@@ -2635,7 +2639,11 @@ static bool videoDiscUiCreate() {
         return true;
     }
     videoDiscUiRelease();  // 片方だけ確保成功のまま残さない
-    Serial.println("[video] disc ui: sprite alloc failed");
+    // 確保量が全画面化で約 34KB→188KB になった（#199）ので、失敗時は空きと最大連続ブロックを
+    // 添える（断片化なのか総量不足なのかを一発で切り分ける・videoLoadAudio の診断と同じ流儀）。
+    Serial.printf("[video] disc ui: sprite alloc failed (psram free=%u largest=%u)\n",
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
     return false;
 }
 
@@ -2759,14 +2767,14 @@ static void videoDiscPrepare() {
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
     if (name != nullptr && videoThumbInto(g_videoDiscSpr, name)) {
         // マスク前（＝透明色や穴が混ざる前）に平均色を採り、模様をこの曲の色味にする（#195→#199）
-        videoFxBuildLut(videoDiscSampleAvg());
+        videoFractalBuildLut(videoDiscSampleAvg());
     } else {
         // videoThumbInto は全経路が無言の false（meta 無し・索引不整合・巨大 JPEG・デコード失敗…）
         // なので、ここで1行だけ残す。「なぜ無地ディスクなのか」の唯一の手掛かり（reviewer 指摘。
         // 無音の失敗にログを添える作法は videoLoadAudio と同じ）。
         Serial.printf("[video] thumb: fallback name=%s\n", name ? name : "(null)");
         videoDiscDrawFallback();
-        videoFxBuildLut(kVideoBgDefaultAvg);  // 無地ディスクの時は既定の色味（#195 と同じ扱い）
+        videoFractalBuildLut(kVideoBgDefaultAvg);  // 無地ディスクの時は既定の色味（#195 と同じ扱い）
     }
     videoDiscApplyMask();
 }
@@ -2850,29 +2858,41 @@ static void videoSelectCompose(uint32_t now) {
     // float に入れると仮数 24bit を超える約4.6時間で ms の分解能が落ち、浮遊がガタつく。
     const float    dy    = 5.0f * sinf(static_cast<float>(t % 2600u) * (6.2831853f / 2600.0f));
     const uint32_t t0    = micros();
-    // 模様: 1行ずつ計算して流し込む。行バッファは内蔵 RAM（640B）に置き、pushImage で
-    // キャンバス(PSRAM)へ行単位の連続コピーにする（writePixel を 76,800 回呼ぶ関数コストと、
-    // PSRAM への点書きを避ける）。
+    // 模様: フレーム不変量（ドリフト・位相）は1コマ1回だけ求め（reviewer 指摘・毎画素の除算
+    // 3回を 76,800 回繰り返さない）、1行ずつ計算して流し込む。行バッファは内蔵 RAM（640B）に
+    // 置き、pushImage でキャンバス(PSRAM)へ行単位の連続コピーにする（writePixel を 76,800 回
+    // 呼ぶ関数コストと、PSRAM への点書きを避ける）。
+    int dx0 = 0, dy0 = 0;
+    uint32_t phase = 0;
+    fractal_offsets(t, &dx0, &dy0, &phase);
     static uint16_t row[kScreenW];
     for (int y = 0; y < kScreenH; ++y) {
+        const int ry = y + dy0;
         for (int x = 0; x < kScreenW; ++x) {
-            row[x] = g_videoFxLut[fractal_value(x, y, t)];
+            row[x] = g_videoFractalLut[fractal_at(x + dx0, ry, phase)];
         }
         g_videoSelCanvas.pushImage(0, y, kScreenW, 1, row);
     }
-    videoDrawSelectOverlay(g_videoSelCanvas, g_videoSelErr);
+    const uint32_t t1 = micros();  // 模様まで
+    videoDrawSelectOverlay(g_videoSelCanvas, g_videoSelErr[0] ? g_videoSelErr : nullptr);
+    const uint32_t t2 = micros();  // 文字まで
     // pushRotateZoom は Sprite の中心（既定ピボット）を dst 座標に合わせて回転描画する。
     // 透明色 kDiscTransp を抜くので、円の外とセンターホールは模様が残る。
     g_videoDiscSpr.pushRotateZoom(&g_videoSelCanvas,
                                   kScreenW * 0.5f, kDiscAreaY + kDiscAreaS * 0.5f + dy,
                                   angle, 1.0f, 1.0f, kDiscTransp);
+    const uint32_t t3 = micros();  // ディスク合成まで
     g_videoSelCanvas.pushSprite(&M5.Display, 0, 0);
-    // 1コマの合成コストを間引きで実測ログに出す（reviewer 指摘・#176 の計装と同じ流儀）。
-    // 全画面の模様計算＋全画面 push は速さの直感が効かないので、体感より先に数字を残す。
-    // 30fps 相当で約5秒に1回。うるさくならず、選択画面に入れば必ず数点は採れる。
+    // 1コマの合成コストを間引き＋内訳付きで実測ログに出す（reviewer 指摘・#176 で「分解した
+    // 計装が削る場所の判断を可能にした」のと同じ流儀。合計だけだと 34ms 級の全画面転送が
+    // 支配的なのか模様計算が重いのか切り分けられない）。150 コマに1回。
     static uint32_t s_frameCount = 0;
     if ((++s_frameCount % 150u) == 0) {
-        Serial.printf("[video] select frame=%uus\n", static_cast<unsigned>(micros() - t0));
+        const uint32_t t4 = micros();
+        Serial.printf("[video] select frame=%uus pat=%u txt=%u disc=%u push=%u\n",
+                      static_cast<unsigned>(t4 - t0),
+                      static_cast<unsigned>(t1 - t0), static_cast<unsigned>(t2 - t1),
+                      static_cast<unsigned>(t3 - t2), static_cast<unsigned>(t4 - t3));
     }
 }
 
@@ -2880,7 +2900,13 @@ static void videoSelectCompose(uint32_t now) {
 // 合成までを1箇所に閉じる。入場時・曲送り時・再生失敗で戻された時のすべてがここを通る。
 // Sprite が確保できない時は g_videoDiscUiUp=false のまま＝静的な退避表示になる（固まらせない）。
 static void videoShowSelect(const char* err = nullptr) {
-    g_videoSelErr = err;  // 文字列リテラル前提（宣言部コメント参照）。err 無しの再表示で自然に消える
+    // コピーで保持（宣言部コメント参照）。err 無しの再表示で自然に消える。
+    if (err) {
+        strncpy(g_videoSelErr, err, sizeof(g_videoSelErr) - 1);
+        g_videoSelErr[sizeof(g_videoSelErr) - 1] = '\0';
+    } else {
+        g_videoSelErr[0] = '\0';
+    }
     if (g_videoList.count > 0 && videoDiscUiCreate()) {
         videoDiscPrepare();
         videoSelectCompose(millis());  // 次の loop を待たず1コマ目を出す（前画面の残像を見せない）
@@ -3238,6 +3264,15 @@ void setup() {
     menuEnter();  // 起動時はまずメニュー画面（シーン選択のハブ・#132）
 }
 
+// 1コマの「残り時間」だけ寝て約 30fps に整える（#199 reviewer 指摘）。固定 delay(33) だと
+// 重いコマ（曲選択の全画面合成 ≈50ms）の後にさらに 33ms 上乗せで寝てしまい、M5.update() の
+// タッチサンプリング間隔が 80ms 超に開いて素早いタップ・スワイプを取りこぼす。
+// 33ms 未満で終わる軽いコマ（他の全シーン）では従来の delay(33) と同じ周期になる。
+static void framePace(uint32_t frameStartMs) {
+    const uint32_t spent = millis() - frameStartMs;
+    if (spent < 33u) delay(33u - spent);
+}
+
 void loop() {
     M5.update();
     const uint32_t now = millis();
@@ -3270,7 +3305,7 @@ void loop() {
             if (next != g_menuSel) { g_menuSel = next; g_menuDirty = true; }
         }
         if (g_menuDirty) { menuRender(); g_menuDirty = false; }  // 変化時だけ描き直す
-        delay(33);
+        framePace(now);
         return;
     }
 
@@ -3279,7 +3314,7 @@ void loop() {
         // シーンが長押しを消費するか先に問い合わせる（#198・動画の「再生→曲選択へ1段戻る」）。
         // 消費された時は音声停止・資源解放もシーン側で済んでいるので、ここでは何もしない。
         if (kScenes[g_sceneIdx].onLongPress && kScenes[g_sceneIdx].onLongPress(now)) {
-            delay(33);
+            framePace(now);
             return;
         }
         // 長押し → メニューへ戻る（ローテーション巡回は廃止・#132）。
@@ -3289,7 +3324,7 @@ void loop() {
         if (kScenes[g_sceneIdx].exit) kScenes[g_sceneIdx].exit();
         g_inMenu = true;
         menuEnter();
-        delay(33);
+        framePace(now);
         return;
     } else if (ev == TouchEvent::Tap) {
         // 短タップ → 現シーンの反応に委譲（羊のメェ／アート再生成／音量増減など）。
@@ -3304,5 +3339,5 @@ void loop() {
     }
 
     kScenes[g_sceneIdx].update(now);  // 毎フレーム描画
-    delay(33);  // 約30fps
+    framePace(now);  // 約30fps（重いコマは残り時間ぶんだけ・#199）
 }

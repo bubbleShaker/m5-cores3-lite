@@ -52,6 +52,54 @@ void test_value_survives_large_t() {
                             fractal_value(10, 20, 0xFFFFFF00u));
 }
 
+// 16bit マスクは出力に影響しない（fractal_offsets のコメントの非自明な主張を固定する・
+// reviewer 指摘）。マスク無しの 64bit 参照実装と、マスクの折り返し境界（t/40 が
+// 0xFFFF→0x10000 を跨ぐ t≈2,621,440ms）の前後を含む広い範囲で突き合わせる。
+// 将来ドリフト除数を変えてこの前提が崩れたら、コメントではなくこのテストが割れる。
+static uint8_t reference_value(int x, int y, uint32_t t) {
+    const int64_t dx = static_cast<int64_t>(x) + t / 40u;   // マスク無し
+    const int64_t dy = static_cast<int64_t>(y) + t / 56u;
+    const int64_t fine   = dx ^ dy;
+    const int64_t coarse = (dx >> 2) ^ (dy >> 2);
+    return static_cast<uint8_t>((fine + coarse + t / 32u) & 0xFF);
+}
+void test_value_matches_unmasked_reference() {
+    const uint32_t ts[] = { 0u, 1234u, 2621000u, 2621440u, 2622000u,
+                            0x7FFFFFFFu, 0x80000000u, 0xFFFFFF00u };
+    for (size_t i = 0; i < sizeof(ts) / sizeof(ts[0]); ++i) {
+        for (int p = 0; p < 100; ++p) {
+            const int x = (p * 13) % 320, y = (p * 29) % 240;
+            TEST_ASSERT_EQUAL_UINT8(reference_value(x, y, ts[i]),
+                                    fractal_value(x, y, ts[i]));
+        }
+    }
+}
+
+// 1フレーム内で階調が広く出る（位相だけ動いて模様が死んでいる改悪を検出する・reviewer 指摘）
+void test_value_uses_wide_range_in_one_frame() {
+    bool seen[256] = {};
+    int uniq = 0;
+    for (int y = 0; y < 240; ++y) {
+        for (int x = 0; x < 320; ++x) {
+            const uint8_t v = fractal_value(x, y, 1234u);
+            if (!seen[v]) { seen[v] = true; uniq++; }
+        }
+    }
+    TEST_ASSERT_TRUE(uniq >= 200);  // 実測は 256。余裕を持って「広い」ことだけ固定する
+}
+
+// 分割版（offsets + at）は合成版 fractal_value と完全一致（表示側が使うのは分割版）
+void test_split_matches_combined() {
+    int dx0 = 0, dy0 = 0;
+    uint32_t phase = 0;
+    fractal_offsets(98765u, &dx0, &dy0, &phase);
+    for (int p = 0; p < 200; ++p) {
+        const int x = (p * 7) % 320, y = (p * 11) % 240;
+        TEST_ASSERT_EQUAL_UINT8(fractal_value(x, y, 98765u),
+                                fractal_at(x + dx0, y + dy0, phase));
+    }
+}
+
 // --- fractal_shade ---
 
 // 両端: v=0 は黒、v=255 はトーン色そのもの
@@ -90,6 +138,21 @@ void test_shade_never_exceeds_tone() {
     }
 }
 
+// --- fractal_gamma ---
+
+// 両端固定・単調非減少（パレットの明暗の順序が崩れない）
+void test_gamma_endpoints_and_monotonic() {
+    TEST_ASSERT_EQUAL_UINT8(0, fractal_gamma(0));
+    TEST_ASSERT_EQUAL_UINT8(255, fractal_gamma(255));
+    uint8_t prev = 0;
+    for (int v = 0; v <= 255; ++v) {
+        const uint8_t g = fractal_gamma(static_cast<uint8_t>(v));
+        TEST_ASSERT_TRUE(g >= prev);
+        TEST_ASSERT_TRUE(g <= v);  // 暗部を締める＝入力より明るくはならない
+        prev = g;
+    }
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_value_is_deterministic);
@@ -97,9 +160,13 @@ int main(int, char**) {
     RUN_TEST(test_value_varies_in_space);
     RUN_TEST(test_value_varies_in_time);
     RUN_TEST(test_value_survives_large_t);
+    RUN_TEST(test_value_matches_unmasked_reference);
+    RUN_TEST(test_value_uses_wide_range_in_one_frame);
+    RUN_TEST(test_split_matches_combined);
     RUN_TEST(test_shade_endpoints);
     RUN_TEST(test_shade_monotonic_per_channel);
     RUN_TEST(test_shade_masks_high_bits);
     RUN_TEST(test_shade_never_exceeds_tone);
+    RUN_TEST(test_gamma_endpoints_and_monotonic);
     return UNITY_END();
 }
