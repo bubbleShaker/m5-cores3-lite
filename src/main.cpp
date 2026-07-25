@@ -2244,17 +2244,17 @@ static VideoPackResult videoOpenPack(const char* meta) {
     }
 
     // meta.txt は SD 上の外部入力。区切り文字を含む値で g_videoDir（/video/<選んだ名前>）の外を
-    // 開かせない（tools 側 safe_subdir_name と同じ考え方を、読む側にも置く）。
-    if (strchr(name, '/') || strchr(name, '\\') || strstr(name, "..")) {
+    // 開かせない。規則は列挙側と同じ純粋関数に集約してある（#193 で3つ目のコピーが生えかけた
+    // ため一本化。video_name_valid は加えて空・"."・長すぎる名前も弾くが、どれも弾いてよい値）。
+    if (!video_name_valid(name)) {
         Serial.printf("[video] pack: rejected name=%s\n", name);
         return VideoPackResult::kError;
     }
     // 上限を課すのは frames が meta.txt 由来の外部入力だから（reviewer 指摘）。
-    // 下の frames×8 が size_t を溢れると索引長が小さな値に化ける。video_pack_entry の
+    // frames×8 が size_t を溢れると索引長が小さな値に化ける。video_pack_entry の
     // 長さ検証が結果的に弾いてくれるが、安全性を離れた関数の性質に頼らず自明にしておく。
-    // 100,000 フレームは 10fps で約 2.8 時間ぶん。この用途で超えることはない。
-    constexpr int kMaxFrames = 100000;
-    if (g_videoFrames <= 0 || g_videoFrames > kMaxFrames) {
+    // 上限値はサムネイル読み（videoThumbInto）と共有する（video.h の kVideoMaxFrames）。
+    if (g_videoFrames <= 0 || g_videoFrames > kVideoMaxFrames) {
         Serial.printf("[video] pack: bad frames=%d\n", g_videoFrames);
         return VideoPackResult::kError;
     }
@@ -2598,8 +2598,10 @@ static bool videoThumbInto(M5Canvas& spr, const char* name) {
     String meta;
     if (!videoPathJoin(path, sizeof(path), dir, "meta.txt") ||
         !videoReadTextFile(path, meta)) return false;
+    // 上限は再生側 videoOpenPack と同じ（kVideoMaxFrames・video.h）。frames は外部入力で、
+    // 下の frames×8 が size_t を溢れると index_len が小さな値に化けて範囲検証が無効になる。
     const int frames = meta_get_int(meta.c_str(), "frames", 0);
-    if (frames <= 0) return false;
+    if (frames <= 0 || frames > kVideoMaxFrames) return false;
     const int mid = frames / 2;  // 先頭はフェードイン等で黒い素材が多いので中間を代表にする
 
     // デコード倍率: 短辺 240 のうち中央 180px を直径 132 いっぱいに使う（132/180）。
@@ -2617,8 +2619,8 @@ static bool videoThumbInto(M5Canvas& spr, const char* name) {
                spr.drawJpgFile(SD, path, dx, dy, 0, 0, 0, 0, scale, scale);
     }
     if (!meta_get_str(meta.c_str(), "pack", packName, sizeof(packName))) return false;
-    // 名前の検証は読む側 videoOpenPack と同じ規則（/video/ の外を開かせない）。
-    if (strchr(packName, '/') || strchr(packName, '\\') || strstr(packName, "..")) return false;
+    // 名前の検証は読む側 videoOpenPack と同じ純粋関数（/video/ の外を開かせない・一本化）。
+    if (!video_name_valid(packName)) return false;
     if (!videoPathJoin(path, sizeof(path), dir, packName)) return false;
 
     File f = SD.open(path, FILE_READ);
@@ -2660,7 +2662,13 @@ static void videoDiscPrepare() {
     if (!g_videoDiscUiUp) return;
     g_videoDiscSpr.fillSprite(TFT_BLACK);  // 前の曲の絵を残さない
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
-    if (name == nullptr || !videoThumbInto(g_videoDiscSpr, name)) videoDiscDrawFallback();
+    if (name == nullptr || !videoThumbInto(g_videoDiscSpr, name)) {
+        // videoThumbInto は全経路が無言の false（meta 無し・索引不整合・巨大 JPEG・デコード失敗…）
+        // なので、ここで1行だけ残す。「なぜ無地ディスクなのか」の唯一の手掛かり（reviewer 指摘。
+        // 無音の失敗にログを添える作法は videoLoadAudio と同じ）。
+        Serial.printf("[video] thumb: fallback name=%s\n", name ? name : "(null)");
+        videoDiscDrawFallback();
+    }
     videoDiscApplyMask();
 }
 
@@ -2672,7 +2680,10 @@ static void videoRenderSelect(const char* err = nullptr) {
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::top_left);
     M5.Display.setTextColor(TFT_CYAN, kColBg);
-    M5.Display.drawString("曲をえらぶのだ（スワイプ=選ぶ/タップ=決定）", 6, 4);
+    // 全角15文字＝240px。右上のカウンタ（"16/16"≒40px・x=274〜）と重ならない長さに収める
+    // （reviewer 指摘: 元の案は 344px で画面幅 320 を超えていた）。スワイプできることは
+    // ディスク両脇の < > が示すので、ヘッダでは決定操作だけ言う。
+    M5.Display.drawString("曲をえらぶのだ（タップで決定）", 6, 4);
 
     if (g_videoList.count == 0) {
         M5.Display.setTextColor(TFT_WHITE, kColBg);
@@ -2716,7 +2727,10 @@ static void videoRenderSelect(const char* err = nullptr) {
 static void videoDiscAnimate(uint32_t now) {
     const uint32_t t     = now - g_videoDiscAnimMs;
     const float    angle = static_cast<float>(t % 20000u) * (360.0f / 20000.0f);
-    const float    dy    = 5.0f * sinf(static_cast<float>(t) * (6.2831853f / 2600.0f));
+    // 浮遊側も角度と同様に周期で剰余を取ってから float 化する（reviewer 指摘）。生の t を
+    // float に入れると仮数 24bit を超える約4.6時間で ms の分解能が落ち、浮遊がガタつく。
+    const float    dy    = 5.0f * sinf(static_cast<float>(t % 2600u) * (6.2831853f / 2600.0f));
+    const uint32_t t0    = micros();
     g_videoDiscCanvas.fillSprite(kColBg);
     // pushRotateZoom は Sprite の中心（既定ピボット）を dst 座標に合わせて回転描画する。
     // 透明色 kDiscTransp を抜くので、円の外とセンターホールは背景が残る。
@@ -2724,6 +2738,13 @@ static void videoDiscAnimate(uint32_t now) {
                                   kDiscCanvasS * 0.5f, kDiscCanvasS * 0.5f + dy,
                                   angle, 1.0f, 1.0f, kDiscTransp);
     g_videoDiscCanvas.pushSprite(&M5.Display, kDiscCanvasX, kDiscCanvasY);
+    // 1コマの合成コストを間引きで実測ログに出す（reviewer 指摘・#176 の計装と同じ流儀）。
+    // PSRAM 上の Sprite 同士の回転合成は速さの直感が効かないので、体感より先に数字を残す。
+    // 30fps 相当で約5秒に1回。うるさくならず、選択画面に入れば必ず数点は採れる。
+    static uint32_t s_frameCount = 0;
+    if ((++s_frameCount % 150u) == 0) {
+        Serial.printf("[video] disc frame=%uus\n", static_cast<unsigned>(micros() - t0));
+    }
 }
 
 // 選択画面を（再）表示する入口。ディスク UI の確保→サムネイル読み→静的部の描画までを1箇所に

@@ -22,11 +22,15 @@ enum class TouchEvent { None, Tap, LongPress, SwipeLeft, SwipeRight };
 //   press_start_ms … 現在の押下が始まった時刻
 //   long_fired     … この押下で LongPress を既に発火したか（二重発火防止）
 //   press_start_x  … 現在の押下が始まった X 座標（スワイプの移動量の基準・#193）
+//   moved          … この押下中に一度でも移動量が kSwipeMinPx に達したか。
+//                    大きく払ってから始点付近へ戻して離す操作を Tap と誤認しないための
+//                    ラッチ（Tap が「決定」に格上げされたので誤タップのコストが高い・#193）
 struct TouchTracker {
     bool     pressed        = false;
     uint32_t press_start_ms = 0;
     bool     long_fired     = false;
     int      press_start_x  = 0;
+    bool     moved          = false;
 };
 
 // 毎フレーム1サンプルを流し、認識した瞬間にイベントを返す純粋関数。
@@ -35,7 +39,9 @@ struct TouchTracker {
 //                途中で長押し＝メニュー復帰が誤爆しないように・#193）。
 //   SwipeLeft  … 離した瞬間、X 移動量 <= -kSwipeMinPx（指が左へ払われた）。
 //   SwipeRight … 離した瞬間、X 移動量 >= +kSwipeMinPx（指が右へ払われた）。
-//   Tap        … kLongPressMs 未満・移動量 kSwipeMinPx 未満で離した瞬間（＝短タップ）。
+//   Tap        … kLongPressMs 未満で離した瞬間（＝短タップ）。ただし押下中に一度でも
+//                移動量が kSwipeMinPx に達していたら出さない（払ってから戻した操作は
+//                タップの意図ではない・#193）。
 //   None       … それ以外。
 // 長押しが発火した後の「離し」では Tap も Swipe も出さない（二重発火防止）。
 // x は現在のタッチ X 座標。触れていないフレームでは無視される（直前値のままでよい）。

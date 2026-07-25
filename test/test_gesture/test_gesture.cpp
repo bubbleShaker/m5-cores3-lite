@@ -112,6 +112,22 @@ void test_no_swipe_after_long_press() {
     TEST_ASSERT_TRUE(touch_update(t, false, kLongPressMs + 300, 100) == TouchEvent::None);
 }
 
+// 大きく払ってから始点付近へ戻して離すと、Tap にはならない（決定の誤爆防止・moved ラッチ）
+void test_swipe_out_and_back_is_not_tap() {
+    TouchTracker t;
+    touch_update(t, true, 0, 200);
+    TEST_ASSERT_TRUE(touch_update(t, true, 100, 120) == TouchEvent::None);  // 80px 動いた（ラッチ）
+    TEST_ASSERT_TRUE(touch_update(t, false, 200, 205) == TouchEvent::None); // 戻して離す→Tap 抑制
+}
+
+// 始点へ戻して押し続けるのは意図的な長押しとみなす（moved が立っていても発火する）
+void test_long_press_after_return_still_fires() {
+    TouchTracker t;
+    touch_update(t, true, 0, 200);
+    touch_update(t, true, 100, 120);                                        // 一度大きく動く
+    TEST_ASSERT_TRUE(touch_update(t, true, kLongPressMs, 200) == TouchEvent::LongPress);  // 戻して保持
+}
+
 // x を渡さない既存の呼び出し（デフォルト引数）は移動量 0 ＝従来挙動のまま
 void test_default_x_keeps_legacy_behavior() {
     TouchTracker t;
@@ -134,6 +150,8 @@ int main(int, char**) {
     RUN_TEST(test_slow_swipe_still_fires);
     RUN_TEST(test_drag_suppresses_long_press_until_back);
     RUN_TEST(test_no_swipe_after_long_press);
+    RUN_TEST(test_swipe_out_and_back_is_not_tap);
+    RUN_TEST(test_long_press_after_return_still_fires);
     RUN_TEST(test_default_x_keeps_legacy_behavior);
     return UNITY_END();
 }

@@ -16,14 +16,20 @@ TouchEvent touch_update(TouchTracker& t, bool touching, uint32_t now_ms, int x) 
             t.press_start_ms = now_ms;
             t.long_fired     = false;
             t.press_start_x  = x;
-        } else if (!t.long_fired && (now_ms - t.press_start_ms) >= kLongPressMs &&
-                   abs_dx(x, t.press_start_x) < kSwipeMinPx) {
-            // 押下継続中に閾値到達: 長押しを1回だけ発火する。
-            // 横に大きく動いている間は発火させない（スワイプの途中で長押し＝メニュー復帰が
-            // 誤爆すると、曲を選んでいたのに画面ごと飛ばされる・#193）。指が戻って移動量が
-            // 閾値未満になれば、押下時間が満ちている限り改めて発火する。
-            t.long_fired = true;
-            ev = TouchEvent::LongPress;
+            t.moved          = false;
+        } else {
+            // 一度でも大きく動いたらラッチする（離す瞬間に始点付近へ戻っていても
+            // 「払ってから戻した」操作を Tap と誤認しないため・#193）。
+            if (abs_dx(x, t.press_start_x) >= kSwipeMinPx) t.moved = true;
+            if (!t.long_fired && (now_ms - t.press_start_ms) >= kLongPressMs &&
+                abs_dx(x, t.press_start_x) < kSwipeMinPx) {
+                // 押下継続中に閾値到達: 長押しを1回だけ発火する。
+                // 横に大きく動いている「間」は発火させない（スワイプの途中で長押し＝メニュー
+                // 復帰が誤爆すると、曲を選んでいたのに画面ごと飛ばされる・#193）。指を始点へ
+                // 戻して押し続けるのは意図的な長押しとみなし、moved が立っていても発火させる。
+                t.long_fired = true;
+                ev = TouchEvent::LongPress;
+            }
         }
     } else {
         if (t.pressed) {
@@ -37,7 +43,7 @@ TouchEvent touch_update(TouchTracker& t, bool touching, uint32_t now_ms, int x) 
                     ev = TouchEvent::SwipeLeft;
                 } else if (dx >= kSwipeMinPx) {
                     ev = TouchEvent::SwipeRight;
-                } else if ((now_ms - t.press_start_ms) < kLongPressMs) {
+                } else if (!t.moved && (now_ms - t.press_start_ms) < kLongPressMs) {
                     ev = TouchEvent::Tap;
                 }
             }
