@@ -45,11 +45,6 @@ const char* video_list_name_at(const VideoList* list, int index) {
     return list->names[index];
 }
 
-bool video_is_decide_tap(int x, int screenW) {
-    // 右半分=決定。境界(ちょうど中央)は右扱い(>=)にして左右で漏れなく二分する（voice_select と同じ）。
-    return x >= screenW / 2;
-}
-
 int video_list_next(int index, int count) {
     if (count <= 0) return 0;  // 候補なし時の安全値
     int i = index % count;
@@ -58,15 +53,10 @@ int video_list_next(int index, int count) {
     return i;
 }
 
-int video_scroll_top(int sel, int count, int rows) {
-    if (rows <= 0 || count <= 0) return 0;  // 異常入力は先頭固定で落とさない
-    if (count <= rows) return 0;            // 全件収まるならスクロール不要
-    // 範囲外の sel を [0, count) にクランプ（描画側が渡し損ねても窓を壊さない）。
-    if (sel < 0) sel = 0;
-    if (sel >= count) sel = count - 1;
-    // sel を窓の中央寄りに置く。rows/2 は整数除算（8→4）。両端は 0 と count-rows で頭打ち。
-    int top = sel - rows / 2;
-    if (top < 0) top = 0;
-    if (top > count - rows) top = count - rows;
-    return top;
+int video_list_prev(int index, int count) {
+    if (count <= 0) return 0;  // 候補なし時の安全値
+    int i = index % count;
+    if (i < 0) i += count;     // 範囲外・負値でも巡回で正規化してから戻す（next と同じ）
+    i = (i + count - 1) % count;  // -1 の代わりに +count-1（負の剰余を避ける）
+    return i;
 }

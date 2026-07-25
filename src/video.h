@@ -47,6 +47,13 @@ bool video_frame_path(char* buf, size_t buf_size, const char* dir, int index);
 // 定義を 1 つにするため公開する（変換ツール tools/video2frames.py 側とも対。片方だけ変えないこと）。
 static const size_t kVideoPackEntrySize = 8;
 
+// meta.txt の frames に課す上限。frames は SD 上の外部入力で、frames × kVideoPackEntrySize が
+// 32bit の size_t を溢れると索引長が小さな値に化けて以降の範囲検証が実質無効になる。
+// 100,000 フレームは 10fps で約 2.8 時間ぶん。この用途で超えることはない。
+// 索引長を計算する場所（再生 videoOpenPack とサムネイル videoThumbInto）すべてで必ずこれを課す
+// （#193 レビューで片方だけガードが落ちる drift が実際に起きたため、定義をここに一本化した）。
+static const int kVideoMaxFrames = 100000;
+
 // この方式で最も壊れやすいのは索引の読み違い（エンディアン・レコード幅・範囲外）なので、
 // SD 上のファイルを外部入力として扱い、範囲検証まで含めてこの純粋関数に閉じ込める。
 //   index      … 索引部だけを読み込んだバッファ

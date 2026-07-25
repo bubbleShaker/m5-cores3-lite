@@ -1002,6 +1002,9 @@ struct SceneDef {
     // 切替で「出て行く」時に1回（省略可 = nullptr）。自前で描画タスクを持つシーン（スタックちゃん）が
     // 画面の占有を手放すために使う。持たないシーンは loop が描くだけなので nullptr でよい（#125）。
     void (*exit)();
+    // 左右スワイプ反応（省略可 = nullptr・#193）。dir=+1 が「指を左へ払った＝次へ」、
+    // -1 が「右へ払った＝前へ」。今は動画（曲選択カルーセル）だけが使う。
+    void (*onSwipe)(uint32_t now, int dir);
 };
 
 // --- 羊シーンの状態とアダプタ ---
@@ -1972,17 +1975,22 @@ static_assert(sizeof("/video/") - 1 + kVideoNameMax + sizeof("/audio.wav") <= 80
 
 // /video/ 直下の列挙結果と選択カーソル・画面状態（#175）。列挙は選択画面の入場時に1回だけ。
 static VideoList g_videoList;
-static int       g_videoSel = 0;  // 選択カーソル（[0, count) を巡回。左タップで video_list_next）
+static int       g_videoSel = 0;  // 選択カーソル（[0, count) を巡回。左右スワイプで next/prev・#193）
 // 動画シーンの2状態: 入場直後は候補から選ぶ kSelecting、決定したら kPlaying。
-// 長押しは loop 側が「メニューへ戻る」に固定なので、決定はタップ（右半分）で行う（#175）。
+// 長押しは loop 側が「メニューへ戻る」に固定なので、決定はタップ（画面のどこでも・#193）で行う。
 enum class VideoPhase { kSelecting, kPlaying };
 static VideoPhase g_videoPhase = VideoPhase::kSelecting;
 
-// g_videoDir を親にした子パス（"meta.txt" / "audio.wav"）を組み立てる。収まらなければ false
-// （切り詰めたパスで SD.open を呼ばせない・video_frame_path と同じ作法）。
-static bool videoSubPath(char* buf, size_t buf_size, const char* leaf) {
-    const int w = snprintf(buf, buf_size, "%s/%s", g_videoDir, leaf);
+// "<dir>/<leaf>" を組み立てる。収まらなければ false（切り詰めたパスで SD.open を呼ばせない・
+// video_frame_path と同じ作法）。サムネイル読み（#193）は g_videoDir を汚さず任意の dir で使う。
+static bool videoPathJoin(char* buf, size_t buf_size, const char* dir, const char* leaf) {
+    const int w = snprintf(buf, buf_size, "%s/%s", dir, leaf);
     return w > 0 && w < static_cast<int>(buf_size);
+}
+
+// g_videoDir を親にした子パス（"meta.txt" / "audio.wav"）を組み立てる。
+static bool videoSubPath(char* buf, size_t buf_size, const char* leaf) {
+    return videoPathJoin(buf, buf_size, g_videoDir, leaf);
 }
 
 // microSD(SPI) のピンは src/sd_pins.h に集約した（転送専用ファーム msc_main.cpp と共有・#157）。
@@ -2236,17 +2244,17 @@ static VideoPackResult videoOpenPack(const char* meta) {
     }
 
     // meta.txt は SD 上の外部入力。区切り文字を含む値で g_videoDir（/video/<選んだ名前>）の外を
-    // 開かせない（tools 側 safe_subdir_name と同じ考え方を、読む側にも置く）。
-    if (strchr(name, '/') || strchr(name, '\\') || strstr(name, "..")) {
+    // 開かせない。規則は列挙側と同じ純粋関数に集約してある（#193 で3つ目のコピーが生えかけた
+    // ため一本化。video_name_valid は加えて空・"."・長すぎる名前も弾くが、どれも弾いてよい値）。
+    if (!video_name_valid(name)) {
         Serial.printf("[video] pack: rejected name=%s\n", name);
         return VideoPackResult::kError;
     }
     // 上限を課すのは frames が meta.txt 由来の外部入力だから（reviewer 指摘）。
-    // 下の frames×8 が size_t を溢れると索引長が小さな値に化ける。video_pack_entry の
+    // frames×8 が size_t を溢れると索引長が小さな値に化ける。video_pack_entry の
     // 長さ検証が結果的に弾いてくれるが、安全性を離れた関数の性質に頼らず自明にしておく。
-    // 100,000 フレームは 10fps で約 2.8 時間ぶん。この用途で超えることはない。
-    constexpr int kMaxFrames = 100000;
-    if (g_videoFrames <= 0 || g_videoFrames > kMaxFrames) {
+    // 上限値はサムネイル読み（videoThumbInto）と共有する（video.h の kVideoMaxFrames）。
+    if (g_videoFrames <= 0 || g_videoFrames > kVideoMaxFrames) {
         Serial.printf("[video] pack: bad frames=%d\n", g_videoFrames);
         return VideoPackResult::kError;
     }
@@ -2490,14 +2498,192 @@ static void videoEnumerate() {
     Serial.printf("[video] enumerate: listed=%d dropped=%d\n", g_videoList.count, dropped);
 }
 
-// 選択画面を1枚描く（#175）。menuRender と同じ縦リストの流儀。0件なら理由を出す（固まらせない）。
-// err を渡すと画面下部に赤字で理由を出す（選んだ動画が壊れていて再生に入れず戻した時・#175 設計メモ）。
+// ───────── 曲選択のCDディスク表示（#193） ─────────
+// テキストの縦リスト（#175/#189）を置き換え、選択中の曲のサムネイルを CD ディスク風に中央へ
+// 出すカルーセル。サムネイルは SD 上の frames.bin から中間フレームを 1 枚だけ読んでデコード
+// する（PC 側の再変換・SD への再転送が一切不要＝今入っている素材がそのまま対象になる）。
+// 操作: 左右スワイプ=曲送り（巡回）/ タップ（どこでも）=決定 / 長押し=メニュー復帰（loop 側・従来どおり）。
+
+static constexpr int kDiscSize    = 132;  // ディスク Sprite の一辺（=CD の直径）
+static constexpr int kDiscCanvasS = 160;  // 合成キャンバスの一辺（浮遊 ±5px と回転の余白ぶん大きく）
+static constexpr int kDiscCanvasX = (kScreenW - kDiscCanvasS) / 2;  // 画面中央（x=80）
+static constexpr int kDiscCanvasY = 30;   // ヘッダ(y=4..20)の下、曲名(y=196)の上に収める
+// 回転合成時の透明色（円の外＝ディスクの背景を抜く）。純マゼンタが JPEG 由来の絵に現れる
+// 確率は実用上無視できる（現れても 1px 単位で背景色に抜けるだけで表示は割れない）。
+static constexpr uint16_t kDiscTransp = 0xF81F;
+
+// ディスク Sprite（円形マスク済みサムネイル）と合成用キャンバス。どちらも選択画面にいる間
+// だけ確保する PSRAM Sprite（132²+160² の 16bit で計約 86KB）。再生開始・退場で必ず
+// deleteSprite する。音声 7MB 級の確保（videoLoadAudio）の前に返し、常駐もさせない
+// （#128「フルスクリーン Sprite が解放されず常駐」の轍を踏まない）。
+static M5Canvas g_videoDiscSpr(&M5.Display);
+static M5Canvas g_videoDiscCanvas(&M5.Display);
+static bool     g_videoDiscUiUp   = false;  // 2枚とも確保できたか（false なら文字だけの退避表示）
+static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊アニメの時刻起点（シーン入場時に1回）
+
+static void videoDiscUiRelease() {
+    // deleteSprite は未確保でも安全な no-op。確保と解放を必ず対にする（videoReleasePack と同じ作法）。
+    g_videoDiscSpr.deleteSprite();
+    g_videoDiscCanvas.deleteSprite();
+    g_videoDiscUiUp = false;
+}
+
+static bool videoDiscUiCreate() {
+    if (g_videoDiscUiUp) return true;
+    g_videoDiscSpr.setPsram(true);      // 内蔵 RAM を圧迫しない（既存キャンバス群と同じ作法）
+    g_videoDiscSpr.setColorDepth(16);
+    g_videoDiscCanvas.setPsram(true);
+    g_videoDiscCanvas.setColorDepth(16);
+    if (g_videoDiscSpr.createSprite(kDiscSize, kDiscSize) &&
+        g_videoDiscCanvas.createSprite(kDiscCanvasS, kDiscCanvasS)) {
+        g_videoDiscUiUp = true;
+        return true;
+    }
+    videoDiscUiRelease();  // 片方だけ確保成功のまま残さない
+    Serial.println("[video] disc ui: sprite alloc failed");
+    return false;
+}
+
+// サムネイルが読めなかった時の無地ディスク（レコード風の同心円）。読めない素材でも
+// 選択画面を固まらせず、曲名（videoRenderSelect が描く）だけで選べるようにする。
+static void videoDiscDrawFallback() {
+    const int c = kDiscSize / 2;
+    g_videoDiscSpr.fillCircle(c, c, kDiscSize / 2 - 1, M5.Display.color565(40, 44, 52));
+    for (int r = 24; r < kDiscSize / 2 - 4; r += 7) {
+        g_videoDiscSpr.drawCircle(c, c, r, M5.Display.color565(58, 63, 72));
+    }
+}
+
+// ディスク共通の仕上げ（サムネイル描画の後に呼ぶ）:
+//   円形マスク … 正方形サムネイルの四隅を透明色にして円だけ残す
+//   中心穴・外周リム … CD らしさの記号
+static void videoDiscApplyMask() {
+    const int   c  = kDiscSize / 2;
+    const int   r  = kDiscSize / 2 - 1;
+    const float cf = kDiscSize * 0.5f - 0.5f;  // ピクセル中心基準の円の中心
+    // 円外を透明色へ。行ごとに円の左右端を求めて外側だけ塗る（全画素の距離判定より速い）。
+    for (int y = 0; y < kDiscSize; ++y) {
+        const float dy = y - cf;
+        const float d2 = static_cast<float>(r) * r - dy * dy;
+        if (d2 <= 0.0f) {  // この行に円は無い
+            g_videoDiscSpr.fillRect(0, y, kDiscSize, 1, kDiscTransp);
+            continue;
+        }
+        const float dx = sqrtf(d2);
+        const int   xl = static_cast<int>(cf - dx);        // 円の左端（これより左は円外）
+        const int   xr = static_cast<int>(cf + dx) + 1;    // 円の右端の次
+        if (xl > 0)         g_videoDiscSpr.fillRect(0, y, xl, 1, kDiscTransp);
+        if (xr < kDiscSize) g_videoDiscSpr.fillRect(xr, y, kDiscSize - xr, 1, kDiscTransp);
+    }
+    // 外周リム（明→暗の2重円で縁を締める）
+    g_videoDiscSpr.drawCircle(c, c, r,     M5.Display.color565(210, 210, 220));
+    g_videoDiscSpr.drawCircle(c, c, r - 1, M5.Display.color565(120, 120, 130));
+    // 中心穴（透明で抜く）とクランプリング
+    g_videoDiscSpr.fillCircle(c, c, 15, kDiscTransp);
+    g_videoDiscSpr.drawCircle(c, c, 16, M5.Display.color565(200, 200, 210));
+    g_videoDiscSpr.drawCircle(c, c, 22, M5.Display.color565(160, 160, 170));
+}
+
+// /video/<name>/ のサムネイル1枚を spr へ読み込む（#193）。成功で true。
+// 再生用の videoOpenPack と違い、索引は「中間フレームの entry 8 バイトだけ」を seek で読む
+// 軽量経路（open→read→close・索引全体を PSRAM に載せない）。曲送りのたびに呼ばれるので、
+// 確保も保持も最小にする。g_videoDir / g_videoFrames 等の再生用状態には一切触らない
+// （#175 の保証「g_videoDir は決定時に確定し videoExit まで固定」を崩さないため）。
+// SD 読みと Sprite 描画は同一 SPI バスだが、すべて loop タスク内で直列なので競合しない（#157）。
+static bool videoThumbInto(M5Canvas& spr, const char* name) {
+    char dir[64];
+    if (!video_build_dir(dir, sizeof(dir), name)) return false;
+
+    char   path[80];
+    String meta;
+    if (!videoPathJoin(path, sizeof(path), dir, "meta.txt") ||
+        !videoReadTextFile(path, meta)) return false;
+    // 上限は再生側 videoOpenPack と同じ（kVideoMaxFrames・video.h）。frames は外部入力で、
+    // 下の frames×8 が size_t を溢れると index_len が小さな値に化けて範囲検証が無効になる。
+    const int frames = meta_get_int(meta.c_str(), "frames", 0);
+    if (frames <= 0 || frames > kVideoMaxFrames) return false;
+    const int mid = frames / 2;  // 先頭はフェードイン等で黒い素材が多いので中間を代表にする
+
+    // デコード倍率: 短辺 240 のうち中央 180px を直径 132 いっぱいに使う（132/180）。
+    // 変換ツールは 320x240 レターボックスで出すため、16:9 素材は上下 30px が黒帯。
+    // この倍率だと帯がちょうど円の外へ出る（180 = 240 - 30×2）。4:3 素材は中央を少し
+    // 拡大するだけで破綻しない。負のオフセットで中央寄せし、Sprite の外はクリップされる。
+    const float scale = static_cast<float>(kDiscSize) / 180.0f;
+    const int   dx    = -static_cast<int>((320.0f * scale - kDiscSize) / 2.0f);
+    const int   dy    = -static_cast<int>((240.0f * scale - kDiscSize) / 2.0f);
+
+    char packName[32];
+    if (!meta_has_key(meta.c_str(), "pack")) {
+        // pack の無い旧アセット（連番ファイル）互換。中間フレームを直接デコードする。
+        return video_frame_path(path, sizeof(path), dir, mid) &&
+               spr.drawJpgFile(SD, path, dx, dy, 0, 0, 0, 0, scale, scale);
+    }
+    if (!meta_get_str(meta.c_str(), "pack", packName, sizeof(packName))) return false;
+    // 名前の検証は読む側 videoOpenPack と同じ純粋関数（/video/ の外を開かせない・一本化）。
+    if (!video_name_valid(packName)) return false;
+    if (!videoPathJoin(path, sizeof(path), dir, packName)) return false;
+
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+
+    // 中間フレームの entry だけを読む。検証は純粋関数 video_pack_entry に任せる:
+    // 「この 8 バイト」を frame_count=1 / idx=0 の索引として渡せば、範囲検証
+    // （offset+length がデータ部に収まるか・length==0 でないか）込みで位置が引ける。
+    const size_t index_len = static_cast<size_t>(frames) * kVideoPackEntrySize;
+    const size_t file_size = f.size();
+    uint8_t  entry[kVideoPackEntrySize];
+    uint32_t off = 0, len = 0;
+    bool ok = file_size > index_len &&
+              f.seek(static_cast<size_t>(mid) * kVideoPackEntrySize) &&
+              f.read(entry, sizeof(entry)) == static_cast<int>(sizeof(entry)) &&
+              video_pack_entry(entry, sizeof(entry), 1, 0,
+                               static_cast<uint32_t>(file_size - index_len), &off, &len);
+    if (ok) {
+        // JPEG 1枚ぶんだけ一時確保（実測の最大は 16.7KB・上限は安全側に 64KB）。
+        // 壊れた索引が巨大な length を返しても PSRAM を食い潰さない。
+        ok = false;
+        if (len <= 64u * 1024u) {
+            uint8_t* buf = static_cast<uint8_t*>(ps_malloc(len));
+            if (buf) {
+                if (f.seek(index_len + off) &&
+                    f.read(buf, len) == static_cast<int>(len)) {
+                    ok = spr.drawJpg(buf, len, dx, dy, 0, 0, 0, 0, scale, scale);
+                }
+                free(buf);
+            }
+        }
+    }
+    f.close();
+    return ok;
+}
+
+// 選択中の曲のサムネイルをディスク Sprite へ用意する（読めなければ無地ディスク）。
+static void videoDiscPrepare() {
+    if (!g_videoDiscUiUp) return;
+    g_videoDiscSpr.fillSprite(TFT_BLACK);  // 前の曲の絵を残さない
+    const char* name = video_list_name_at(&g_videoList, g_videoSel);
+    if (name == nullptr || !videoThumbInto(g_videoDiscSpr, name)) {
+        // videoThumbInto は全経路が無言の false（meta 無し・索引不整合・巨大 JPEG・デコード失敗…）
+        // なので、ここで1行だけ残す。「なぜ無地ディスクなのか」の唯一の手掛かり（reviewer 指摘。
+        // 無音の失敗にログを添える作法は videoLoadAudio と同じ）。
+        Serial.printf("[video] thumb: fallback name=%s\n", name ? name : "(null)");
+        videoDiscDrawFallback();
+    }
+    videoDiscApplyMask();
+}
+
+// 選択画面の静的部分（ヘッダ・曲名・件数・操作ヒント・エラー）を1枚描く（#175 → #193 で刷新）。
+// ディスク本体は videoUpdate が毎フレーム合成する（kDiscCanvas の矩形内だけが動き、文字と重ならない）。
+// err を渡すと画面下部に赤字で理由を出す（選んだ曲が壊れていて再生に入れず戻した時・#175 設計メモ）。
 static void videoRenderSelect(const char* err = nullptr) {
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::top_left);
     M5.Display.setTextColor(TFT_CYAN, kColBg);
-    M5.Display.drawString("動画を選ぶのだ（左=次へ / 右=決定）", 6, 4);
+    // 全角15文字＝240px。右上のカウンタ（"16/16"≒40px・x=274〜）と重ならない長さに収める
+    // （reviewer 指摘: 元の案は 344px で画面幅 320 を超えていた）。スワイプできることは
+    // ディスク両脇の < > が示すので、ヘッダでは決定操作だけ言う。
+    M5.Display.drawString("曲をえらぶのだ（タップで決定）", 6, 4);
 
     if (g_videoList.count == 0) {
         M5.Display.setTextColor(TFT_WHITE, kColBg);
@@ -2507,29 +2693,66 @@ static void videoRenderSelect(const char* err = nullptr) {
         M5.Display.setFont(&fonts::Font0);
         return;
     }
-    // 1行 21px・先頭 y=40。一度に kVideoVisibleRows(=8) 行だけ描く。件数がそれを超える時は
-    // video_scroll_top が選択を必ず含む窓の先頭を返すので、その窓 [top, top+rows) を描く（#189）。
-    const int top = video_scroll_top(g_videoSel, g_videoList.count, kVideoVisibleRows);
-    const int end = (top + kVideoVisibleRows < g_videoList.count)
-                        ? top + kVideoVisibleRows : g_videoList.count;
-    for (int i = top; i < end; ++i) {
-        const int  y   = 40 + (i - top) * 21;
-        const bool sel = (i == g_videoSel);
-        if (sel) M5.Display.fillTriangle(8, y + 2, 8, y + 14, 16, y + 8, TFT_YELLOW);
-        M5.Display.setTextColor(sel ? TFT_YELLOW : TFT_WHITE, kColBg);
-        M5.Display.drawString(video_list_name_at(&g_videoList, i), 24, y);
+
+    // 曲名（中央揃え・ディスクの下）と「何曲目/全何曲」（右上）
+    const char* name = video_list_name_at(&g_videoList, g_videoSel);
+    if (name) {
+        M5.Display.setTextDatum(textdatum_t::top_center);
+        M5.Display.setTextColor(TFT_YELLOW, kColBg);
+        M5.Display.drawString(name, kScreenW / 2, 196);
     }
-    // 窓の外に隠れた項目がある向きへ▲▼を出す（スクロールできることの手掛かり・#189）。
-    // ▼は最下行の右端(y=187)に置く。y=208 だと下部の err 赤字(y=216)と縦に重なるため
-    // （9本以上あって再生失敗で選択へ戻された時に同時に出る・reviewer 指摘）。
+    char pos[16];
+    snprintf(pos, sizeof(pos), "%d/%d", g_videoSel + 1, g_videoList.count);
+    M5.Display.setTextDatum(textdatum_t::top_right);
     M5.Display.setTextColor(TFT_DARKGREY, kColBg);
-    if (top > 0)                    M5.Display.drawString("▲", 300, 40);
-    if (end < g_videoList.count)    M5.Display.drawString("▼", 300, 187);
+    M5.Display.drawString(pos, kScreenW - 6, 4);
+
+    // 左右にスワイプできることの手掛かり（ディスクの両脇）
+    M5.Display.setTextDatum(textdatum_t::middle_left);
+    M5.Display.drawString("<", 8, kDiscCanvasY + kDiscCanvasS / 2);
+    M5.Display.setTextDatum(textdatum_t::middle_right);
+    M5.Display.drawString(">", kScreenW - 8, kDiscCanvasY + kDiscCanvasS / 2);
+    M5.Display.setTextDatum(textdatum_t::top_left);
+
     if (err) {
         M5.Display.setTextColor(TFT_RED, kColBg);
-        M5.Display.drawString(err, 8, 216);  // 画面下部（最大 8 行の下・kScreenH=240 に収まる）
+        M5.Display.drawString(err, 8, 220);  // 曲名(y=196..212)の下・kScreenH=240 に収まる
     }
     M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
+}
+
+// ディスクを1コマ合成する（#193）。ゆっくり回転（20秒/周）＋sin の上下浮遊（±5px・2.6秒周期）。
+// キャンバスへ「背景→回転描画」してから一括 push することで、前コマの軌跡消しと
+// ちらつき防止を同時に済ませる（既存キャンバス群と同じダブルバッファの作法）。
+static void videoDiscAnimate(uint32_t now) {
+    const uint32_t t     = now - g_videoDiscAnimMs;
+    const float    angle = static_cast<float>(t % 20000u) * (360.0f / 20000.0f);
+    // 浮遊側も角度と同様に周期で剰余を取ってから float 化する（reviewer 指摘）。生の t を
+    // float に入れると仮数 24bit を超える約4.6時間で ms の分解能が落ち、浮遊がガタつく。
+    const float    dy    = 5.0f * sinf(static_cast<float>(t % 2600u) * (6.2831853f / 2600.0f));
+    const uint32_t t0    = micros();
+    g_videoDiscCanvas.fillSprite(kColBg);
+    // pushRotateZoom は Sprite の中心（既定ピボット）を dst 座標に合わせて回転描画する。
+    // 透明色 kDiscTransp を抜くので、円の外とセンターホールは背景が残る。
+    g_videoDiscSpr.pushRotateZoom(&g_videoDiscCanvas,
+                                  kDiscCanvasS * 0.5f, kDiscCanvasS * 0.5f + dy,
+                                  angle, 1.0f, 1.0f, kDiscTransp);
+    g_videoDiscCanvas.pushSprite(&M5.Display, kDiscCanvasX, kDiscCanvasY);
+    // 1コマの合成コストを間引きで実測ログに出す（reviewer 指摘・#176 の計装と同じ流儀）。
+    // PSRAM 上の Sprite 同士の回転合成は速さの直感が効かないので、体感より先に数字を残す。
+    // 30fps 相当で約5秒に1回。うるさくならず、選択画面に入れば必ず数点は採れる。
+    static uint32_t s_frameCount = 0;
+    if ((++s_frameCount % 150u) == 0) {
+        Serial.printf("[video] disc frame=%uus\n", static_cast<unsigned>(micros() - t0));
+    }
+}
+
+// 選択画面を（再）表示する入口。ディスク UI の確保→サムネイル読み→静的部の描画までを1箇所に
+// 閉じる。入場時・曲送り時・再生失敗で戻された時のすべてがここを通る。Sprite が確保できない時は
+// g_videoDiscUiUp=false のまま＝文字（曲名・件数）だけで選べる退避表示になる（固まらせない）。
+static void videoShowSelect(const char* err = nullptr) {
+    if (g_videoList.count > 0 && videoDiscUiCreate()) videoDiscPrepare();
+    videoRenderSelect(err);
 }
 
 // 再生開始に失敗した時の後始末（#175・reviewer 指摘）。確保済み資源を対称に解放し、状態を
@@ -2551,6 +2774,9 @@ static const char* videoFailToSelect(const char* reason) {
 // 呼び出し前に g_videoDir が確定していること（videoExit まで書き換えない保証・#175）。
 // 成功なら nullptr、失敗ならその理由（呼び出し側が選択画面へ戻して赤字で出す・#175 設計メモ）。
 static const char* videoStartPlayback() {
+    // 選択画面のディスク Sprite を先に返す（#193）。直後の videoLoadAudio が 7MB 級の連続領域を
+    // PSRAM に要求するので、確保前に返しておく（#128 の「常駐が確保を邪魔する」を自分で作らない）。
+    videoDiscUiRelease();
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::top_left);
@@ -2603,12 +2829,14 @@ static const char* videoStartPlayback() {
     return nullptr;
 }
 
-// 動画シーンへ入る（#175）。まず /video/ を列挙して選択画面を出す。決定は videoOnTap（右タップ）で。
+// 動画シーンへ入る（#175）。まず /video/ を列挙して選択画面（CDカルーセル・#193）を出す。
+// 決定は videoOnTap（どこでもタップ）、曲送りは videoOnSwipe（左右スワイプ）で。
 static void videoEnter() {
     M5.Speaker.stop();               // 前シーンの音声を確実に止めてから選択画面へ
-    g_videoReady = false;            // 選択中は videoUpdate を素通しにする（再生ロジックを動かさない）
+    g_videoReady = false;            // 選択中は再生ロジックを動かさない
     g_videoPhase = VideoPhase::kSelecting;
     g_videoSel   = 0;
+    g_videoDiscAnimMs = millis();    // 回転・浮遊アニメの時刻起点（#193）
 
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
@@ -2626,7 +2854,7 @@ static void videoEnter() {
         return;
     }
     videoEnumerate();     // 選択画面の入場時に1回だけ列挙する
-    videoRenderSelect();
+    videoShowSelect();
 }
 
 // 一周した時の再スタート（#164）。順序は videoEnter の末尾と同じ
@@ -2656,6 +2884,13 @@ static void videoRestartCycle() {
 }
 
 static void videoUpdate(uint32_t now) {
+    // 選択中はディスクのカルーセルを回す（#193）。SD 無し・0件・Sprite 確保失敗の時は
+    // UI が立っていない（g_videoDiscUiUp=false）ので静止画面のまま＝従来どおり固まらない。
+    if (g_videoPhase == VideoPhase::kSelecting) {
+        if (g_videoDiscUiUp && g_videoList.count > 0) videoDiscAnimate(now);
+        return;
+    }
+
     if (!g_videoReady) return;  // SD/meta/1枚目のどれかで失敗した入場では動かさない
 
     // 起点より前の now では何もしない（#175・reviewer 指摘）。loop は先頭で now を取り、
@@ -2708,26 +2943,33 @@ static void videoUpdate(uint32_t now) {
     g_videoLastIdx = idx;
 }
 
-static void videoOnTap(uint32_t /*now*/, int touchX) {
+static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
     // 再生中は短タップ無反応（既存の作法）。選択中だけタップに反応する（#175）。
     if (g_videoPhase != VideoPhase::kSelecting) return;
     if (g_videoList.count == 0) return;  // 候補なしは長押しで戻るだけ
 
-    if (video_is_decide_tap(touchX, kScreenW)) {
-        // 右半分=決定。選んだ名前で /video/<name> を確定してから再生へ入る（#175 の保証：
-        // ここで g_videoDir を確定し、videoExit まで書き換えない）。組み立て失敗なら何もしない。
-        const char* name = video_list_name_at(&g_videoList, g_videoSel);
-        if (!name || !video_build_dir(g_videoDir, sizeof(g_videoDir), name)) return;
-        // 再生開始。meta 欠け/壊れ等で入れなかったら選択画面へ戻して理由を出す（#175 設計メモ）。
-        // 失敗時の状態の後始末（資源解放・phase を kSelecting へ）は videoStartPlayback 側に閉じて
-        // あるので、ここは戻ってきた理由を選択画面に描くだけでよい。長押しでメニューにも戻れる。
-        const char* err = videoStartPlayback();
-        if (err) videoRenderSelect(err);
-    } else {
-        // 左半分=次の候補へカーソル移動（巡回・純粋ロジック video_list_next）。変化時だけ描き直す。
-        const int next = video_list_next(g_videoSel, g_videoList.count);
-        if (next != g_videoSel) { g_videoSel = next; videoRenderSelect(); }
-    }
+    // タップ＝決定（#193）。曲送りがスワイプになったので、左右の二分（旧 video_is_decide_tap）は
+    // 廃止し、画面のどこをタップしても決定にする。選んだ名前で /video/<name> を確定してから
+    // 再生へ入る（#175 の保証: ここで g_videoDir を確定し、videoExit まで書き換えない）。
+    const char* name = video_list_name_at(&g_videoList, g_videoSel);
+    if (!name || !video_build_dir(g_videoDir, sizeof(g_videoDir), name)) return;
+    // 再生開始。meta 欠け/壊れ等で入れなかったら選択画面へ戻して理由を出す（#175 設計メモ）。
+    // 失敗時の状態の後始末（資源解放・phase を kSelecting へ）は videoStartPlayback 側に閉じて
+    // あるので、ここは戻ってきた理由を選択画面に描くだけでよい。長押しでメニューにも戻れる。
+    const char* err = videoStartPlayback();
+    if (err) videoShowSelect(err);
+}
+
+// 左右スワイプで曲送り（#193・純粋ロジック video_list_next/prev で巡回）。
+// dir=+1（指を左へ払う=次の曲）/ -1（右へ払う=前の曲）。再生中のスワイプは無反応（タップと同じ作法）。
+static void videoOnSwipe(uint32_t /*now*/, int dir) {
+    if (g_videoPhase != VideoPhase::kSelecting) return;
+    if (g_videoList.count == 0) return;
+    const int next = (dir >= 0) ? video_list_next(g_videoSel, g_videoList.count)
+                                : video_list_prev(g_videoSel, g_videoList.count);
+    if (next == g_videoSel) return;  // 1曲しか無い時は読み直しも描き直しもしない
+    g_videoSel = next;
+    videoShowSelect();  // サムネイル読み直し＋静的部（曲名・件数）の描き直し
 }
 
 // シーン退場時のクリーンアップ（#152）。長押し復帰では呼び出し側(loop)が既に Speaker.stop() 済みだが、
@@ -2735,8 +2977,9 @@ static void videoOnTap(uint32_t /*now*/, int touchX) {
 // （g_ttsBuf と同じ「停止→解放」作法）。exit を持たせることで音声バッファを常駐させずクリーンに退場する。
 static void videoExit() {
     M5.Speaker.stop();
-    videoReleaseAudio();  // free と解析結果の null 化を対で行う（#164）
-    videoReleasePack();   // frames.bin を閉じ、索引と読み込みバッファを返す（#170）
+    videoReleaseAudio();   // free と解析結果の null 化を対で行う（#164）
+    videoReleasePack();    // frames.bin を閉じ、索引と読み込みバッファを返す（#170）
+    videoDiscUiRelease();  // 選択画面のディスク Sprite を返す（#193・常駐させない）
     g_videoReady = false;
 }
 
@@ -2751,7 +2994,7 @@ const SceneDef kScenes[] = {
     { "声の選択",     voiceEnter,  voiceUpdate,  voiceOnTap  },  // 左右タップ・#105
     { "スタックチャン", stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
     { "パックマン",   pacEnter,    pacUpdate,    pacOnTap    },  // 自作パックマン（#134 Step2）
-    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit },  // /video/ から選んで再生（#142/#148/#150/#152/#170/#175）
+    { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit, videoOnSwipe },  // CDカルーセルで選んで再生（#142/#148/#150/#152/#170/#175/#193）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号
@@ -2861,7 +3104,9 @@ void loop() {
         lastTouchX = d.x;
         lastTouchY = d.y;
     }
-    const TouchEvent ev = touch_update(tracker, touching, now);
+    // X 座標も渡してスワイプ（左右の払い）を判定する（#193）。離した瞬間の判定に使われるのは
+    // 「押下開始時の X」と「押下中の最後の X」なので、lastTouchX をそのまま流せばよい。
+    const TouchEvent ev = touch_update(tracker, touching, now, lastTouchX);
 
     if (g_inMenu) {
         // ── メニュー画面 ──
@@ -2892,6 +3137,13 @@ void loop() {
     } else if (ev == TouchEvent::Tap) {
         // 短タップ → 現シーンの反応に委譲（羊のメェ／アート再生成／音量増減など）。
         kScenes[g_sceneIdx].onTap(now, lastTouchX);
+    } else if (ev == TouchEvent::SwipeLeft || ev == TouchEvent::SwipeRight) {
+        // 左右スワイプ → 対応するシーンだけに配る（#193・曲選択カルーセル）。
+        // 左へ払う=+1（次へ）/ 右へ払う=-1（前へ）。onSwipe を持たないシーンでは何もしない
+        // （従来この操作は Tap 扱いだったが、大きく払ったのに onTap が飛ぶ方が誤操作なので配らない）。
+        if (kScenes[g_sceneIdx].onSwipe) {
+            kScenes[g_sceneIdx].onSwipe(now, ev == TouchEvent::SwipeLeft ? +1 : -1);
+        }
     }
 
     kScenes[g_sceneIdx].update(now);  // 毎フレーム描画
