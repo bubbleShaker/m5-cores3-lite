@@ -2598,13 +2598,17 @@ static void videoBgBuild(uint32_t avg) {
 // 色は入力に依らないのでシーン入場時に1回焼けば足りる（#199 時代は曲ごとの色味だったため
 // 曲送りのたびに焼き直していた）。強度には fractal_gamma（v²/255・native テスト済み）を
 // かけて暗部を締める（線形だと中間調が支配的になり、模様の輪郭がぼやけて安っぽくなる）。
+// 値は swap565（上下バイト入替済み・パネル送出順）で焼く（#205）。pushImage(uint16_t*) は
+// setSwapBytes(false) だとデータを swap565 として解釈するため、color565 のネイティブ順で
+// 焼くとグレーが上下バイト逆に読まれ緑・紫の縞に化ける（#80 と同じ罠）。setSwapBytes(true)
+// で毎フレーム 76,800 画素を変換させるより、焼き時の1回で済ませる（行 push は無変換のまま）。
 static void videoFractalBuildLut() {
     for (int i = 0; i < 256; ++i) {
         const uint8_t v = fractal_gamma(static_cast<uint8_t>(i));
         const uint8_t g = fractal_gray(kVideoFractalMax, v);
         const uint8_t d = fractal_gray(kVideoFractalSmokeMax, v);
-        g_videoFractalLut[i]    = M5.Display.color565(g, g, g);
-        g_videoFractalLutDim[i] = M5.Display.color565(d, d, d);
+        g_videoFractalLut[i]    = lgfx::swap565(g, g, g);
+        g_videoFractalLutDim[i] = lgfx::swap565(d, d, d);
     }
 }
 
@@ -2623,8 +2627,8 @@ static bool videoDiscUiCreate() {
     g_videoSelCanvas.setColorDepth(16);
     if (g_videoDiscSpr.createSprite(kDiscSize, kDiscSize) &&
         g_videoSelCanvas.createSprite(kScreenW, kScreenH)) {
-        // 模様の行データは color565 のネイティブ 565 値なので送り込み時のバイト入替は不要。
-        // 既定値のままだが、pokePushSprite（#80）で嵌った箇所なので明示しておく。
+        // 模様の行データは LUT 焼き時に swap565（パネル送出順）へ変換済み（#205・
+        // videoFractalBuildLut のコメント参照）。false のまま無変換で流し込むのが正しい。
         g_videoSelCanvas.setSwapBytes(false);
         g_videoDiscUiUp = true;
         return true;
