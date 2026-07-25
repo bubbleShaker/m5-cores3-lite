@@ -290,6 +290,56 @@ void test_bg_lerp_monotone_per_component() {
     }
 }
 
+// ───────── 次フレーム締切までの残り時間（Issue #207） ─────────
+// loop のペーシングが再生中も一律 33ms 寝ると、フレーム締切に最大 33ms 気づき遅れて
+// 描画予算（1/fps）を削り、JPEG の大きい曲でコマ落ちする。締切の計算は
+// video_frame_at と同じ total（通算フレーム数）から導く。
+
+// 10fps: 締切は 100ms ごと。境界ちょうどでは「次の」境界までを返す。
+void test_pace_basic_10fps() {
+    TEST_ASSERT_EQUAL_UINT32(100, video_until_next_frame_ms(0, 10));
+    TEST_ASSERT_EQUAL_UINT32(1,   video_until_next_frame_ms(99, 10));
+    TEST_ASSERT_EQUAL_UINT32(100, video_until_next_frame_ms(100, 10));
+    TEST_ASSERT_EQUAL_UINT32(50,  video_until_next_frame_ms(150, 10));
+    TEST_ASSERT_EQUAL_UINT32(1,   video_until_next_frame_ms(5, 1000));  // 1ms 周期でも 1 以上
+}
+
+// 1000/fps が割り切れない fps でも、返した時刻ちょうどで video_frame_at が進み、
+// その 1ms 手前ではまだ進まない（締切の定義そのものを不変条件として検査する）。
+void test_pace_boundary_matches_frame_at() {
+    const int fps = 3;  // 一周期 333.33ms（割り切れない代表）
+    uint32_t e = 0;
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t wait = video_until_next_frame_ms(e, fps);
+        TEST_ASSERT_TRUE(wait >= 1);
+        // frame_count を十分大きく取れば idx == total なので、idx の変化＝total の変化。
+        TEST_ASSERT_EQUAL_INT(video_frame_at(e, fps, 1000000),
+                              video_frame_at(e + wait - 1, fps, 1000000));
+        TEST_ASSERT_TRUE(video_frame_at(e + wait, fps, 1000000) !=
+                         video_frame_at(e, fps, 1000000));
+        e += wait;
+    }
+}
+
+// fps<=0 は締切なし（UINT32_MAX）。呼び出し側の min() で自然に無効化される安全値。
+void test_pace_invalid_fps_no_deadline() {
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, video_until_next_frame_ms(1000, 0));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, video_until_next_frame_ms(1000, -1));
+}
+
+// 長時間再生でも桁あふれしない（(total+1)×1000 が 32bit を超える領域）。
+// 200,000,000ms×30fps: total=6,000,000 → 次の締切は 200,000,034ms → 残り 34ms。
+void test_pace_no_overflow_long_playback() {
+    TEST_ASSERT_EQUAL_UINT32(34, video_until_next_frame_ms(200000000u, 30));
+}
+
+// millis ラップ直前（elapsed=UINT32_MAX）: 締切の絶対時刻 target が uint32 を超える領域でも
+// uint64 の引き算で残り時間は正しく出る（reviewer 指摘で固定した性質）。
+// total=128,849,018 → target=4,294,967,300（>uint32 上限）→ 残り 5ms。
+void test_pace_near_u32_wrap() {
+    TEST_ASSERT_EQUAL_UINT32(5, video_until_next_frame_ms(UINT32_MAX, 30));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_starts_at_first_frame);
@@ -329,5 +379,10 @@ int main(int, char**) {
     RUN_TEST(test_bg_lerp_two_and_three_rows);
     RUN_TEST(test_bg_lerp_robust);
     RUN_TEST(test_bg_lerp_monotone_per_component);
+    RUN_TEST(test_pace_basic_10fps);
+    RUN_TEST(test_pace_boundary_matches_frame_at);
+    RUN_TEST(test_pace_invalid_fps_no_deadline);
+    RUN_TEST(test_pace_no_overflow_long_playback);
+    RUN_TEST(test_pace_near_u32_wrap);
     return UNITY_END();
 }

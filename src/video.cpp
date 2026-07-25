@@ -22,6 +22,20 @@ uint32_t video_cycle_at(uint32_t elapsed_ms, int fps, int frame_count) {
     return static_cast<uint32_t>(total / static_cast<uint64_t>(frame_count));
 }
 
+uint32_t video_until_next_frame_ms(uint32_t elapsed_ms, int fps) {
+    if (fps <= 0) return UINT32_MAX;  // 締切なし（呼び出し側の min() で自然に効かなくなる）
+
+    // video_frame_at と同じ total（通算フレーム数）を作り、それが次に進む最小の時刻を逆算する。
+    // total(t) = t*fps/1000（切り捨て）なので、total+1 に到達する最初の ms は
+    // ceil((total+1)*1000 / fps)。式を video_frame_at と揃えておかないと「締切に起きたのに
+    // 番号がまだ進んでいない」境界の食い違いが出る（cycle と同じ理由）。
+    const uint64_t fps64  = static_cast<uint64_t>(fps);
+    const uint64_t total  = static_cast<uint64_t>(elapsed_ms) * fps64 / 1000u;
+    const uint64_t target = ((total + 1u) * 1000u + fps64 - 1u) / fps64;
+    const uint64_t wait   = target - elapsed_ms;  // target > elapsed_ms が式の性質で保証される＝必ず 1 以上
+    return (wait > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(wait);
+}
+
 bool video_frame_path(char* buf, size_t buf_size, const char* dir, int index) {
     if (buf == nullptr || dir == nullptr || buf_size == 0) return false;
     if (index < 0) return false;  // 契約: 0基点の番号のみ。負値で frame_00000/frame_-0001 を作らせない

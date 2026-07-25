@@ -21,6 +21,16 @@ int video_frame_at(uint32_t elapsed_ms, int fps, int frame_count);
 //   fps <= 0 または frame_count <= 0 のときは 0 を返す（video_frame_at と同じ安全値）。
 uint32_t video_cycle_at(uint32_t elapsed_ms, int fps, int frame_count);
 
+// 次のフレーム締切（video_frame_at の通算フレーム数が進む時刻）までの残り ms を返す
+// 純粋ロジック（Issue #207）。loop のペーシング（framePace）が再生中も一律 33ms 寝ると、
+// 締切に最大 33ms 気づき遅れて描画予算（1/fps）を削り、JPEG の大きい曲でコマ落ちする。
+// この返り値で寝る長さをクランプすれば、締切のタイミングで目が覚める。
+//   fps <= 0 のときは UINT32_MAX（締切なし。呼び出し側の min() で自然に無効化される安全値）。
+//   返り値は必ず 1 以上（elapsed_ms がちょうど境界でも「次の」境界までを返す）、かつ
+//   1000/fps + 1 以下に収まる。つまり呼び出し側のクランプは「寝る長さを短くする」方向にしか
+//   効かない＝締切を持たないシーンの周期を伸ばす事故は構造的に起きない。
+uint32_t video_until_next_frame_ms(uint32_t elapsed_ms, int fps);
+
 // フレーム番号（0基点）から SD 上のファイルパスを組み立てる純粋ロジック（Issue #150）。
 // video_frame_at が返す 0..frame_count-1 の index を受け取り、1基点・5桁ゼロ埋めの
 // "<dir>/frame_%05d.jpg" を buf に書く（例: dir="/video/sample", index=0 → "/video/sample/frame_00001.jpg"）。
