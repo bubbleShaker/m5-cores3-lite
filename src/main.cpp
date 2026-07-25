@@ -2908,7 +2908,8 @@ static void videoDiscPrepare() {
 
 // フェード中の1コマ: 元絵（g_videoDiscSrc）を輝度 level/256 で表示用 Sprite へ複写する（#209）。
 // バッファは swap565（パネル送出順。LUT の static_assert と #205 参照）なので、bswap で
-// RGB565 に戻してから R/B（0xF81F）と G（0x07E0）を分けてスケールする定石を使う。
+// ネイティブ順の RGB565 に戻し、画素の暗転そのものは純粋関数 video_fade_scale565 に任せる
+// （チャンネルを混ぜて掛けると青が湧く。理由と数値は video_fade.h と Issue #213）。
 // 透明色（円の外とセンターホール）はスケールせずそのまま通す。スケール結果が偶然
 // 透明色に一致することは無い（0xF81F には R=B=31 が要るが、level<256 では 31 に届かない）。
 static void videoDiscFadeApply(uint32_t level) {
@@ -2918,10 +2919,7 @@ static void videoDiscFadeApply(uint32_t level) {
     for (int i = 0; i < kDiscPixels; ++i) {
         const uint16_t raw = g_videoDiscSrc[i];
         if (raw == keyRaw) { dst[i] = raw; continue; }
-        const uint16_t v  = __builtin_bswap16(raw);
-        const uint32_t rb = ((v & 0xF81Fu) * level) >> 8;
-        const uint32_t g  = ((v & 0x07E0u) * level) >> 8;
-        dst[i] = __builtin_bswap16(static_cast<uint16_t>((rb & 0xF81Fu) | (g & 0x07E0u)));
+        dst[i] = __builtin_bswap16(video_fade_scale565(__builtin_bswap16(raw), level));
     }
 }
 

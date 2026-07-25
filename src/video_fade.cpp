@@ -100,6 +100,17 @@ void video_fade_rebase(VideoFade* f, uint32_t now) {
     f->start_ms = now;
 }
 
+uint16_t video_fade_scale565(uint16_t rgb565, uint32_t level) {
+    // 等倍の早出し。level=256 は下の式でも厳密に恒等（31*256>>8=31）なので結果は変わらず、
+    // 狙いは (a) 等倍コマで 17,424 画素ぶんの乗算を丸ごと省くこと、(b) 万一 level>256 が
+    // 流れ込んだ時にフィールドが溢れて色が壊れるのを防ぐこと（reviewer 指摘）。
+    if (level >= 256) return rgb565;
+    const uint32_t r = (((rgb565 >> 11) & 0x1Fu) * level) >> 8;
+    const uint32_t g = (((rgb565 >>  5) & 0x3Fu) * level) >> 8;
+    const uint32_t b = ((  rgb565        & 0x1Fu) * level) >> 8;
+    return static_cast<uint16_t>((r << 11) | (g << 5) | b);
+}
+
 int video_fade_target(const VideoFade* f, int current) {
     if (f != nullptr && f->state == VideoFadeState::kOut) return f->pending;
     return current;
