@@ -87,6 +87,38 @@ bool video_pack_entry(const uint8_t* index, size_t index_len, int frame_count,
     return true;
 }
 
+int video_audio_chunk_count(size_t total_samples, size_t chunk_samples) {
+    if (chunk_samples == 0) return 0;  // 0除算を踏まない安全値
+    return static_cast<int>((total_samples + chunk_samples - 1) / chunk_samples);
+}
+
+bool video_audio_chunk_at(int idx, size_t total_samples, size_t chunk_samples,
+                          size_t* out_start, size_t* out_count) {
+    if (out_start == nullptr || out_count == nullptr) return false;
+    const int n = video_audio_chunk_count(total_samples, chunk_samples);
+    if (idx < 0 || idx >= n) return false;
+
+    const size_t start = static_cast<size_t>(idx) * chunk_samples;
+    size_t count = total_samples - start;          // 最終チャンクは端数になりうる
+    if (count > chunk_samples) count = chunk_samples;
+    *out_start = start;
+    *out_count = count;
+    return true;
+}
+
+uint32_t video_audio_read_budget(uint32_t until_deadline_ms, uint32_t reserve_ms,
+                                 uint32_t bytes_per_ms, uint32_t min_bytes,
+                                 uint32_t max_bytes) {
+    if (until_deadline_ms <= reserve_ms) return 0;  // 締切目前は読まない
+
+    // uint64 で掛けてから比較する。UINT32_MAX（締切なし）× bytes_per_ms は 32bit を
+    // 大きく溢れるが、どうせ max_bytes に張り付くので値そのものは要らない。
+    const uint64_t budget = static_cast<uint64_t>(until_deadline_ms - reserve_ms) * bytes_per_ms;
+    if (budget < min_bytes) return 0;               // 呼び出しコストに見合わない
+    if (budget > max_bytes) return max_bytes;
+    return static_cast<uint32_t>(budget);
+}
+
 uint32_t video_bg_tone(uint32_t rgb, uint8_t target_max) {
     const uint32_t r = (rgb >> 16) & 0xFF;
     const uint32_t g = (rgb >> 8) & 0xFF;

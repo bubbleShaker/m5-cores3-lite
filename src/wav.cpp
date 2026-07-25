@@ -36,10 +36,17 @@ constexpr uint16_t kBits16      = 16;  // 本実装が受理するビット深�
 } // namespace
 
 bool parse_wav_header(const uint8_t* data, size_t len, WavInfo* info) {
+    // prefix == ファイル全長の特殊形（等価性は native テストで固定・#208）。
+    return parse_wav_header_prefix(data, len, len, info);
+}
+
+bool parse_wav_header_prefix(const uint8_t* data, size_t prefix_len, size_t file_len,
+                             WavInfo* info) {
     if (data == nullptr || info == nullptr) return false;
+    if (prefix_len > file_len) return false;  // 契約違反（読んだ量が全長を超えることはない）
 
     // RIFF ヘッダ（12byte）: "RIFF" + サイズ(4) + "WAVE"。最低でもこれが必要。
-    if (len < 12) return false;
+    if (prefix_len < 12) return false;
     if (!tag_eq(data, "RIFF")) return false;
     if (!tag_eq(data + 8, "WAVE")) return false;
 
@@ -48,18 +55,23 @@ bool parse_wav_header(const uint8_t* data, size_t len, WavInfo* info) {
     WavInfo out;
 
     // 12 から先はチャンク列。各チャンク = ID(4) + サイズ(4) + 中身(size, 奇数なら1byteパディング)。
+    // 走査できるのは prefix に収まっている範囲まで。fmt / data のチャンクヘッダが prefix 内に
+    // 現れなければ have_* が立たず自然に false になる（prefix を伸ばして再挑戦する契約）。
     size_t pos = 12;
-    while (pos + 8 <= len) {  // 最低でも ID+サイズの 8byte が読めること
+    while (pos + 8 <= prefix_len) {  // 最低でも ID+サイズの 8byte が読めること
         const uint8_t* id   = data + pos;
         const uint32_t size = read_u32(data + pos + 4);
         const size_t   body = pos + 8;  // 中身の先頭
 
-        // 中身が宣言サイズ分そろっていなければ壊れている（途中で切れた等）→ 失敗。
-        if (size > len - body) return false;
+        // 中身が宣言サイズ分ファイルにそろっていなければ壊れている（途中で切れた等）→ 失敗。
+        // 判定はファイル全長に対して行う（中身が prefix にまだ無いのはストリーミングでは正常）。
+        if (size > file_len - body) return false;
 
         if (tag_eq(id, "fmt ")) {
-            // fmt は最低 16byte（PCM の必須フィールド分）。
+            // fmt は最低 16byte（PCM の必須フィールド分）。フィールドを実際に読むので
+            // prefix 内に全部そろっていることも要求する（読めていないメモリを読まない）。
             if (size < 16) return false;
+            if (body + 16 > prefix_len) return false;
             const uint16_t fmt_code = read_u16(data + body + 0);
             out.channels        = read_u16(data + body + 2);
             out.sample_rate     = read_u32(data + body + 4);
@@ -67,9 +79,14 @@ bool parse_wav_header(const uint8_t* data, size_t len, WavInfo* info) {
             // 受理するのは 16bit リニア PCM のみ（playRaw が扱える形に限定）。
             if (fmt_code != kPcmFormat) return false;
             if (out.bits_per_sample != kBits16) return false;
-            if (out.channels == 0) return false;
+            // レート 0 は再生位置が永久に進まず（Speaker の出力タスクが 0 除算相当で停滞し）
+            // キューが詰まったままになる。3ch 以上はモノラル扱いで誤った速度で鳴る。
+            // どちらも SD 上の外部入力なので、届く前にここで弾く（#208 reviewer 指摘）。
+            if (out.sample_rate == 0) return false;
+            if (out.channels == 0 || out.channels > 2) return false;
             have_fmt = true;
         } else if (tag_eq(id, "data")) {
+            // data は位置と長さだけ記録する（中身はここでは読まないので prefix 外でよい）。
             out.data_offset = body;
             out.data_bytes  = size;
             have_data = true;

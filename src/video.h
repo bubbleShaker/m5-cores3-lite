@@ -76,6 +76,31 @@ bool video_pack_entry(const uint8_t* index, size_t index_len, int frame_count,
                       int idx, uint32_t data_size,
                       uint32_t* out_offset, uint32_t* out_length);
 
+// ───────── 音声チャンクストリーミング（Issue #208） ─────────
+// 再生開始ラグの主因だった「audio.wav 丸ごと読み（数MB＝数秒）」をやめ、
+// 「先頭チャンクだけ同期で読んで即開始 → 残りは再生中の空き時間に読み足し、
+// 読めたチャンクを Speaker のキュー（再生中＋次の1本）へ順次投入」にするための算術。
+// サンプル単位（int16 の要素数）で扱い、バイト換算（×2）は呼び出し側の責務。
+
+// 全長 total_samples を chunk_samples ごとに割った時のチャンク個数（端数は最終チャンク）。
+// chunk_samples == 0 は 0 を返す（0除算を踏まない安全値）。
+int video_audio_chunk_count(size_t total_samples, size_t chunk_samples);
+
+// idx 番目（0基点）のチャンクの開始サンプル位置と個数を返す。範囲外・出力先 null は false。
+// 全チャンクを連結すると全長に過不足なく一致する（隙間も重なりも無い・native テスト）。
+bool video_audio_chunk_at(int idx, size_t total_samples, size_t chunk_samples,
+                          size_t* out_start, size_t* out_count);
+
+// 「次フレーム締切までの残り until_deadline_ms」から、今の周回で SD から読んでよい
+// バイト数を返す。予算を超えて読むとフレーム締切を食い、#207 で直したコマ落ちを
+// 別経路で再発させるため、締切から reserve_ms 手前までに bytes_per_ms で読み切れる量に
+// 制限する。min_bytes 未満しか読めない周回は 0（read の呼び出しコストに見合わない）、
+// 上限は max_bytes（1回の read で締切を大きく跨がない）。until_deadline_ms=UINT32_MAX
+//（締切なし）でも桁あふれせず max_bytes を返す。
+uint32_t video_audio_read_budget(uint32_t until_deadline_ms, uint32_t reserve_ms,
+                                 uint32_t bytes_per_ms, uint32_t min_bytes,
+                                 uint32_t max_bytes);
+
 // ───────── 選択画面の背景グラデーション（#195） ─────────
 // サムネイルの平均色から背景の色を作る算術。0xRRGGBB のパック表現で受け渡しする
 // （RGB565 への変換は表示側 M5GFX の color565 に任せ、ここは 8bit/成分で計算する）。

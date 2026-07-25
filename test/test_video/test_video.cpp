@@ -340,6 +340,88 @@ void test_pace_near_u32_wrap() {
     TEST_ASSERT_EQUAL_UINT32(5, video_until_next_frame_ms(UINT32_MAX, 30));
 }
 
+// ───────── 音声チャンク分割（Issue #208） ─────────
+// 再生開始ラグの主因だった「audio.wav 丸ごと読み」をやめ、チャンク単位で
+// 読み足し・キュー投入するための分割算術。境界のオフバイワンは実機でしか
+// 出ないバグになるので native で固める。
+
+void test_audio_chunk_count() {
+    TEST_ASSERT_EQUAL_INT(0, video_audio_chunk_count(0, 100));
+    TEST_ASSERT_EQUAL_INT(1, video_audio_chunk_count(100, 100));
+    TEST_ASSERT_EQUAL_INT(2, video_audio_chunk_count(101, 100));
+    TEST_ASSERT_EQUAL_INT(2, video_audio_chunk_count(200, 100));  // ちょうど倍数で余分な空チャンクを作らない
+    TEST_ASSERT_EQUAL_INT(0, video_audio_chunk_count(100, 0));    // 0除算を踏まない
+}
+
+// ちょうど倍数のとき、最終チャンクは満量で「その次」は存在しない（空チャンクの排除）
+void test_audio_chunk_at_exact_multiple() {
+    size_t start = 0, count = 0;
+    TEST_ASSERT_TRUE(video_audio_chunk_at(1, 200, 100, &start, &count));
+    TEST_ASSERT_EQUAL(100, start);
+    TEST_ASSERT_EQUAL(100, count);
+    TEST_ASSERT_FALSE(video_audio_chunk_at(2, 200, 100, &start, &count));
+}
+
+void test_audio_chunk_at_full_and_tail() {
+    size_t start = 0, count = 0;
+    TEST_ASSERT_TRUE(video_audio_chunk_at(0, 250, 100, &start, &count));
+    TEST_ASSERT_EQUAL(0, start);
+    TEST_ASSERT_EQUAL(100, count);
+    TEST_ASSERT_TRUE(video_audio_chunk_at(2, 250, 100, &start, &count));
+    TEST_ASSERT_EQUAL(200, start);
+    TEST_ASSERT_EQUAL(50, count);  // 端数の最終チャンク
+}
+
+void test_audio_chunk_at_out_of_range() {
+    size_t start = 0, count = 0;
+    TEST_ASSERT_FALSE(video_audio_chunk_at(-1, 250, 100, &start, &count));
+    TEST_ASSERT_FALSE(video_audio_chunk_at(3, 250, 100, &start, &count));   // count=3 の範囲外
+    TEST_ASSERT_FALSE(video_audio_chunk_at(0, 0, 100, &start, &count));     // 空データ
+    TEST_ASSERT_FALSE(video_audio_chunk_at(0, 250, 100, nullptr, &count));  // 出力先なし
+}
+
+// 全チャンクを連結すると元の全長に過不足なく一致する（隙間も重なりも無い不変条件）
+void test_audio_chunks_cover_exactly() {
+    const size_t total = 65536u * 3 + 12345u;
+    size_t expect_start = 0;
+    const int n = video_audio_chunk_count(total, 65536);
+    for (int i = 0; i < n; ++i) {
+        size_t start = 0, count = 0;
+        TEST_ASSERT_TRUE(video_audio_chunk_at(i, total, 65536, &start, &count));
+        TEST_ASSERT_EQUAL(expect_start, start);
+        TEST_ASSERT_TRUE(count > 0);
+        expect_start = start + count;
+    }
+    TEST_ASSERT_EQUAL(total, expect_start);
+}
+
+// ───────── 読み足し予算（Issue #208） ─────────
+// 「次フレーム締切までの余り時間」から今の周回で SD から読んでよいバイト数を出す。
+// 予算を超えて読むとフレーム締切を食い、#207 で直したコマ落ちを別経路で再発させる。
+
+void test_read_budget_basic() {
+    // 残り 40ms・マージン 12ms・1KB/ms → 28KB
+    TEST_ASSERT_EQUAL_UINT32(28000, video_audio_read_budget(40, 12, 1000, 8192, 65536));
+}
+
+void test_read_budget_zero_when_close_to_deadline() {
+    TEST_ASSERT_EQUAL_UINT32(0, video_audio_read_budget(12, 12, 1000, 8192, 65536));  // 境界ちょうど
+    TEST_ASSERT_EQUAL_UINT32(0, video_audio_read_budget(5, 12, 1000, 8192, 65536));   // 締切目前
+    // 読めるには読めるが min 未満（read の呼び出しコストに見合わない）
+    TEST_ASSERT_EQUAL_UINT32(0, video_audio_read_budget(20, 12, 1000, 8192, 65536));
+}
+
+void test_read_budget_clamps_to_max() {
+    TEST_ASSERT_EQUAL_UINT32(65536, video_audio_read_budget(200, 12, 1000, 8192, 65536));
+    // 締切なし（UINT32_MAX）でも桁あふれせず max に張り付く
+    TEST_ASSERT_EQUAL_UINT32(65536, video_audio_read_budget(UINT32_MAX, 12, 1000, 8192, 65536));
+}
+
+// 速度見積り 0（読めない前提）は常に予算 0（0 バイト read を呼ばせない）
+void test_read_budget_zero_rate() {
+    TEST_ASSERT_EQUAL_UINT32(0, video_audio_read_budget(1000, 12, 0, 8192, 65536));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_starts_at_first_frame);
@@ -384,5 +466,14 @@ int main(int, char**) {
     RUN_TEST(test_pace_invalid_fps_no_deadline);
     RUN_TEST(test_pace_no_overflow_long_playback);
     RUN_TEST(test_pace_near_u32_wrap);
+    RUN_TEST(test_audio_chunk_count);
+    RUN_TEST(test_audio_chunk_at_exact_multiple);
+    RUN_TEST(test_audio_chunk_at_full_and_tail);
+    RUN_TEST(test_audio_chunk_at_out_of_range);
+    RUN_TEST(test_audio_chunks_cover_exactly);
+    RUN_TEST(test_read_budget_basic);
+    RUN_TEST(test_read_budget_zero_when_close_to_deadline);
+    RUN_TEST(test_read_budget_clamps_to_max);
+    RUN_TEST(test_read_budget_zero_rate);
     return UNITY_END();
 }

@@ -2036,6 +2036,37 @@ static size_t         g_videoPcmSamples = 0;
 static uint32_t       g_videoPcmRate    = 0;
 static bool           g_videoPcmStereo  = false;
 
+// ── 音声チャンクストリーミング（#208） ──
+// 決定タップから再生開始までの支配的ラグだった「audio.wav 丸ごと読み（数MB＝数秒）」を、
+// 「先頭チャンクだけ同期で読んで即開始 → 残りは再生中の空き時間に読み足す」に変える。
+// Speaker はチャンネルごとに「再生中＋次の1本」を持てる（Speaker_Class.hpp の playRaw doc が
+// 案内するストリーミング用途）ので、読み終わったチャンクを順次キューへ入れれば途切れない。
+// 読み足し速度（実効 100〜200KB/s）≫ 消費速度（変換ツール既定の 16kHz mono = 32KB/s）なので、
+// 先頭チャンクさえ読めていれば後続は枯れない。⚠ この余裕は既定素材の仮定で、44.1kHz stereo
+//（176KB/s）などを SD に置くと成り立たない。そのため下の videoAudioStep に「枯渇寸前は予算を
+// 無視して読む」緊急経路を持つ（reviewer 指摘）。分割算術は純粋関数（video_audio_chunk_*）。
+static constexpr uint8_t  kVideoAudioCh = 0;  // 動画音声の専用チャンネル（キュー投入先を固定する）
+// 1チャンク = 64K サンプル（16kHz mono で約 4.1 秒・128KB）。ステレオでも偶数なので
+// L/R フレーム境界に乗る。継ぎ目にノイズが出る素材が見つかったら、ここを大きくして
+// 継ぎ目自体を減らすのが対処（実機リスクは Issue #208 に記載）。
+static constexpr size_t   kVideoAudioChunkSamples = 65536;
+static constexpr size_t   kVideoAudioChunkBytes   = kVideoAudioChunkSamples * 2;  // int16=2B/要素
+static constexpr uint32_t kVideoAudioReserveMs    = 12;   // 読み足し後に締切まで残す安全マージン
+// SD 読み速度の見積り。#176 実測 ≈1.1MB/s は単一ファイルの連続読みで、実運用は frames.bin の
+// seek+read と交互に叩くぶん確実に落ちるため、さらに安全側へ 0.6 倍している（reviewer 指摘。
+// 甘い見積りは reserve を食い潰して #207 のコマ落ちを別経路で再発させる）。
+static constexpr uint32_t kVideoAudioBytesPerMs   = 600;
+static constexpr uint32_t kVideoAudioMinSlice     = 8192;  // これ未満しか読めない周回は読まない
+static constexpr uint32_t kVideoAudioMaxSlice     = 65536; // 1周回で読む上限（締切を大きく跨がない）
+
+static File   g_videoAudioFile;               // 読み足し中は開いたまま（読み切り/退場で close）
+static bool   g_videoAudioFileOpen   = false;
+static size_t g_videoAudioLoaded     = 0;     // g_videoAudioBuf へ読み込み済みのバイト数
+static size_t g_videoAudioTotal      = 0;     // ファイル全長（＝バッファ長）
+static size_t g_videoAudioDataOffset = 0;     // PCM 本体の先頭バイト位置（チャンク読込済み判定に使う）
+static int    g_videoAudioNextChunk  = 0;     // 次に Speaker キューへ入れるチャンク番号（0基点）
+static bool   g_videoAudioUnderrun   = false; // 枯渇（未投入チャンクが残るのに無音）を1回だけログするラッチ
+
 // ───────── パック方式（frames.bin）の状態（#170） ─────────
 // 連番ファイル方式は FAT32 のファイル名解決が線形走査になり、終盤で 1 枚 1 秒かかった（#169）。
 // 全フレームを 1 本にまとめ、番号→位置の索引を自前で持てば名前解決は入場時の 1 回だけになる。
@@ -2112,14 +2143,78 @@ static void videoLogPsram(const char* tag, size_t want) {
 // DMA が参照中でないこと（呼ぶ前に M5.Speaker.stop() 済み、または未再生）を前提にする。
 static void videoReleaseAudio() {
     g_videoAudioWasPlaying = false;  // 解放したら鳴り終わり検知のラッチも落とす（#169）
-    if (g_videoAudioBuf) { free(g_videoAudioBuf); g_videoAudioBuf = nullptr; }
+    // 読み足し途中のファイルも必ず閉じる（#208）。閉じ忘れると次の曲の SD.open が
+    // ハンドルを食い潰していく。
+    if (g_videoAudioFileOpen) { g_videoAudioFile.close(); g_videoAudioFileOpen = false; }
+    g_videoAudioLoaded     = 0;
+    g_videoAudioTotal      = 0;
+    g_videoAudioDataOffset = 0;
+    g_videoAudioNextChunk  = 0;
+    g_videoAudioUnderrun   = false;
+    if (g_videoAudioBuf) {
+        // 呼び出し側の M5.Speaker.stop() は「次スロットに停止マーカーを置くだけ」の非同期停止で、
+        // 出力タスクが処理するまで数ms は旧バッファを読み続ける（reviewer 指摘・Speaker_Class.cpp）。
+        // その窓の中で free すると use-after-free になるので、鳴り終わりを待ってから返す。
+        // 通常は 1〜2ms で抜ける。万一の異常時も 50ms で諦めて進む（フリーズより稀ノイズを取る）。
+        for (int i = 0; i < 50 && M5.Speaker.isPlaying(kVideoAudioCh); ++i) delay(1);
+        free(g_videoAudioBuf);
+        g_videoAudioBuf = nullptr;
+    }
     g_videoPcm        = nullptr;
     g_videoPcmSamples = 0;
     g_videoPcmRate    = 0;
     g_videoPcmStereo  = false;
 }
 
-// 解析済みの PCM を playRaw に流す（#164）。SD には触れないので周回のたびに呼んでよい。
+// 読み込み済みの次チャンクを Speaker のキューへ入れる（#208）。入れられたら true。
+// 「満杯（再生中＋次の1本）」「読み足しがまだチャンク末尾に届いていない」「全チャンク投入済み」は
+// どれも正常な false（次の周回でまた試す）。専用チャンネル固定なのは、キューが「同一チャンネルの
+// 再生中＋次の1本」で構成されるため（自動割当だとチャンクごとに別チャンネルへ散って並列に鳴る）。
+static bool videoAudioQueueNext() {
+    if (g_videoPcm == nullptr || g_videoPcmSamples == 0) return false;
+    const int chunks = video_audio_chunk_count(g_videoPcmSamples, kVideoAudioChunkSamples);
+    if (g_videoAudioNextChunk >= chunks) return false;             // 最後まで投入済み
+
+    // 先頭チャンクは stop_current_sound=true で「チャンネルを奪って」即時切替する（reviewer 指摘）。
+    // M5.Speaker.stop() は同期停止ではなく「次スロットに停止マーカーを置くだけ」で、直後に同一
+    // チャンネルへ stop=false の playRaw をするとマーカーが上書きされて停止指示が消える
+    // （＝周回時に前の周のチャンクが鳴り切るまで最大4秒、古い音が残る）。stop=true なら
+    // playRaw 自身が確実に切り替えるので、呼び出し側の stop() のタイミングに依存しない。
+    // 満杯ガードも先頭チャンクには適用しない（奪うのだから満杯でよい）。
+    const bool takeover = (g_videoAudioNextChunk == 0);
+    if (!takeover && M5.Speaker.isPlaying(kVideoAudioCh) >= 2) return false;  // 再生中＋次の1本で満杯
+
+    size_t start = 0, count = 0;
+    if (!video_audio_chunk_at(g_videoAudioNextChunk, g_videoPcmSamples,
+                              kVideoAudioChunkSamples, &start, &count)) return false;
+    // チャンク末尾までバッファへ読み込み済みであること（int16 = 2B/要素）。ここで待つのが
+    // 「読めたところまでしか鳴らさない」保証の一点（未読み領域を DMA に渡さない）。
+    const size_t need = g_videoAudioDataOffset + (start + count) * 2;
+    if (g_videoAudioLoaded < need) return false;
+
+    if (!M5.Speaker.playRaw(g_videoPcm + start, count, g_videoPcmRate,
+                            g_videoPcmStereo, 1, kVideoAudioCh, takeover)) return false;
+    g_videoAudioUnderrun = false;  // 投入できた＝枯渇状態から抜けた（下の underrun 検知と対）
+
+    if (g_videoAudioNextChunk == 0) {
+        // 実測の起点を取る（#169）。playRaw は非同期に返るので、先頭チャンクを呼んだ直後を
+        // 音声の開始時刻とみなす。公称の長さは分割前の全長（サンプル数÷レート。ステレオは
+        // L/R が交互に入るので 2 で割ってから割る）のまま＝ audio end の実測/公称の比較は
+        // チャンク化しても意味が変わらない。
+        const uint32_t frames = static_cast<uint32_t>(g_videoPcmSamples / (g_videoPcmStereo ? 2 : 1));
+        g_videoAudioStartMs    = millis();
+        g_videoAudioNominalMs  = (g_videoPcmRate > 0)
+            ? static_cast<uint32_t>(static_cast<uint64_t>(frames) * 1000u / g_videoPcmRate)
+            : 0;
+        g_videoAudioWasPlaying = true;
+    }
+    g_videoAudioNextChunk++;
+    return true;
+}
+
+// 解析済みの PCM を先頭から鳴らし（直し）始める（#164/#208）。チャンクカーソルを 0 に戻して
+// 先頭チャンクをキューへ入れる。SD には触れないので周回のたびに呼んでよい（周回時は読み足しが
+// とうに終わっている前提だが、仮に途中でも「読めたところまで鳴る」へ落ちるだけ）。
 // 音声 OFF や解析失敗では g_videoPcm が nullptr のままなので、ここが無音を保証する一点になる。
 static bool videoPlayAudio() {
     // 先にラッチを落としてから鳴らす（reviewer 指摘・#169）。ここで落とさないと、playRaw が
@@ -2130,17 +2225,8 @@ static bool videoPlayAudio() {
 
     if (g_videoPcm == nullptr || g_videoPcmSamples == 0) return false;
     M5.Speaker.setVolume(volume_to_speaker(g_volumeLevel));
-    if (!M5.Speaker.playRaw(g_videoPcm, g_videoPcmSamples, g_videoPcmRate, g_videoPcmStereo)) return false;
-
-    // 実測の起点を取る（#169）。playRaw は非同期に返るので、呼んだ直後を音声の開始時刻とみなす。
-    // 公称の長さは「サンプル数 ÷ レート」。ステレオは L/R が交互に入るので 2 で割ってから割る。
-    const uint32_t frames = static_cast<uint32_t>(g_videoPcmSamples / (g_videoPcmStereo ? 2 : 1));
-    g_videoAudioStartMs    = millis();
-    g_videoAudioNominalMs  = (g_videoPcmRate > 0)
-        ? static_cast<uint32_t>(static_cast<uint64_t>(frames) * 1000u / g_videoPcmRate)
-        : 0;
-    g_videoAudioWasPlaying = true;
-    return true;
+    g_videoAudioNextChunk = 0;
+    return videoAudioQueueNext();  // 先頭チャンク＝音の開始。起点とラッチはこの中で取る
 }
 
 static bool videoLoadAudio() {
@@ -2187,20 +2273,48 @@ static bool videoLoadAudio() {
     // 死なないか」を判断する数字なので、載った場合も必ず出す（reviewer 指摘）。
     videoLogPsram("audio-alloc-ok", len);
 
-    const size_t got = f.read(buf, len);
-    f.close();
-    if (got != len) {
+    // ここが決定タップから音が出るまでの唯一の同期 SD 読み（#208）。旧実装は len 全部
+    // （数MB＝数秒）をここで読んでいた。ヘッダ＋先頭チャンクぶんだけ読んで即開始し、
+    // 残りは再生中の空き時間に videoAudioStep が読み足す。
+    // 初回読みは「標準44Bヘッダ＋ffmpeg が挟む LIST 等の余裕(4KB)＋先頭チャンク」を狙った量。
+    // ヘッダが 4KB 超で先頭チャンクが初回読みに収まらなかった場合も、下の読み足しが埋める。
+    size_t head = kVideoAudioChunkBytes + 4096;
+    if (head > len) head = len;
+    const size_t head_got = f.read(buf, head);
+    if (head_got != head) {  // ログは要求量ではなく実読み量を出す（reviewer 指摘・誤読防止）
         Serial.printf("[video] audio skip: short read %u/%u\n",
-                      static_cast<unsigned>(got), static_cast<unsigned>(len));
+                      static_cast<unsigned>(head_got), static_cast<unsigned>(head));
         free(buf);
+        f.close();
         return false;
     }
 
     WavInfo info;
-    if (!parse_wav_header(buf, len, &info)) {  // 16bit PCM 以外/破損は諦める
+    // 先頭だけでヘッダを解析する（純粋関数・native テスト済み）。data の中身はまだ無くてよいが、
+    // data の終端がファイル全長に収まること（途中で切れたファイルの排除）は len に対して検証される。
+    if (!parse_wav_header_prefix(buf, head, len, &info)) {  // 16bit PCM 以外/破損は諦める
         Serial.println("[video] audio skip: wav header parse failed");
         free(buf);
+        f.close();
         return false;
+    }
+
+    // 先頭チャンクの末尾までは同期で読み切る（先頭チャンクが鳴り始められる状態にして返る）。
+    // ヘッダが素直な 44B なら初回読みで足りていて、ここは 0 バイト読みでスキップされる。
+    size_t chunk0_bytes = kVideoAudioChunkBytes;
+    if (chunk0_bytes > info.data_bytes) chunk0_bytes = info.data_bytes;
+    const size_t need0 = info.data_offset + chunk0_bytes;  // parse が data 終端 <= len を保証済み
+    if (head < need0) {
+        const size_t more_got = f.read(buf + head, need0 - head);
+        if (more_got != need0 - head) {
+            Serial.printf("[video] audio skip: chunk0 short read %u/%u\n",
+                          static_cast<unsigned>(more_got),
+                          static_cast<unsigned>(need0 - head));
+            free(buf);
+            f.close();
+            return false;
+        }
+        head = need0;
     }
 
     // 旧バッファは videoReleaseAudio 経由で捨てる（g_ttsBuf/g_prefetchBuf と同じ防御・540/570行）。
@@ -2211,11 +2325,26 @@ static bool videoLoadAudio() {
     videoReleaseAudio();
     g_videoAudioBuf = buf;  // 再生中は解放しない（videoExit で free）
 
+    // 読み足しの状態を保持。ファイルは開いたまま videoAudioStep へ引き継ぐ（File は共有ハンドルの
+    // コピーなので、ローカル f が抜けても close されない）。全部読めてしまう短い素材はここで閉じる。
+    g_videoAudioLoaded     = head;
+    g_videoAudioTotal      = len;
+    g_videoAudioDataOffset = info.data_offset;
+    if (head < len) {
+        g_videoAudioFile     = f;
+        g_videoAudioFileOpen = true;
+    } else {
+        f.close();
+    }
+
     // 解析結果を保持してから鳴らす（#164）。周回時はこの状態だけで playRaw を呼び直せる＝SD に触らない。
     g_videoPcm        = reinterpret_cast<const int16_t*>(buf + info.data_offset);
     g_videoPcmSamples = info.data_bytes / 2;  // 16bit = 2byte/サンプル
     g_videoPcmRate    = info.sample_rate;
     g_videoPcmStereo  = (info.channels == 2);
+    // ステレオは L/R で 1 フレーム＝要素数を偶数に丸める。半端な 1 要素が残ると、Speaker の
+    // 出力タスクが最終フレームで配列の1つ外を読む（Speaker_Class.cpp の wav[length] 参照）。
+    if (g_videoPcmStereo) g_videoPcmSamples &= ~static_cast<size_t>(1);
 
     // 鳴らせなければ保持した状態ごと捨てる。バッファだけ free して g_videoPcm を残すと、
     // videoUpdate の周回再生が解放済みメモリを playRaw へ渡す（videoReleaseAudio で対にしてある）。
@@ -2224,10 +2353,12 @@ static bool videoLoadAudio() {
         videoReleaseAudio();
         return false;
     }
-    Serial.printf("[video] audio ok: %u samples @%uHz ch=%u\n",
+    Serial.printf("[video] audio ok(stream): %u samples @%uHz ch=%u loaded=%u/%u\n",
                   static_cast<unsigned>(g_videoPcmSamples),
                   static_cast<unsigned>(g_videoPcmRate),
-                  g_videoPcmStereo ? 2u : 1u);
+                  g_videoPcmStereo ? 2u : 1u,
+                  static_cast<unsigned>(g_videoAudioLoaded),
+                  static_cast<unsigned>(g_videoAudioTotal));
     return true;
 }
 
@@ -2423,57 +2554,6 @@ static bool videoDrawFrame(int idx) {
         }
     }
     return ok;
-}
-
-// LCD 転送のみを実測する（#176・再生開始時に1回）。drawJpg は「デコード＋LCD転送」の合計なので、
-// フルスクリーン Sprite を1枚 pushSprite する時間を測れば、そこから転送ぶんを引いてデコード時間を
-// 分離できる（draw_us − push = デコード）。合わせて LCD バスの実クロック（M5GFX が内部で決めるため
-// 自前コードには現れない値）も出す。仮説「LCD と SD が同一 SPI バスで転送時間が足し算」の検証材料。
-//
-// ⚠ フルスクリーン Sprite は #128 の「解放されず常駐」の当事者。ここでは必ず deleteSprite で即返す。
-// 前提: g_videoPack* が有効（videoOpenPack 済み）で、g_videoJpgBuf に読み込む余地がある状態で呼ぶ。
-static void videoBenchLcd() {
-    // 非パック方式（旧アセット）は内訳計時の対象外なので測らない（reviewer 指摘・#176）。150KB Sprite
-    // 確保と 30 回転送を無駄に走らせず、frame 0 の実絵も入らない（真っ黒）ので測る意味が無いため。
-    if (!(g_videoPackOpen && g_videoJpgBuf)) return;
-
-    // バス→クロック取得。getBus()->getClock() は Bus_SPI では freq_write（Hz）を返す。
-    const uint32_t clk = M5.Display.getPanel()->getBus()->getClock();
-
-    M5Canvas spr(&M5.Display);
-    spr.setPsram(true);      // フルスクリーンぶん(150KB)で内蔵RAMを圧迫しないよう PSRAM に置く（既存作法）
-    spr.setColorDepth(16);   // 実再生と同じ RGB565。転送バイト数を一致させる
-    if (!spr.createSprite(M5.Display.width(), M5.Display.height())) {
-        Serial.printf("[video] bench: sprite alloc failed (lcd clk=%uHz)\n",
-                      static_cast<unsigned>(clk));
-        return;
-    }
-
-    // 実画像を1枚入れておく（真っ黒でも DMA 転送量は同じだが、実絵のほうが代表性が高い）。frame 0 を
-    // pack から読み直して Sprite にデコードする。失敗しても転送は測れるので戻らない。デコード成否は
-    // img としてログに出す（真っ黒転送を実絵の代表値と誤読しないため・reviewer 指摘）。
-    // ⚠ この seek+read は g_videoPackFile の位置と g_videoJpgBuf を動かすが、後続の videoDrawFromPack は
-    //   毎フレーム必ず seek し直す（同関数の seek 参照）ので副作用は無い。
-    bool img_ok = false;
-    uint32_t off = 0, len = 0;
-    if (video_pack_entry(g_videoPackIndex, g_videoPackIndexLen, g_videoFrames,
-                         0, g_videoPackDataSize, &off, &len) &&
-        len <= g_videoJpgCap &&
-        g_videoPackFile.seek(g_videoPackIndexLen + off) &&
-        g_videoPackFile.read(g_videoJpgBuf, len) == static_cast<int>(len)) {
-        img_ok = spr.drawJpg(g_videoJpgBuf, len);
-    }
-
-    const int N = 30;  // 1回だと micros の量子化と初回 DMA 立ち上げが乗るので平均する
-    const uint32_t t0 = micros();
-    for (int i = 0; i < N; ++i) spr.pushSprite(&M5.Display, 0, 0);
-    const uint32_t t1 = micros();
-    spr.deleteSprite();  // #128 を踏まないよう即解放
-
-    Serial.printf("[video] bench: lcd clk=%uHz push=%uus/frame (%dx%d 16bit avg of %d img=%d)\n",
-                  static_cast<unsigned>(clk),
-                  static_cast<unsigned>((t1 - t0) / N),
-                  M5.Display.width(), M5.Display.height(), N, img_ok ? 1 : 0);
 }
 
 // 失敗時の共通表示（原因＋補足＋戻り方）。以降の処理は打ち切る。
@@ -2972,12 +3052,12 @@ static const char* videoStartPlayback() {
         return videoFailToSelect("フレームを表示できないのだ");
     }
 
-    // LCD 転送のみ＋実クロックを1回だけ実測する（#176）。音声ロード前に呼ぶのは、フルスクリーン
-    // Sprite(150KB) を確保する余地が PSRAM に一番ある瞬間だから（音声 7.5MB を載せた後だと逼迫する）。
-    videoBenchLcd();
+    // ※ ここにあった videoBenchLcd（#176 の LCD 転送実測・pushSprite 30 回 ≈1 秒）は #208 で
+    //    撤去した。#176/#191 で役目（30fps 可否の内訳分解）を終えており、再生開始ラグの
+    //    固定コストになっていた。必要になったら git 履歴（PR #180）から戻す。
 
-    // 音声はベストエフォート（#152）。無くても絵は再生するので戻り値は使わない。playRaw を
-    // 起点取り直しの直前に呼び、絵と音の時間軸をできるだけ揃える。
+    // 音声はベストエフォート（#152）。無くても絵は再生するので戻り値は使わない。先頭チャンク
+    // だけ同期で読んで鳴らし始め（#208）、起点取り直しの直前に呼ぶことで絵と音の時間軸を揃える。
     videoLoadAudio();
 
     // 経過時間の起点は「1枚目を出し＋音を鳴らし始めた今」に取り直す。冒頭で取ると SD マウント/
@@ -3076,6 +3156,66 @@ static uint32_t videoPaceLimitMs(uint32_t now) {
     return video_until_next_frame_ms(elapsed, g_videoFps);
 }
 
+// 音声の読み足しとキュー投入を1周回ぶん進める（#208）。再生中の毎周回、フレーム描画の後に呼ぶ。
+//   1) 次フレーム締切までの余り時間に収まる分だけ SD から読み足す（予算は純粋関数
+//      video_audio_read_budget。締切を食って #207 のコマ落ちを再発させないための制限）
+//   2) 読み込み済みの次チャンクを Speaker のキューへ入れる（videoAudioQueueNext）
+// SD 読みと LCD は同一 SPI バスだが、すべて loop タスク内で直列なので競合しない（#157）。
+static void videoAudioStep() {
+    if (g_videoAudioFileOpen && g_videoAudioLoaded < g_videoAudioTotal) {
+        // 締切は videoPaceLimitMs に一本化（フレーム締切の定義を2箇所に複製しない・#207 と同じ理由）。
+        const uint32_t until = videoPaceLimitMs(millis());
+        uint32_t budget = video_audio_read_budget(until, kVideoAudioReserveMs,
+                                                  kVideoAudioBytesPerMs,
+                                                  kVideoAudioMinSlice, kVideoAudioMaxSlice);
+        // 緊急経路（reviewer 指摘）: 実際に無音へ落ちた（=枯渇した）のに次チャンクの読みが
+        // 追いついていない時だけ、予算を無視して読む。高レート素材（44.1kHz stereo 等）や
+        // 巨大 fps で予算が恒常的に 0 になると「先頭チャンクだけ鳴って無音」に落ちるため。
+        // コマ落ちと無音なら無音の方が体験が悪い、という優先順位をここで決めている。
+        // 条件を ==0（無音になってから）に絞るのは、<=1（残り1本）だと再生開始直後に
+        // ほぼ必ず成立し、4秒の余裕があるのに締切無視の読みで曲の頭を再現性を持って
+        // コマ落ちさせるため（再検証の指摘）。無音の間はどうせ描画より音の復旧が先。
+        if (budget == 0 && M5.Speaker.isPlaying(kVideoAudioCh) == 0) {
+            size_t start = 0, count = 0;
+            if (video_audio_chunk_at(g_videoAudioNextChunk, g_videoPcmSamples,
+                                     kVideoAudioChunkSamples, &start, &count) &&
+                g_videoAudioLoaded < g_videoAudioDataOffset + (start + count) * 2) {
+                budget = kVideoAudioMaxSlice;
+                // コマ落ちの犯人がこの経路かどうかを実機ログで即断できるよう1行残す。
+                // ==0 の間は毎周回来るが、underrun ログ（1回だけ）と違い読みの実施記録なので
+                // 頻度もそのまま情報になる（読みは 64KB/周回で数回あれば復旧する）。
+                Serial.printf("[video] audio emergency read: chunk=%d loaded=%u/%u\n",
+                              g_videoAudioNextChunk,
+                              static_cast<unsigned>(g_videoAudioLoaded),
+                              static_cast<unsigned>(g_videoAudioTotal));
+            }
+        }
+        if (budget > 0) {
+            size_t want = g_videoAudioTotal - g_videoAudioLoaded;
+            if (want > budget) want = budget;
+            const size_t got = g_videoAudioFile.read(g_videoAudioBuf + g_videoAudioLoaded, want);
+            if (got > 0) {
+                g_videoAudioLoaded += got;
+            } else {
+                // 読み失敗＝ここで打ち切り（ベストエフォート・#152 の流儀）。読めたぶんの
+                // チャンクまでで音が止まり、絵の再生は続く。理由の1行は必ず残す（#166）。
+                Serial.printf("[video] audio stream: read failed at %u/%u\n",
+                              static_cast<unsigned>(g_videoAudioLoaded),
+                              static_cast<unsigned>(g_videoAudioTotal));
+                g_videoAudioFile.close();
+                g_videoAudioFileOpen = false;
+            }
+            if (g_videoAudioLoaded >= g_videoAudioTotal) {
+                g_videoAudioFile.close();
+                g_videoAudioFileOpen = false;
+                Serial.printf("[video] audio stream: complete %uB\n",
+                              static_cast<unsigned>(g_videoAudioTotal));
+            }
+        }
+    }
+    videoAudioQueueNext();
+}
+
 static void videoUpdate(uint32_t now) {
     // 選択中は背景の模様とディスクのカルーセルを毎フレーム合成する（#193/#199）。SD 無し・0件・
     // Sprite 確保失敗の時は UI が立っていない（g_videoDiscUiUp=false）ので静止画面のまま＝固まらない。
@@ -3091,13 +3231,29 @@ static void videoUpdate(uint32_t now) {
     // 音声が鳴り終わった瞬間を1回だけ捉え、実測と公称を比べる（#169）。
     // 差がそのまま「I2S の時計が millis に対してどれだけ速い/遅いか」になる。
     // 早期 return より前に置く。フレーム番号が変わらない周回では下まで到達しないため。
+    //
+    // チャンク化（#208）で「無音」には2種類できた: 全チャンク投入済みなら真の終端、未投入の
+    // チャンクが残っているなら枯渇（アンダーラン）。区別しないと、枯渇が「音声が早く終わった」
+    // という嘘の end ログに化け、真の終端は観測できなくなる（reviewer 指摘）。枯渇はラッチを
+    // 落とさない＝この後の videoAudioStep が次チャンクを投入すれば音は再開する。
     if (g_videoAudioWasPlaying && !M5.Speaker.isPlaying()) {
-        const uint32_t actual = millis() - g_videoAudioStartMs;
-        Serial.printf("[video] audio end: actual=%ums nominal=%ums diff=%+dms\n",
-                      static_cast<unsigned>(actual),
-                      static_cast<unsigned>(g_videoAudioNominalMs),
-                      static_cast<int>(actual) - static_cast<int>(g_videoAudioNominalMs));
-        g_videoAudioWasPlaying = false;
+        const int chunks = video_audio_chunk_count(g_videoPcmSamples, kVideoAudioChunkSamples);
+        if (g_videoAudioNextChunk < chunks) {
+            if (!g_videoAudioUnderrun) {  // 枯渇エピソードごとに1回だけ（毎ループ吐かない）
+                g_videoAudioUnderrun = true;
+                Serial.printf("[video] audio underrun: chunk=%d/%d loaded=%u/%u\n",
+                              g_videoAudioNextChunk, chunks,
+                              static_cast<unsigned>(g_videoAudioLoaded),
+                              static_cast<unsigned>(g_videoAudioTotal));
+            }
+        } else {
+            const uint32_t actual = millis() - g_videoAudioStartMs;
+            Serial.printf("[video] audio end: actual=%ums nominal=%ums diff=%+dms\n",
+                          static_cast<unsigned>(actual),
+                          static_cast<unsigned>(g_videoAudioNominalMs),
+                          static_cast<int>(actual) - static_cast<int>(g_videoAudioNominalMs));
+            g_videoAudioWasPlaying = false;
+        }
     }
 
     // 実時刻基準でフレーム番号を出す（純粋ロジック video_frame_at）。SD 読み＋デコードが
@@ -3119,13 +3275,18 @@ static void videoUpdate(uint32_t now) {
         return;
     }
 
-    if (idx == g_videoLastIdx) return;  // 同じ番号なら描かない（ちらつき/SD負荷回避・既存の作法）
+    if (idx != g_videoLastIdx) {
+        // 欠け/破損フレームでもこの番号は「消化済み」にする。更新しないと、恒常的に欠けた
+        // 番号の時間窓（最大 1/fps 秒）ずっと毎ループ SD を叩き続けるため。同番号スキップの
+        // 作法と一貫させ、次の番号まで SD に触れない。
+        videoDrawFrame(idx);
+        g_videoLastIdx = idx;
+    }
 
-    // 欠け/破損フレームでもこの番号は「消化済み」にする。更新せず return すると、恒常的に欠けた
-    // 番号の時間窓（最大 1/fps 秒）ずっと毎ループ SD を叩き続けるため。同番号スキップの作法と
-    // 一貫させ、次の番号まで SD に触れない。
-    videoDrawFrame(idx);
-    g_videoLastIdx = idx;
+    // 音声の読み足しとキュー投入（#208）。フレームを描いた「後」の残り時間で行う。描く前に
+    // 読むと、その読みがフレーム締切を食って本末転倒になる（予算計算は読み始める時点の
+    // 残り時間で行うので、描いた直後がいちばん正確に余りを使える）。
+    videoAudioStep();
 }
 
 static void videoOnTap(uint32_t /*now*/, int /*touchX*/) {
