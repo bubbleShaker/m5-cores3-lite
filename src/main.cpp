@@ -34,6 +34,7 @@
 #include "pacman.h"   // Tile/Dir/Pos / pac_tile_at / pac_can_move / pac_step（パックマン迷路・純粋ロジック・#134）
 #include "video.h"    // video_frame_at（動画フレーム時刻・純粋ロジック・#142）
 #include "meta.h"     // meta_get_int（動画 manifest の key=value 取り出し・純粋ロジック・#148）
+#include "fractal.h"  // fractal_value / fractal_shade（曲選択背景の動く幾何学模様・純粋ロジック・#199）
 #include "video_list.h"  // video_name_valid / VideoList 等（動画選択の純粋ロジック・#175）
 #include "sd_pins.h"  // kSdCsPin 等（microSD の SPI ピン・転送専用ファームと共有・#157）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
@@ -2515,36 +2516,44 @@ static void videoEnumerate() {
 // 再生中の長押しはこの選択画面へ1段戻る（videoOnLongPress・#198）。
 
 static constexpr int kDiscSize    = 132;  // ディスク Sprite の一辺（=CD の直径）
-static constexpr int kDiscCanvasS = 160;  // 合成キャンバスの一辺（浮遊 ±5px と回転の余白ぶん大きく）
-static constexpr int kDiscCanvasX = (kScreenW - kDiscCanvasS) / 2;  // 画面中央（x=80）
-static constexpr int kDiscCanvasY = 30;   // ヘッダ(y=4..20)の下、曲名(y=196)の上に収める
+static constexpr int kDiscAreaS   = 160;  // ディスクの可動域の一辺（浮遊 ±5px と回転の余白ぶん大きく）
+static constexpr int kDiscAreaY   = 30;   // ヘッダ(y=4..20)の下、曲名(y=196)の上に収める
 // 回転合成時の透明色（円の外＝ディスクの背景を抜く）。純マゼンタが JPEG 由来の絵に現れる
 // 確率は実用上無視できる（現れても 1px 単位で背景色に抜けるだけで表示は割れない）。
 static constexpr uint16_t kDiscTransp = 0xF81F;
 
-// ディスク Sprite（円形マスク済みサムネイル）と合成用キャンバス。どちらも選択画面にいる間
-// だけ確保する PSRAM Sprite（132²+160² の 16bit で計約 86KB）。再生開始・退場で必ず
+// ディスク Sprite（円形マスク済みサムネイル）とフルスクリーン合成キャンバス。どちらも選択画面に
+// いる間だけ確保する PSRAM Sprite（132² + 320×240 の 16bit で計約 185KB）。再生開始・退場で必ず
 // deleteSprite する。音声 7MB 級の確保（videoLoadAudio）の前に返し、常駐もさせない
 // （#128「フルスクリーン Sprite が解放されず常駐」の轍を踏まない）。
+// キャンバスが 160² → 全画面になったのは #199: 背景全体が毎フレーム動く模様になったため、
+// 「模様→文字→回転ディスク」を1枚に合成して一括 push する（ちらつき防止の既存作法のまま）。
 static M5Canvas g_videoDiscSpr(&M5.Display);
-static M5Canvas g_videoDiscCanvas(&M5.Display);
+static M5Canvas g_videoSelCanvas(&M5.Display);
 static bool     g_videoDiscUiUp   = false;  // 2枚とも確保できたか（false なら文字だけの退避表示）
-static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊アニメの時刻起点（シーン入場時に1回）
+static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊・模様アニメの時刻起点（シーン入場時に1回）
 
-// ── サムネイル連動の背景グラデーション（#195） ──
-// 黒一色の代わりに、選択中サムネイルの平均色から作った縦グラデーション
-// （上=控えめな明トーン → 下=ほぼ黒）を敷く。色の算術は純粋関数
-// video_bg_tone / video_bg_lerp（video.h・native テスト済み）で、ここは表示だけを持つ。
-//
-// 行ごとの RGB565 は曲送り時に一度だけこのテーブルへ焼き、毎フレームのキャンバス背景も
-// 静的画面の描画も同じテーブルから塗る。毎フレーム lerp と color565 を 160 行ぶん計算
-// し直さないためと、画面とキャンバスで同じ y が必ず同じ色になる（継ぎ目が出ない）ため。
+// ── サムネイル連動の背景（#195 グラデーション → #199 動く模様） ──
+// 通常経路の背景は XOR フラクタル模様（fractal.h・下の g_videoFractalLut）に置き換えた。
+// この行テーブルは静的フォールバック（SD 無し・0件・Sprite 確保失敗）の縦グラデーション
+// 専用に残す。色の算術は純粋関数 video_bg_tone / video_bg_lerp（native テスト済み）。
 static uint16_t g_videoBgRows[kScreenH];
-// キャンバス行→画面行の対応（videoDiscAnimate の kDiscCanvasY + y）がテーブルの外を読まない
-// ことをコンパイル時に固める（reviewer 指摘）。ディスクの寸法・位置を変える改修が入った時、
-// コメントの約束ではなくビルドが破綻を教える（g_videoDir の static_assert と同じ作法）。
-static_assert(kDiscCanvasY + kDiscCanvasS <= kScreenH,
-              "disc canvas must fit in the bg row table");
+// ディスクの可動域が画面内に収まることをコンパイル時に固める（寸法・位置を変える改修が
+// 入った時、コメントの約束ではなくビルドが破綻を教える。g_videoDir の static_assert と同じ作法）。
+static_assert(kDiscAreaY + kDiscAreaS <= kScreenH,
+              "disc area must fit on screen");
+
+// ── 動く模様のパレット LUT（#199） ──
+// fractal_value の強度 0..255 → RGB565 の 256 段テーブル。曲送り時（videoFractalBuildLut）に
+// 一度だけ焼き、毎フレームは引くだけにする（76,800 画素 × 毎フレームの色計算をしないため）。
+// 色はサムネイル平均色のトーン（#195 の資産 video_bg_tone を再利用）を暗→明に段階づける。
+static uint16_t g_videoFractalLut[256];
+// トーンの明るさ上限。文字（白）とディスクが背景に埋もれない「柄は分かるが主役より暗い」水準。
+static constexpr uint8_t kVideoFractalMax = 120;
+// 選択画面に出す失敗理由（再生に入れなかった時・#175）。毎フレーム合成し直すためコピーで
+// 保持する（ポインタ保持だと、将来 snprintf した局所バッファを渡した瞬間に「毎フレーム
+// 解放済みスタックを読む」発見しにくい壊れ方をする・reviewer 指摘）。空文字列＝エラー無し。
+static char g_videoSelErr[48] = "";
 // サムネイルが無い/読めない時の基準色（落ち着いたスレートブルー）。トーンは
 // video_bg_tone が揃えるので、ここは色味だけの指定でよい。
 static constexpr uint32_t kVideoBgDefaultAvg = 0x3C5068;
@@ -2555,6 +2564,8 @@ static constexpr uint8_t kVideoBgBottomMax = 14;
 
 // 平均色 avg（0xRRGGBB）から全行の色テーブルを作る。avg が真っ黒（トーンが作れない）なら
 // 既定色に差し替える（黒背景に戻さない＝「必ず何かしらの色味が付く」保証をここに閉じる）。
+// #199 以降の呼び出し元は videoEnter の既定色1箇所のみ（静的フォールバック専用。
+// サムネイル連動の役目は videoFractalBuildLut に移った）。
 static void videoBgBuild(uint32_t avg) {
     uint32_t top = video_bg_tone(avg, kVideoBgTopMax);
     if (top == 0) {
@@ -2565,6 +2576,19 @@ static void videoBgBuild(uint32_t avg) {
     for (int y = 0; y < kScreenH; ++y) {
         const uint32_t c = video_bg_lerp(top, bottom, y, kScreenH);
         g_videoBgRows[y] = M5.Display.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+    }
+}
+
+// 平均色 avg から模様パレット（256 段 RGB565）を焼く（#199）。avg が真っ黒（トーンが作れない）
+// なら既定色に差し替える（videoBgBuild と同じ「必ず色味が付く」保証）。強度には fractal_gamma
+// （v²/255・native テスト済み）をかけて暗部を締める（線形だと中間調が支配的になり、模様の
+// 輪郭がぼやけて安っぽくなる）。
+static void videoFractalBuildLut(uint32_t avg) {
+    uint32_t tone = video_bg_tone(avg, kVideoFractalMax);
+    if (tone == 0) tone = video_bg_tone(kVideoBgDefaultAvg, kVideoFractalMax);
+    for (int i = 0; i < 256; ++i) {
+        const uint32_t c = fractal_shade(tone, fractal_gamma(static_cast<uint8_t>(i)));
+        g_videoFractalLut[i] = M5.Display.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
     }
 }
 
@@ -2596,7 +2620,7 @@ static uint32_t videoDiscSampleAvg() {
 static void videoDiscUiRelease() {
     // deleteSprite は未確保でも安全な no-op。確保と解放を必ず対にする（videoReleasePack と同じ作法）。
     g_videoDiscSpr.deleteSprite();
-    g_videoDiscCanvas.deleteSprite();
+    g_videoSelCanvas.deleteSprite();
     g_videoDiscUiUp = false;
 }
 
@@ -2604,15 +2628,22 @@ static bool videoDiscUiCreate() {
     if (g_videoDiscUiUp) return true;
     g_videoDiscSpr.setPsram(true);      // 内蔵 RAM を圧迫しない（既存キャンバス群と同じ作法）
     g_videoDiscSpr.setColorDepth(16);
-    g_videoDiscCanvas.setPsram(true);
-    g_videoDiscCanvas.setColorDepth(16);
+    g_videoSelCanvas.setPsram(true);
+    g_videoSelCanvas.setColorDepth(16);
     if (g_videoDiscSpr.createSprite(kDiscSize, kDiscSize) &&
-        g_videoDiscCanvas.createSprite(kDiscCanvasS, kDiscCanvasS)) {
+        g_videoSelCanvas.createSprite(kScreenW, kScreenH)) {
+        // 模様の行データは color565 のネイティブ 565 値なので送り込み時のバイト入替は不要。
+        // 既定値のままだが、pokePushSprite（#80）で嵌った箇所なので明示しておく。
+        g_videoSelCanvas.setSwapBytes(false);
         g_videoDiscUiUp = true;
         return true;
     }
     videoDiscUiRelease();  // 片方だけ確保成功のまま残さない
-    Serial.println("[video] disc ui: sprite alloc failed");
+    // 確保量が全画面化で約 34KB→188KB になった（#199）ので、失敗時は空きと最大連続ブロックを
+    // 添える（断片化なのか総量不足なのかを一発で切り分ける・videoLoadAudio の診断と同じ流儀）。
+    Serial.printf("[video] disc ui: sprite alloc failed (psram free=%u largest=%u)\n",
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
     return false;
 }
 
@@ -2735,40 +2766,73 @@ static void videoDiscPrepare() {
     g_videoDiscSpr.fillSprite(TFT_BLACK);  // 前の曲の絵を残さない
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
     if (name != nullptr && videoThumbInto(g_videoDiscSpr, name)) {
-        // マスク前（＝透明色や穴が混ざる前）に平均色を採り、背景をこの曲の色味にする（#195）
-        videoBgBuild(videoDiscSampleAvg());
+        // マスク前（＝透明色や穴が混ざる前）に平均色を採り、模様をこの曲の色味にする（#195→#199）
+        videoFractalBuildLut(videoDiscSampleAvg());
     } else {
         // videoThumbInto は全経路が無言の false（meta 無し・索引不整合・巨大 JPEG・デコード失敗…）
         // なので、ここで1行だけ残す。「なぜ無地ディスクなのか」の唯一の手掛かり（reviewer 指摘。
         // 無音の失敗にログを添える作法は videoLoadAudio と同じ）。
         Serial.printf("[video] thumb: fallback name=%s\n", name ? name : "(null)");
         videoDiscDrawFallback();
-        videoBgBuild(kVideoBgDefaultAvg);  // 無地ディスクの時は既定の色味（#195）
+        videoFractalBuildLut(kVideoBgDefaultAvg);  // 無地ディスクの時は既定の色味（#195 と同じ扱い）
     }
     videoDiscApplyMask();
 }
 
-// 選択画面の静的部分（ヘッダ・曲名・件数・操作ヒント・エラー）を1枚描く（#175 → #193 で刷新）。
-// ディスク本体は videoUpdate が毎フレーム合成する（kDiscCanvas の矩形内だけが動き、文字と重ならない）。
-// err を渡すと画面下部に赤字で理由を出す（選んだ曲が壊れていて再生に入れず戻した時・#175 設計メモ）。
+// 選択画面のテキスト（曲名・件数・左右矢印・エラー）を dst へ透明背景で重ねる（#199 で共通化）。
+// 通常経路は毎フレームの合成キャンバスへ、静的フォールバックは Display へ、同じ見た目で描くため
+// 共通基底 lgfx::LovyanGFX を受ける。フォントは呼び出しの間だけ日本語に切り替え、既定へ戻す。
+// 文字は背景色を指定せず透明で載せる（#195）。模様の上に矩形の地色を出さないため。
+// ヘッダの説明文は置かない（#195・実機確認のフィードバック。操作は < > と実際の
+// 触り心地で伝わるので、文で説明しない）。
+static void videoDrawSelectOverlay(lgfx::LovyanGFX& g, const char* err) {
+    g.setFont(&fonts::lgfxJapanGothic_16);
+
+    // 曲名（中央揃え・ディスクの下）と「何曲目/全何曲」（右上）
+    const char* name = video_list_name_at(&g_videoList, g_videoSel);
+    if (name) {
+        g.setTextDatum(textdatum_t::top_center);
+        g.setTextColor(TFT_WHITE);
+        g.drawString(name, kScreenW / 2, 196);
+    }
+    char pos[16];
+    snprintf(pos, sizeof(pos), "%d/%d", g_videoSel + 1, g_videoList.count);
+    g.setTextDatum(textdatum_t::top_right);
+    g.setTextColor(TFT_LIGHTGREY);
+    g.drawString(pos, kScreenW - 6, 4);
+
+    // 左右にスワイプできることの手掛かり（ディスクの両脇）。色は暗黙に引き継がず明示する
+    // （reviewer 指摘: ブロックの並べ替えで黙って変わらないように）。
+    g.setTextColor(TFT_LIGHTGREY);
+    g.setTextDatum(textdatum_t::middle_left);
+    g.drawString("<", 8, kDiscAreaY + kDiscAreaS / 2);
+    g.setTextDatum(textdatum_t::middle_right);
+    g.drawString(">", kScreenW - 8, kDiscAreaY + kDiscAreaS / 2);
+    g.setTextDatum(textdatum_t::top_left);
+
+    if (err) {
+        g.setTextColor(TFT_RED);
+        g.drawString(err, 8, 220);  // 曲名(y=196..212)の下・kScreenH=240 に収まる
+    }
+    g.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
+}
+
+// 静的フォールバックの1枚描き（0件・キャンバス確保失敗のとき）。通常経路は #199 で毎フレーム
+// 合成（videoSelectCompose）に移行したので、ここは「動かないが必ず出せる」最後の砦。
+// 背景は既定色の縦グラデーション行テーブル（#195 の資産・videoEnter が必ず作る）。
+// startWrite で囲んで 240 本の fillRect を 1 つの SPI トランザクションにまとめる（reviewer 指摘。
+// 囲まないと 1 本ごとに begin/end transaction と setWindow が乗る。同一 loop タスク内なので
+// #157 のバス共有の制約には抵触しない）。
 static void videoRenderSelect(const char* err = nullptr) {
-    // 背景はサムネイル連動の縦グラデーション（#195）。行テーブルは videoDiscPrepare（または
-    // videoEnter の既定値）で作成済み。startWrite で囲んで 240 本の fillRect を 1 つの SPI
-    // トランザクションにまとめる（reviewer 指摘。囲まないと 1 本ごとに begin/end transaction と
-    // setWindow が乗る。同一 loop タスク内なので #157 のバス共有の制約には抵触しない）。
     M5.Display.startWrite();
     for (int y = 0; y < kScreenH; ++y) {
         M5.Display.fillRect(0, y, kScreenW, 1, g_videoBgRows[y]);
     }
     M5.Display.endWrite();
-    M5.Display.setFont(&fonts::lgfxJapanGothic_16);
-    M5.Display.setTextDatum(textdatum_t::top_left);
-    // 文字は背景色を指定せず透明で載せる（#195）。グラデーションの上に矩形の地色が
-    // 出ないようにするため。この画面は毎回全面を描き直すので、透明描画でも残像は出ない。
-    // ヘッダの説明文は置かない（#195・実機確認のフィードバック。操作は < > と実際の
-    // 触り心地で伝わるので、文で説明しない）。
 
     if (g_videoList.count == 0) {
+        M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+        M5.Display.setTextDatum(textdatum_t::top_left);
         M5.Display.setTextColor(TFT_WHITE);
         M5.Display.drawString("/video/ に動画が無いのだ", 8, 44);
         M5.Display.drawString("PCで変換してSDへ入れてね", 8, 68);
@@ -2776,72 +2840,79 @@ static void videoRenderSelect(const char* err = nullptr) {
         M5.Display.setFont(&fonts::Font0);
         return;
     }
-
-    // 曲名（中央揃え・ディスクの下）と「何曲目/全何曲」（右上）
-    const char* name = video_list_name_at(&g_videoList, g_videoSel);
-    if (name) {
-        M5.Display.setTextDatum(textdatum_t::top_center);
-        M5.Display.setTextColor(TFT_WHITE);
-        M5.Display.drawString(name, kScreenW / 2, 196);
-    }
-    char pos[16];
-    snprintf(pos, sizeof(pos), "%d/%d", g_videoSel + 1, g_videoList.count);
-    M5.Display.setTextDatum(textdatum_t::top_right);
-    M5.Display.setTextColor(TFT_LIGHTGREY);
-    M5.Display.drawString(pos, kScreenW - 6, 4);
-
-    // 左右にスワイプできることの手掛かり（ディスクの両脇）。色は暗黙に引き継がず明示する
-    // （reviewer 指摘: ブロックの並べ替えで黙って変わらないように）。
-    M5.Display.setTextColor(TFT_LIGHTGREY);
-    M5.Display.setTextDatum(textdatum_t::middle_left);
-    M5.Display.drawString("<", 8, kDiscCanvasY + kDiscCanvasS / 2);
-    M5.Display.setTextDatum(textdatum_t::middle_right);
-    M5.Display.drawString(">", kScreenW - 8, kDiscCanvasY + kDiscCanvasS / 2);
-    M5.Display.setTextDatum(textdatum_t::top_left);
-
-    if (err) {
-        M5.Display.setTextColor(TFT_RED);
-        M5.Display.drawString(err, 8, 220);  // 曲名(y=196..212)の下・kScreenH=240 に収まる
-    }
-    M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
+    videoDrawSelectOverlay(M5.Display, err);
 }
 
-// ディスクを1コマ合成する（#193）。ゆっくり回転（20秒/周）＋sin の上下浮遊（±5px・2.6秒周期）。
-// キャンバスへ「背景→回転描画」してから一括 push することで、前コマの軌跡消しと
-// ちらつき防止を同時に済ませる（既存キャンバス群と同じダブルバッファの作法）。
-static void videoDiscAnimate(uint32_t now) {
+// 選択画面を1コマ合成する（#193 回転ディスク → #199 全画面の動く模様）。
+// フルスクリーンキャンバスへ「模様（LUT引き）→ 文字 → 回転ディスク」の順に重ね、一括 push で
+// ちらつきなく出す（前コマの軌跡消しも兼ねる・既存キャンバス群と同じダブルバッファの作法）。
+// ディスクはゆっくり回転（20秒/周）＋sin の上下浮遊（±5px・2.6秒周期）で #193 のまま。
+static void videoSelectCompose(uint32_t now) {
+    // 起点より前の now では何もしない（videoUpdate の再生側ガードと同じ・#175 reviewer 指摘の型）。
+    // 曲送りのタップ処理内で起点が now より後に取り直されることがあり、uint32 の引き算が
+    // アンダーフローすると1コマだけデタラメな角度・位相で描いてしまう。
+    if (static_cast<int32_t>(now - g_videoDiscAnimMs) < 0) return;
     const uint32_t t     = now - g_videoDiscAnimMs;
     const float    angle = static_cast<float>(t % 20000u) * (360.0f / 20000.0f);
     // 浮遊側も角度と同様に周期で剰余を取ってから float 化する（reviewer 指摘）。生の t を
     // float に入れると仮数 24bit を超える約4.6時間で ms の分解能が落ち、浮遊がガタつく。
     const float    dy    = 5.0f * sinf(static_cast<float>(t % 2600u) * (6.2831853f / 2600.0f));
     const uint32_t t0    = micros();
-    // 背景は画面と同じ行テーブルから塗る（#195）。キャンバスは画面の y=kDiscCanvasY から
-    // 貼られるので、その行に対応する色を使えば静的背景と継ぎ目なく繋がる。
-    for (int y = 0; y < kDiscCanvasS; ++y) {
-        g_videoDiscCanvas.fillRect(0, y, kDiscCanvasS, 1, g_videoBgRows[kDiscCanvasY + y]);
+    // 模様: フレーム不変量（ドリフト・位相）は1コマ1回だけ求め（reviewer 指摘・毎画素の除算
+    // 3回を 76,800 回繰り返さない）、1行ずつ計算して流し込む。行バッファは内蔵 RAM（640B）に
+    // 置き、pushImage でキャンバス(PSRAM)へ行単位の連続コピーにする（writePixel を 76,800 回
+    // 呼ぶ関数コストと、PSRAM への点書きを避ける）。
+    int dx0 = 0, dy0 = 0;
+    uint32_t phase = 0;
+    fractal_offsets(t, &dx0, &dy0, &phase);
+    static uint16_t row[kScreenW];
+    for (int y = 0; y < kScreenH; ++y) {
+        const int ry = y + dy0;
+        for (int x = 0; x < kScreenW; ++x) {
+            row[x] = g_videoFractalLut[fractal_at(x + dx0, ry, phase)];
+        }
+        g_videoSelCanvas.pushImage(0, y, kScreenW, 1, row);
     }
+    const uint32_t t1 = micros();  // 模様まで
+    videoDrawSelectOverlay(g_videoSelCanvas, g_videoSelErr[0] ? g_videoSelErr : nullptr);
+    const uint32_t t2 = micros();  // 文字まで
     // pushRotateZoom は Sprite の中心（既定ピボット）を dst 座標に合わせて回転描画する。
-    // 透明色 kDiscTransp を抜くので、円の外とセンターホールは背景が残る。
-    g_videoDiscSpr.pushRotateZoom(&g_videoDiscCanvas,
-                                  kDiscCanvasS * 0.5f, kDiscCanvasS * 0.5f + dy,
+    // 透明色 kDiscTransp を抜くので、円の外とセンターホールは模様が残る。
+    g_videoDiscSpr.pushRotateZoom(&g_videoSelCanvas,
+                                  kScreenW * 0.5f, kDiscAreaY + kDiscAreaS * 0.5f + dy,
                                   angle, 1.0f, 1.0f, kDiscTransp);
-    g_videoDiscCanvas.pushSprite(&M5.Display, kDiscCanvasX, kDiscCanvasY);
-    // 1コマの合成コストを間引きで実測ログに出す（reviewer 指摘・#176 の計装と同じ流儀）。
-    // PSRAM 上の Sprite 同士の回転合成は速さの直感が効かないので、体感より先に数字を残す。
-    // 30fps 相当で約5秒に1回。うるさくならず、選択画面に入れば必ず数点は採れる。
+    const uint32_t t3 = micros();  // ディスク合成まで
+    g_videoSelCanvas.pushSprite(&M5.Display, 0, 0);
+    // 1コマの合成コストを間引き＋内訳付きで実測ログに出す（reviewer 指摘・#176 で「分解した
+    // 計装が削る場所の判断を可能にした」のと同じ流儀。合計だけだと 34ms 級の全画面転送が
+    // 支配的なのか模様計算が重いのか切り分けられない）。150 コマに1回。
     static uint32_t s_frameCount = 0;
     if ((++s_frameCount % 150u) == 0) {
-        Serial.printf("[video] disc frame=%uus\n", static_cast<unsigned>(micros() - t0));
+        const uint32_t t4 = micros();
+        Serial.printf("[video] select frame=%uus pat=%u txt=%u disc=%u push=%u\n",
+                      static_cast<unsigned>(t4 - t0),
+                      static_cast<unsigned>(t1 - t0), static_cast<unsigned>(t2 - t1),
+                      static_cast<unsigned>(t3 - t2), static_cast<unsigned>(t4 - t3));
     }
 }
 
-// 選択画面を（再）表示する入口。ディスク UI の確保→サムネイル読み→静的部の描画までを1箇所に
-// 閉じる。入場時・曲送り時・再生失敗で戻された時のすべてがここを通る。Sprite が確保できない時は
-// g_videoDiscUiUp=false のまま＝文字（曲名・件数）だけで選べる退避表示になる（固まらせない）。
+// 選択画面を（再）表示する入口。ディスク UI の確保→サムネイル読み＋パレット焼き→1コマ目の
+// 合成までを1箇所に閉じる。入場時・曲送り時・再生失敗で戻された時のすべてがここを通る。
+// Sprite が確保できない時は g_videoDiscUiUp=false のまま＝静的な退避表示になる（固まらせない）。
 static void videoShowSelect(const char* err = nullptr) {
-    if (g_videoList.count > 0 && videoDiscUiCreate()) videoDiscPrepare();
-    videoRenderSelect(err);
+    // コピーで保持（宣言部コメント参照）。err 無しの再表示で自然に消える。
+    if (err) {
+        strncpy(g_videoSelErr, err, sizeof(g_videoSelErr) - 1);
+        g_videoSelErr[sizeof(g_videoSelErr) - 1] = '\0';
+    } else {
+        g_videoSelErr[0] = '\0';
+    }
+    if (g_videoList.count > 0 && videoDiscUiCreate()) {
+        videoDiscPrepare();
+        videoSelectCompose(millis());  // 次の loop を待たず1コマ目を出す（前画面の残像を見せない）
+    } else {
+        videoRenderSelect(err);
+    }
 }
 
 // 再生開始に失敗した時の後始末（#175・reviewer 指摘）。確保済み資源を対称に解放し、状態を
@@ -2972,10 +3043,10 @@ static void videoRestartCycle() {
 }
 
 static void videoUpdate(uint32_t now) {
-    // 選択中はディスクのカルーセルを回す（#193）。SD 無し・0件・Sprite 確保失敗の時は
-    // UI が立っていない（g_videoDiscUiUp=false）ので静止画面のまま＝従来どおり固まらない。
+    // 選択中は背景の模様とディスクのカルーセルを毎フレーム合成する（#193/#199）。SD 無し・0件・
+    // Sprite 確保失敗の時は UI が立っていない（g_videoDiscUiUp=false）ので静止画面のまま＝固まらない。
     if (g_videoPhase == VideoPhase::kSelecting) {
-        if (g_videoDiscUiUp && g_videoList.count > 0) videoDiscAnimate(now);
+        if (g_videoDiscUiUp && g_videoList.count > 0) videoSelectCompose(now);
         return;
     }
 
@@ -3193,6 +3264,15 @@ void setup() {
     menuEnter();  // 起動時はまずメニュー画面（シーン選択のハブ・#132）
 }
 
+// 1コマの「残り時間」だけ寝て約 30fps に整える（#199 reviewer 指摘）。固定 delay(33) だと
+// 重いコマ（曲選択の全画面合成 ≈50ms）の後にさらに 33ms 上乗せで寝てしまい、M5.update() の
+// タッチサンプリング間隔が 80ms 超に開いて素早いタップ・スワイプを取りこぼす。
+// 33ms 未満で終わる軽いコマ（他の全シーン）では従来の delay(33) と同じ周期になる。
+static void framePace(uint32_t frameStartMs) {
+    const uint32_t spent = millis() - frameStartMs;
+    if (spent < 33u) delay(33u - spent);
+}
+
 void loop() {
     M5.update();
     const uint32_t now = millis();
@@ -3225,7 +3305,7 @@ void loop() {
             if (next != g_menuSel) { g_menuSel = next; g_menuDirty = true; }
         }
         if (g_menuDirty) { menuRender(); g_menuDirty = false; }  // 変化時だけ描き直す
-        delay(33);
+        framePace(now);
         return;
     }
 
@@ -3234,7 +3314,7 @@ void loop() {
         // シーンが長押しを消費するか先に問い合わせる（#198・動画の「再生→曲選択へ1段戻る」）。
         // 消費された時は音声停止・資源解放もシーン側で済んでいるので、ここでは何もしない。
         if (kScenes[g_sceneIdx].onLongPress && kScenes[g_sceneIdx].onLongPress(now)) {
-            delay(33);
+            framePace(now);
             return;
         }
         // 長押し → メニューへ戻る（ローテーション巡回は廃止・#132）。
@@ -3244,7 +3324,7 @@ void loop() {
         if (kScenes[g_sceneIdx].exit) kScenes[g_sceneIdx].exit();
         g_inMenu = true;
         menuEnter();
-        delay(33);
+        framePace(now);
         return;
     } else if (ev == TouchEvent::Tap) {
         // 短タップ → 現シーンの反応に委譲（羊のメェ／アート再生成／音量増減など）。
@@ -3259,5 +3339,5 @@ void loop() {
     }
 
     kScenes[g_sceneIdx].update(now);  // 毎フレーム描画
-    delay(33);  // 約30fps
+    framePace(now);  // 約30fps（重いコマは残り時間ぶんだけ・#199）
 }
