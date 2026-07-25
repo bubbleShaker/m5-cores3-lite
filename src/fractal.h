@@ -27,12 +27,8 @@ uint8_t fractal_at(int dx, int dy, uint32_t phase);
 // （1点だけ欲しい時・テスト用の入口。全画面を回す表示側は分割版を使う）。
 uint8_t fractal_value(int x, int y, uint32_t t_ms);
 
-// 強度 v (0..255) でトーン色 tone (0xRRGGBB) を暗→明に段階づける。
-//   v=0 は黒、v=255 は tone そのもの。各成分は独立に線形スケール（単調・tone を超えない）。
-//   tone の 24bit を超えるビットは無視する（video_bg_tone と同じ契約）。
-//   256 段のパレット LUT を焼く時に使う（表示側は RGB565 化して毎フレーム引くだけ）。
-uint32_t fractal_shade(uint32_t tone, uint8_t v);
-
 // 強度のガンマ補正 v²/255（0..255 → 0..255・単調・両端固定）。線形のままだと中間調が
 // 支配的になり模様の輪郭がぼやけるため、パレットを焼く時に暗部を締める用途で使う。
+// （#203 で背景を白黒に統一し、トーン着色 fractal_shade は用済みになったため削除した。
+//   グレー化は表示側が kVideoFractalMax * v / 255 の1成分スケールで行う。）
 uint8_t fractal_gamma(uint8_t v);

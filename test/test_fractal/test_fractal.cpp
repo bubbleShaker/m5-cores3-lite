@@ -100,45 +100,8 @@ void test_split_matches_combined() {
     }
 }
 
-// --- fractal_shade ---
-
-// 両端: v=0 は黒、v=255 はトーン色そのもの
-void test_shade_endpoints() {
-    TEST_ASSERT_EQUAL_UINT32(0u, fractal_shade(0x80C0FF, 0));
-    TEST_ASSERT_EQUAL_UINT32(0x80C0FFu, fractal_shade(0x80C0FF, 255));
-}
-
-// 各成分は v について単調非減少（明るさの段階が逆転しない）
-void test_shade_monotonic_per_channel() {
-    const uint32_t tone = 0x60A0E0;
-    uint32_t prev = 0;
-    for (int v = 0; v <= 255; ++v) {
-        const uint32_t c = fractal_shade(tone, static_cast<uint8_t>(v));
-        TEST_ASSERT_TRUE(((c >> 16) & 0xFF) >= ((prev >> 16) & 0xFF));
-        TEST_ASSERT_TRUE(((c >> 8) & 0xFF) >= ((prev >> 8) & 0xFF));
-        TEST_ASSERT_TRUE((c & 0xFF) >= (prev & 0xFF));
-        prev = c;
-    }
-}
-
-// tone の 24bit を超えるビットは無視される（video_bg_tone と同じ契約）
-void test_shade_masks_high_bits() {
-    TEST_ASSERT_EQUAL_UINT32(fractal_shade(0x00123456u, 200),
-                             fractal_shade(0xFF123456u, 200));
-}
-
-// 出力の各成分は入力トーンを超えない（v<255 で必ず暗くなる方向）
-void test_shade_never_exceeds_tone() {
-    const uint32_t tone = 0x40FF80;
-    for (int v = 0; v <= 255; v += 5) {
-        const uint32_t c = fractal_shade(tone, static_cast<uint8_t>(v));
-        TEST_ASSERT_TRUE(((c >> 16) & 0xFF) <= 0x40u);
-        TEST_ASSERT_TRUE(((c >> 8) & 0xFF) <= 0xFFu);
-        TEST_ASSERT_TRUE((c & 0xFF) <= 0x80u);
-    }
-}
-
 // --- fractal_gamma ---
+// （fractal_shade のテスト群は #203 の白黒統一で関数ごと削除した）
 
 // 両端固定・単調非減少（パレットの明暗の順序が崩れない）
 void test_gamma_endpoints_and_monotonic() {
@@ -163,10 +126,6 @@ int main(int, char**) {
     RUN_TEST(test_value_matches_unmasked_reference);
     RUN_TEST(test_value_uses_wide_range_in_one_frame);
     RUN_TEST(test_split_matches_combined);
-    RUN_TEST(test_shade_endpoints);
-    RUN_TEST(test_shade_monotonic_per_channel);
-    RUN_TEST(test_shade_masks_high_bits);
-    RUN_TEST(test_shade_never_exceeds_tone);
     RUN_TEST(test_gamma_endpoints_and_monotonic);
     return UNITY_END();
 }

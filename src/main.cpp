@@ -34,7 +34,7 @@
 #include "pacman.h"   // Tile/Dir/Pos / pac_tile_at / pac_can_move / pac_step（パックマン迷路・純粋ロジック・#134）
 #include "video.h"    // video_frame_at（動画フレーム時刻・純粋ロジック・#142）
 #include "meta.h"     // meta_get_int（動画 manifest の key=value 取り出し・純粋ロジック・#148）
-#include "fractal.h"  // fractal_value / fractal_shade（曲選択背景の動く幾何学模様・純粋ロジック・#199）
+#include "fractal.h"  // fractal_at / fractal_gamma（曲選択背景の動く幾何学模様・純粋ロジック・#199）
 #include "video_list.h"  // video_name_valid / VideoList 等（動画選択の純粋ロジック・#175）
 #include "sd_pins.h"  // kSdCsPin 等（microSD の SPI ピン・転送専用ファームと共有・#157）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
@@ -2533,7 +2533,7 @@ static M5Canvas g_videoSelCanvas(&M5.Display);
 static bool     g_videoDiscUiUp   = false;  // 2枚とも確保できたか（false なら文字だけの退避表示）
 static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊・模様アニメの時刻起点（シーン入場時に1回）
 
-// ── サムネイル連動の背景（#195 グラデーション → #199 動く模様） ──
+// ── 選択画面の背景（#195 グラデーション → #199 動く模様 → #203 白黒化） ──
 // 通常経路の背景は XOR フラクタル模様（fractal.h・下の g_videoFractalLut）に置き換えた。
 // この行テーブルは静的フォールバック（SD 無し・0件・Sprite 確保失敗）の縦グラデーション
 // 専用に残す。色の算術は純粋関数 video_bg_tone / video_bg_lerp（native テスト済み）。
@@ -2543,19 +2543,28 @@ static uint16_t g_videoBgRows[kScreenH];
 static_assert(kDiscAreaY + kDiscAreaS <= kScreenH,
               "disc area must fit on screen");
 
-// ── 動く模様のパレット LUT（#199） ──
-// fractal_value の強度 0..255 → RGB565 の 256 段テーブル。曲送り時（videoFractalBuildLut）に
+// ── 動く模様のパレット LUT（#199 → #203 で白黒化） ──
+// fractal_value の強度 0..255 → RGB565 の 256 段テーブル。シーン入場時（videoFractalBuildLut）に
 // 一度だけ焼き、毎フレームは引くだけにする（76,800 画素 × 毎フレームの色計算をしないため）。
-// 色はサムネイル平均色のトーン（#195 の資産 video_bg_tone を再利用）を暗→明に段階づける。
+// #203: 色はサムネイル平均色連動をやめ、白黒（グレースケール）に統一した。
+// 通常用と、曲名帯だけ暗くする「スモーク」用の2本を持ち、行ごとに引き分ける
+// （毎フレームのアルファ合成は 76,800 画素では重い。LUT の引き分けなら追加コストほぼゼロ）。
 static uint16_t g_videoFractalLut[256];
-// トーンの明るさ上限。文字（白）とディスクが背景に埋もれない「柄は分かるが主役より暗い」水準。
+static uint16_t g_videoFractalLutDim[256];
+// 明るさ上限。文字（白）とディスクが背景に埋もれない「柄は分かるが主役より暗い」水準。
 static constexpr uint8_t kVideoFractalMax = 120;
+// スモーク帯の明るさ上限。白文字とのコントラストを確保しつつ、模様がうっすら透けて見える水準
+// （すりガラス越しの見え方。真っ黒にすると帯だけ切り取られたような断絶になる）。
+static constexpr uint8_t kVideoFractalSmokeMax = 40;
+// スモーク帯の開始行。曲名 y=196〜（16px フォント）とエラー文 y=220〜 をまとめて覆い、
+// 曲名の少し上から画面下端まで敷く。
+static constexpr int kVideoSmokeY = 188;
 // 選択画面に出す失敗理由（再生に入れなかった時・#175）。毎フレーム合成し直すためコピーで
 // 保持する（ポインタ保持だと、将来 snprintf した局所バッファを渡した瞬間に「毎フレーム
 // 解放済みスタックを読む」発見しにくい壊れ方をする・reviewer 指摘）。空文字列＝エラー無し。
 static char g_videoSelErr[48] = "";
-// サムネイルが無い/読めない時の基準色（落ち着いたスレートブルー）。トーンは
-// video_bg_tone が揃えるので、ここは色味だけの指定でよい。
+// 静的フォールバック（縦グラデーション）の基準色（落ち着いたスレートブルー）。トーンは
+// video_bg_tone が揃えるので、ここは色味だけの指定でよい（#203 で通常経路は白黒化済み）。
 static constexpr uint32_t kVideoBgDefaultAvg = 0x3C5068;
 // 上端・下端の明るさ（最大成分の目標値）。上端 88/255 は「色味は分かるがディスクより
 // 確実に暗い」水準、下端 14 はほぼ黒（真っ黒にしないことで安っぽい断絶を避ける）。
@@ -2565,7 +2574,7 @@ static constexpr uint8_t kVideoBgBottomMax = 14;
 // 平均色 avg（0xRRGGBB）から全行の色テーブルを作る。avg が真っ黒（トーンが作れない）なら
 // 既定色に差し替える（黒背景に戻さない＝「必ず何かしらの色味が付く」保証をここに閉じる）。
 // #199 以降の呼び出し元は videoEnter の既定色1箇所のみ（静的フォールバック専用。
-// サムネイル連動の役目は videoFractalBuildLut に移った）。
+// 通常経路の背景は videoFractalBuildLut の白黒パレットに移った・#203）。
 static void videoBgBuild(uint32_t avg) {
     uint32_t top = video_bg_tone(avg, kVideoBgTopMax);
     if (top == 0) {
@@ -2579,42 +2588,18 @@ static void videoBgBuild(uint32_t avg) {
     }
 }
 
-// 平均色 avg から模様パレット（256 段 RGB565）を焼く（#199）。avg が真っ黒（トーンが作れない）
-// なら既定色に差し替える（videoBgBuild と同じ「必ず色味が付く」保証）。強度には fractal_gamma
-// （v²/255・native テスト済み）をかけて暗部を締める（線形だと中間調が支配的になり、模様の
-// 輪郭がぼやけて安っぽくなる）。
-static void videoFractalBuildLut(uint32_t avg) {
-    uint32_t tone = video_bg_tone(avg, kVideoFractalMax);
-    if (tone == 0) tone = video_bg_tone(kVideoBgDefaultAvg, kVideoFractalMax);
+// 白黒の模様パレット（256 段 RGB565）を通常用・スモーク帯用の2本焼く（#199 → #203）。
+// 色は入力に依らないのでシーン入場時に1回焼けば足りる（#199 時代は曲ごとの色味だったため
+// 曲送りのたびに焼き直していた）。強度には fractal_gamma（v²/255・native テスト済み）を
+// かけて暗部を締める（線形だと中間調が支配的になり、模様の輪郭がぼやけて安っぽくなる）。
+static void videoFractalBuildLut() {
     for (int i = 0; i < 256; ++i) {
-        const uint32_t c = fractal_shade(tone, fractal_gamma(static_cast<uint8_t>(i)));
-        g_videoFractalLut[i] = M5.Display.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+        const uint8_t v = fractal_gamma(static_cast<uint8_t>(i));
+        const uint8_t g = static_cast<uint8_t>(kVideoFractalMax * v / 255u);
+        const uint8_t d = static_cast<uint8_t>(kVideoFractalSmokeMax * v / 255u);
+        g_videoFractalLut[i]    = M5.Display.color565(g, g, g);
+        g_videoFractalLutDim[i] = M5.Display.color565(d, d, d);
     }
-}
-
-// ディスク Sprite（デコード直後・円形マスク前）を格子サンプリングして平均色を取る。
-// 全画素を読むと 132²=17k 回の readPixel になるので、円の内側だけを 6px 刻みで
-// 317 点拾う（背景の雰囲気を決めるだけなので密度はこれで十分）。
-static uint32_t videoDiscSampleAvg() {
-    const int   c = kDiscSize / 2;
-    const int   r = kDiscSize / 2 - 6;  // マスクで消える縁ぎりぎりは避ける
-    uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
-    for (int y = 6; y < kDiscSize; y += 6) {
-        for (int x = 6; x < kDiscSize; x += 6) {
-            const int dx = x - c, dy = y - c;
-            if (dx * dx + dy * dy > r * r) continue;  // 円の外（マスクで消える領域）は数えない
-            const uint16_t p = g_videoDiscSpr.readPixel(x, y);  // 16bit Sprite なので RGB565
-            // 5/6bit→8bit は上位ビットを下位へ複製して展開する（単純シフトだと最大値が
-            // 248/252 になり、純白がわずかに緑へ寄る・reviewer 指摘）。
-            const uint32_t r5 = (p >> 11) & 0x1F, g6 = (p >> 5) & 0x3F, b5 = p & 0x1F;
-            sr += (r5 << 3) | (r5 >> 2);
-            sg += (g6 << 2) | (g6 >> 4);
-            sb += (b5 << 3) | (b5 >> 2);
-            cnt++;
-        }
-    }
-    if (cnt == 0) return 0;  // 理論上到達しないが、0 除算だけは避ける（0 は「色味なし」扱い）
-    return ((sr / cnt) << 16) | ((sg / cnt) << 8) | (sb / cnt);
 }
 
 static void videoDiscUiRelease() {
@@ -2765,16 +2750,12 @@ static void videoDiscPrepare() {
     if (!g_videoDiscUiUp) return;
     g_videoDiscSpr.fillSprite(TFT_BLACK);  // 前の曲の絵を残さない
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
-    if (name != nullptr && videoThumbInto(g_videoDiscSpr, name)) {
-        // マスク前（＝透明色や穴が混ざる前）に平均色を採り、模様をこの曲の色味にする（#195→#199）
-        videoFractalBuildLut(videoDiscSampleAvg());
-    } else {
+    if (name == nullptr || !videoThumbInto(g_videoDiscSpr, name)) {
         // videoThumbInto は全経路が無言の false（meta 無し・索引不整合・巨大 JPEG・デコード失敗…）
         // なので、ここで1行だけ残す。「なぜ無地ディスクなのか」の唯一の手掛かり（reviewer 指摘。
         // 無音の失敗にログを添える作法は videoLoadAudio と同じ）。
         Serial.printf("[video] thumb: fallback name=%s\n", name ? name : "(null)");
         videoDiscDrawFallback();
-        videoFractalBuildLut(kVideoBgDefaultAvg);  // 無地ディスクの時は既定の色味（#195 と同じ扱い）
     }
     videoDiscApplyMask();
 }
@@ -2868,8 +2849,10 @@ static void videoSelectCompose(uint32_t now) {
     static uint16_t row[kScreenW];
     for (int y = 0; y < kScreenH; ++y) {
         const int ry = y + dy0;
+        // 曲名帯（kVideoSmokeY 以降）はスモーク用の暗い LUT で引き、白文字を浮かせる（#203）。
+        const uint16_t* lut = (y >= kVideoSmokeY) ? g_videoFractalLutDim : g_videoFractalLut;
         for (int x = 0; x < kScreenW; ++x) {
-            row[x] = g_videoFractalLut[fractal_at(x + dx0, ry, phase)];
+            row[x] = lut[fractal_at(x + dx0, ry, phase)];
         }
         g_videoSelCanvas.pushImage(0, y, kScreenW, 1, row);
     }
@@ -2998,6 +2981,7 @@ static void videoEnter() {
     g_videoSel   = 0;
     g_videoDiscAnimMs = millis();    // 回転・浮遊アニメの時刻起点（#193）
     videoBgBuild(kVideoBgDefaultAvg);  // 0件・SD無し・Sprite確保失敗でも背景テーブルは常に有効（#195）
+    videoFractalBuildLut();            // 白黒固定なので入場時の1回で足りる（#203）
 
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
