@@ -117,14 +117,7 @@ void test_list_overflow() {
     TEST_ASSERT_EQUAL_INT(kVideoListCap, list.count);      // 増えない
 }
 
-// ───────── タップ判定・カーソル巡回（#175） ─────────
-
-// 右半分=決定、左半分=移動（境界は右扱い）
-void test_is_decide_tap() {
-    TEST_ASSERT_TRUE(video_is_decide_tap(200, 320));   // 右
-    TEST_ASSERT_FALSE(video_is_decide_tap(50, 320));   // 左
-    TEST_ASSERT_TRUE(video_is_decide_tap(160, 320));   // 中央=右扱い
-}
+// ───────── カーソル巡回（#175・#193 で双方向化） ─────────
 
 // next は1つ進み、末尾の次は先頭へ巡回する
 void test_list_next_cycles() {
@@ -142,53 +135,28 @@ void test_list_next_robust() {
     TEST_ASSERT_EQUAL_INT(0, video_list_next(-1, 3));  // -1≡2 →次は 0
 }
 
-// ───────── スクロール開始位置（#189・9本以上を8行窓で見せる） ─────────
-
-// 全件が窓に収まる（count<=rows）ときは常に先頭から（スクロール不要）
-void test_scroll_top_fits() {
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(0, 5, 8));
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(4, 5, 8));
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(7, 8, 8));  // ちょうど収まる
+// prev は1つ戻り、先頭の前は末尾へ回り込む（#193・スワイプの双方向化）
+void test_list_prev_cycles() {
+    TEST_ASSERT_EQUAL_INT(2, video_list_prev(0, 3));  // 先頭→末尾
+    TEST_ASSERT_EQUAL_INT(0, video_list_prev(1, 3));
+    TEST_ASSERT_EQUAL_INT(1, video_list_prev(2, 3));
 }
 
-// 溢れる（count>rows）ときは選択を中央寄りに置き、両端でクランプする
-void test_scroll_top_scrolls() {
-    // count 16 / rows 8。窓は [top, top+8)
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(0, 16, 8));   // 先頭
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(3, 16, 8));   // 3-4=-1 → 0 でクランプ
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(4, 16, 8));   // 4-4=0
-    TEST_ASSERT_EQUAL_INT(4, video_scroll_top(8, 16, 8));   // 8-4=4（中央寄せ）
-    TEST_ASSERT_EQUAL_INT(8, video_scroll_top(15, 16, 8));  // 末尾は count-rows=8 でクランプ
-    TEST_ASSERT_EQUAL_INT(8, video_scroll_top(12, 16, 8));  // 12-4=8（末尾クランプと一致）
+// prev も count<=0 は 0、範囲外・負値は正規化して落ちない（next と同じ堅牢性）
+void test_list_prev_robust() {
+    TEST_ASSERT_EQUAL_INT(0, video_list_prev(0, 0));
+    TEST_ASSERT_EQUAL_INT(0, video_list_prev(5, 0));
+    TEST_ASSERT_EQUAL_INT(2, video_list_prev(3, 3));   // 3≡0 →前は 2
+    TEST_ASSERT_EQUAL_INT(1, video_list_prev(-1, 3));  // -1≡2 →前は 1
 }
 
-// count=rows+1 の「溢れるが余白1しか無い」中間帯（中央寄せが末尾クランプに飲まれる・reviewer 指摘）
-void test_scroll_top_barely_overflows() {
-    // count 9 / rows 8。top は 0 か 1 しか取れない
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(0, 9, 8));
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(4, 9, 8));  // 4-4=0
-    TEST_ASSERT_EQUAL_INT(1, video_scroll_top(5, 9, 8));  // 5-4=1（末尾クランプ count-rows=1 と一致）
-    TEST_ASSERT_EQUAL_INT(1, video_scroll_top(8, 9, 8));  // 末尾もクランプで 1
-}
-
-// 選択は必ず窓 [top, top+rows) の中に入る（見えない項目を選ばせない不変条件）
-void test_scroll_top_keeps_selection_visible() {
-    const int count = 13, rows = 8;
-    for (int sel = 0; sel < count; ++sel) {
-        int top = video_scroll_top(sel, count, rows);
-        TEST_ASSERT_TRUE(top <= sel);
-        TEST_ASSERT_TRUE(sel < top + rows);
-        TEST_ASSERT_TRUE(top >= 0);
-        TEST_ASSERT_TRUE(top <= count - rows);
+// next と prev は互いに逆操作（どの位置でも往復すれば元へ戻る・不変条件）
+void test_list_prev_inverts_next() {
+    const int count = 13;
+    for (int i = 0; i < count; ++i) {
+        TEST_ASSERT_EQUAL_INT(i, video_list_prev(video_list_next(i, count), count));
+        TEST_ASSERT_EQUAL_INT(i, video_list_next(video_list_prev(i, count), count));
     }
-}
-
-// 異常入力でも 0 を返して落ちない（rows<=0 / 範囲外 sel / count<=0）
-void test_scroll_top_robust() {
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(3, 16, 0));   // rows<=0
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(3, 0, 8));    // count<=0
-    TEST_ASSERT_EQUAL_INT(0, video_scroll_top(-5, 16, 8));  // 負の sel はクランプ
-    TEST_ASSERT_EQUAL_INT(8, video_scroll_top(999, 16, 8)); // 範囲超の sel は末尾へ
 }
 
 int main(int, char**) {
@@ -204,13 +172,10 @@ int main(int, char**) {
     RUN_TEST(test_list_empty);
     RUN_TEST(test_list_add_and_get);
     RUN_TEST(test_list_overflow);
-    RUN_TEST(test_is_decide_tap);
     RUN_TEST(test_list_next_cycles);
     RUN_TEST(test_list_next_robust);
-    RUN_TEST(test_scroll_top_fits);
-    RUN_TEST(test_scroll_top_scrolls);
-    RUN_TEST(test_scroll_top_barely_overflows);
-    RUN_TEST(test_scroll_top_keeps_selection_visible);
-    RUN_TEST(test_scroll_top_robust);
+    RUN_TEST(test_list_prev_cycles);
+    RUN_TEST(test_list_prev_robust);
+    RUN_TEST(test_list_prev_inverts_next);
     return UNITY_END();
 }

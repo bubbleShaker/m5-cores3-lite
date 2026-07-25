@@ -63,6 +63,62 @@ void test_long_then_tap() {
     TEST_ASSERT_TRUE(touch_update(t, false, 2100) == TouchEvent::Tap);
 }
 
+// ───────── スワイプ（#193） ─────────
+
+// 左へ閾値以上動かして離すと SwipeLeft（Tap にならない）
+void test_swipe_left_on_release() {
+    TouchTracker t;
+    touch_update(t, true, 0, 200);                        // 押下開始 x=200
+    TEST_ASSERT_TRUE(touch_update(t, true, 100, 150) == TouchEvent::None);   // 途中は無音
+    TEST_ASSERT_TRUE(touch_update(t, false, 200, 200 - kSwipeMinPx) == TouchEvent::SwipeLeft);
+}
+
+// 右へ閾値以上動かして離すと SwipeRight
+void test_swipe_right_on_release() {
+    TouchTracker t;
+    touch_update(t, true, 0, 100);
+    TEST_ASSERT_TRUE(touch_update(t, false, 200, 100 + kSwipeMinPx) == TouchEvent::SwipeRight);
+}
+
+// 閾値未満の横ブレは従来どおり Tap
+void test_small_move_is_still_tap() {
+    TouchTracker t;
+    touch_update(t, true, 0, 100);
+    TEST_ASSERT_TRUE(touch_update(t, false, 200, 100 + kSwipeMinPx - 1) == TouchEvent::Tap);
+}
+
+// ゆっくり払って kLongPressMs を超えてもスワイプは成立する（時間で弾かない）
+void test_slow_swipe_still_fires() {
+    TouchTracker t;
+    touch_update(t, true, 0, 200);
+    // 横に大きく動いている間は LongPress が抑制される（メニュー復帰の誤爆防止）
+    TEST_ASSERT_TRUE(touch_update(t, true, kLongPressMs + 100, 120) == TouchEvent::None);
+    TEST_ASSERT_TRUE(touch_update(t, false, kLongPressMs + 200, 100) == TouchEvent::SwipeLeft);
+}
+
+// 横に動かしたまま押し続けても LongPress は出ない。指を戻せば改めて発火する
+void test_drag_suppresses_long_press_until_back() {
+    TouchTracker t;
+    touch_update(t, true, 0, 200);
+    TEST_ASSERT_TRUE(touch_update(t, true, kLongPressMs, 130) == TouchEvent::None);      // ずれ70px: 抑制
+    TEST_ASSERT_TRUE(touch_update(t, true, kLongPressMs + 100, 200) == TouchEvent::LongPress);  // 戻した: 発火
+}
+
+// 長押し発火後の離しではスワイプも出ない（二重発火防止）
+void test_no_swipe_after_long_press() {
+    TouchTracker t;
+    touch_update(t, true, 0, 200);
+    TEST_ASSERT_TRUE(touch_update(t, true, kLongPressMs, 200) == TouchEvent::LongPress);
+    TEST_ASSERT_TRUE(touch_update(t, false, kLongPressMs + 300, 100) == TouchEvent::None);
+}
+
+// x を渡さない既存の呼び出し（デフォルト引数）は移動量 0 ＝従来挙動のまま
+void test_default_x_keeps_legacy_behavior() {
+    TouchTracker t;
+    touch_update(t, true, 0);
+    TEST_ASSERT_TRUE(touch_update(t, false, 100) == TouchEvent::Tap);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_idle_returns_none);
@@ -72,5 +128,12 @@ int main(int, char**) {
     RUN_TEST(test_no_tap_after_long_press);
     RUN_TEST(test_consecutive_taps);
     RUN_TEST(test_long_then_tap);
+    RUN_TEST(test_swipe_left_on_release);
+    RUN_TEST(test_swipe_right_on_release);
+    RUN_TEST(test_small_move_is_still_tap);
+    RUN_TEST(test_slow_swipe_still_fires);
+    RUN_TEST(test_drag_suppresses_long_press_until_back);
+    RUN_TEST(test_no_swipe_after_long_press);
+    RUN_TEST(test_default_x_keeps_legacy_behavior);
     return UNITY_END();
 }
