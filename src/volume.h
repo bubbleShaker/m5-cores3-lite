@@ -9,7 +9,7 @@
 // レベル0=無音、kVolumeMax=最大。実機へは volume_to_speaker で 0〜255 に直して渡す。
 
 constexpr int kVolumeMax     = 7;  // 最大レベル（0〜7 の8段階）
-constexpr int kVolumeDefault = 5;  // 初期レベル（従来のベタ書き 180 に最も近い 182 相当）
+constexpr int kVolumeDefault = 2;  // 初期レベル（室内で控えめに鳴る水準・#197。旧5は大きすぎた）
 
 // レベルを1段上げる/下げる（範囲 [0, kVolumeMax] にクランプ）。純粋関数。
 int volume_up(int level);

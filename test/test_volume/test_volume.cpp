@@ -21,11 +21,16 @@ void test_down_decrements_and_clamps_at_zero() {
     TEST_ASSERT_EQUAL_INT(0, volume_down(0));  // 下限で止まる
 }
 
-// setVolume 値への変換：両端と初期値の代表点
+// setVolume 値への変換：両端と中間の代表点。
+// 既定値そのもの（kVolumeDefault）はチューニング対象なので値を固定しない
+// （#197 レビュー指摘: 既定変更のたびにテストが赤くなると仕様変更とデグレを区別できない）。
+// 既定値は「範囲内にある」という不変条件だけをコンパイル時に固める。
+static_assert(0 <= kVolumeDefault && kVolumeDefault <= kVolumeMax,
+              "kVolumeDefault must stay within [0, kVolumeMax]");
 void test_to_speaker_maps_range() {
     TEST_ASSERT_EQUAL_UINT8(0, volume_to_speaker(0));            // 無音
     TEST_ASSERT_EQUAL_UINT8(255, volume_to_speaker(kVolumeMax)); // 最大
-    TEST_ASSERT_EQUAL_UINT8(182, volume_to_speaker(kVolumeDefault)); // 初期(≒従来180)
+    TEST_ASSERT_EQUAL_UINT8(72, volume_to_speaker(2));           // 中間の代表点（2*255/7）
 }
 
 // 変換は単調増加（レベルが上がれば setVolume 値も下がらない）

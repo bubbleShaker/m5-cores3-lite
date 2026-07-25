@@ -97,7 +97,7 @@ bool g_replyDirty = false;
 // （TTS 合成/先読み・鳴き声・メェ・録音→/stt・/chat）は入口で即 return し、HTTP を一切張らない。
 // ポケモンの info/sprite は「絵の表示に必須・音声導入前から必要」な通信なので、ここでは遮断しない。
 // fetchChatReply より前に宣言する（同関数の入口ガードが参照するため）。
-static bool g_voiceEnabled = false;
+static bool g_voiceEnabled = true;  // 既定 ON（#197・毎回メニューでトグルする手数を無くす）
 
 // 色（M5GFX の RGB565）。
 constexpr uint16_t kColBg    = TFT_BLACK;
