@@ -2521,6 +2521,60 @@ static M5Canvas g_videoDiscCanvas(&M5.Display);
 static bool     g_videoDiscUiUp   = false;  // 2枚とも確保できたか（false なら文字だけの退避表示）
 static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊アニメの時刻起点（シーン入場時に1回）
 
+// ── サムネイル連動の背景グラデーション（#195） ──
+// 黒一色の代わりに、選択中サムネイルの平均色から作った縦グラデーション
+// （上=控えめな明トーン → 下=ほぼ黒）を敷く。色の算術は純粋関数
+// video_bg_tone / video_bg_lerp（video.h・native テスト済み）で、ここは表示だけを持つ。
+//
+// 行ごとの RGB565 は曲送り時に一度だけこのテーブルへ焼き、毎フレームのキャンバス背景も
+// 静的画面の描画も同じテーブルから塗る。毎フレーム lerp と color565 を 160 行ぶん計算
+// し直さないためと、画面とキャンバスで同じ y が必ず同じ色になる（継ぎ目が出ない）ため。
+static uint16_t g_videoBgRows[kScreenH];
+// サムネイルが無い/読めない時の基準色（落ち着いたスレートブルー）。トーンは
+// video_bg_tone が揃えるので、ここは色味だけの指定でよい。
+static constexpr uint32_t kVideoBgDefaultAvg = 0x3C5068;
+// 上端・下端の明るさ（最大成分の目標値）。上端 88/255 は「色味は分かるがディスクより
+// 確実に暗い」水準、下端 14 はほぼ黒（真っ黒にしないことで安っぽい断絶を避ける）。
+static constexpr uint8_t kVideoBgTopMax    = 88;
+static constexpr uint8_t kVideoBgBottomMax = 14;
+
+// 平均色 avg（0xRRGGBB）から全行の色テーブルを作る。avg が真っ黒（トーンが作れない）なら
+// 既定色に差し替える（黒背景に戻さない＝「必ず何かしらの色味が付く」保証をここに閉じる）。
+static void videoBgBuild(uint32_t avg) {
+    uint32_t top = video_bg_tone(avg, kVideoBgTopMax);
+    if (top == 0) {
+        avg = kVideoBgDefaultAvg;
+        top = video_bg_tone(avg, kVideoBgTopMax);
+    }
+    const uint32_t bottom = video_bg_tone(avg, kVideoBgBottomMax);
+    for (int y = 0; y < kScreenH; ++y) {
+        const uint32_t c = video_bg_lerp(top, bottom, y, kScreenH);
+        g_videoBgRows[y] = M5.Display.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+    }
+}
+
+// ディスク Sprite（デコード直後・円形マスク前）を格子サンプリングして平均色を取る。
+// 全画素を読むと 132²=17k 回の readPixel になるので、円の内側だけを 6px 刻みで
+// 約380点拾う（背景の雰囲気を決めるだけなので密度はこれで十分）。
+static uint32_t videoDiscSampleAvg() {
+    const int   c = kDiscSize / 2;
+    const int   r = kDiscSize / 2 - 6;  // マスクで消える縁ぎりぎりは避ける
+    uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
+    for (int y = 6; y < kDiscSize; y += 6) {
+        for (int x = 6; x < kDiscSize; x += 6) {
+            const int dx = x - c, dy = y - c;
+            if (dx * dx + dy * dy > r * r) continue;  // 円の外（マスクで消える領域）は数えない
+            const uint16_t p = g_videoDiscSpr.readPixel(x, y);  // 16bit Sprite なので RGB565
+            sr += ((p >> 11) & 0x1F) << 3;
+            sg += ((p >> 5) & 0x3F) << 2;
+            sb += (p & 0x1F) << 3;
+            cnt++;
+        }
+    }
+    if (cnt == 0) return 0;  // 理論上到達しないが、0 除算だけは避ける（0 は「色味なし」扱い）
+    return ((sr / cnt) << 16) | ((sg / cnt) << 8) | (sb / cnt);
+}
+
 static void videoDiscUiRelease() {
     // deleteSprite は未確保でも安全な no-op。確保と解放を必ず対にする（videoReleasePack と同じ作法）。
     g_videoDiscSpr.deleteSprite();
@@ -2662,12 +2716,16 @@ static void videoDiscPrepare() {
     if (!g_videoDiscUiUp) return;
     g_videoDiscSpr.fillSprite(TFT_BLACK);  // 前の曲の絵を残さない
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
-    if (name == nullptr || !videoThumbInto(g_videoDiscSpr, name)) {
+    if (name != nullptr && videoThumbInto(g_videoDiscSpr, name)) {
+        // マスク前（＝透明色や穴が混ざる前）に平均色を採り、背景をこの曲の色味にする（#195）
+        videoBgBuild(videoDiscSampleAvg());
+    } else {
         // videoThumbInto は全経路が無言の false（meta 無し・索引不整合・巨大 JPEG・デコード失敗…）
         // なので、ここで1行だけ残す。「なぜ無地ディスクなのか」の唯一の手掛かり（reviewer 指摘。
         // 無音の失敗にログを添える作法は videoLoadAudio と同じ）。
         Serial.printf("[video] thumb: fallback name=%s\n", name ? name : "(null)");
         videoDiscDrawFallback();
+        videoBgBuild(kVideoBgDefaultAvg);  // 無地ディスクの時は既定の色味（#195）
     }
     videoDiscApplyMask();
 }
@@ -2676,17 +2734,20 @@ static void videoDiscPrepare() {
 // ディスク本体は videoUpdate が毎フレーム合成する（kDiscCanvas の矩形内だけが動き、文字と重ならない）。
 // err を渡すと画面下部に赤字で理由を出す（選んだ曲が壊れていて再生に入れず戻した時・#175 設計メモ）。
 static void videoRenderSelect(const char* err = nullptr) {
-    M5.Display.fillScreen(kColBg);
+    // 背景はサムネイル連動の縦グラデーション（#195）。行テーブルは videoDiscPrepare（または
+    // videoEnter の既定値）で作成済み。1回きりの全画面描画なので行ループで十分速い。
+    for (int y = 0; y < kScreenH; ++y) {
+        M5.Display.fillRect(0, y, kScreenW, 1, g_videoBgRows[y]);
+    }
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::top_left);
-    M5.Display.setTextColor(TFT_CYAN, kColBg);
-    // 全角15文字＝240px。右上のカウンタ（"16/16"≒40px・x=274〜）と重ならない長さに収める
-    // （reviewer 指摘: 元の案は 344px で画面幅 320 を超えていた）。スワイプできることは
-    // ディスク両脇の < > が示すので、ヘッダでは決定操作だけ言う。
-    M5.Display.drawString("曲をえらぶのだ（タップで決定）", 6, 4);
+    // 文字は背景色を指定せず透明で載せる（#195）。グラデーションの上に矩形の地色が
+    // 出ないようにするため。この画面は毎回全面を描き直すので、透明描画でも残像は出ない。
+    // ヘッダの説明文は置かない（#195・実機確認のフィードバック。操作は < > と実際の
+    // 触り心地で伝わるので、文で説明しない）。
 
     if (g_videoList.count == 0) {
-        M5.Display.setTextColor(TFT_WHITE, kColBg);
+        M5.Display.setTextColor(TFT_WHITE);
         M5.Display.drawString("/video/ に動画が無いのだ", 8, 44);
         M5.Display.drawString("PCで変換してSDへ入れてね", 8, 68);
         M5.Display.drawString("長押しでメニューに戻るのだ", 8, 200);
@@ -2698,13 +2759,13 @@ static void videoRenderSelect(const char* err = nullptr) {
     const char* name = video_list_name_at(&g_videoList, g_videoSel);
     if (name) {
         M5.Display.setTextDatum(textdatum_t::top_center);
-        M5.Display.setTextColor(TFT_YELLOW, kColBg);
+        M5.Display.setTextColor(TFT_WHITE);
         M5.Display.drawString(name, kScreenW / 2, 196);
     }
     char pos[16];
     snprintf(pos, sizeof(pos), "%d/%d", g_videoSel + 1, g_videoList.count);
     M5.Display.setTextDatum(textdatum_t::top_right);
-    M5.Display.setTextColor(TFT_DARKGREY, kColBg);
+    M5.Display.setTextColor(TFT_LIGHTGREY);
     M5.Display.drawString(pos, kScreenW - 6, 4);
 
     // 左右にスワイプできることの手掛かり（ディスクの両脇）
@@ -2715,7 +2776,7 @@ static void videoRenderSelect(const char* err = nullptr) {
     M5.Display.setTextDatum(textdatum_t::top_left);
 
     if (err) {
-        M5.Display.setTextColor(TFT_RED, kColBg);
+        M5.Display.setTextColor(TFT_RED);
         M5.Display.drawString(err, 8, 220);  // 曲名(y=196..212)の下・kScreenH=240 に収まる
     }
     M5.Display.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
@@ -2731,7 +2792,11 @@ static void videoDiscAnimate(uint32_t now) {
     // float に入れると仮数 24bit を超える約4.6時間で ms の分解能が落ち、浮遊がガタつく。
     const float    dy    = 5.0f * sinf(static_cast<float>(t % 2600u) * (6.2831853f / 2600.0f));
     const uint32_t t0    = micros();
-    g_videoDiscCanvas.fillSprite(kColBg);
+    // 背景は画面と同じ行テーブルから塗る（#195）。キャンバスは画面の y=kDiscCanvasY から
+    // 貼られるので、その行に対応する色を使えば静的背景と継ぎ目なく繋がる。
+    for (int y = 0; y < kDiscCanvasS; ++y) {
+        g_videoDiscCanvas.fillRect(0, y, kDiscCanvasS, 1, g_videoBgRows[kDiscCanvasY + y]);
+    }
     // pushRotateZoom は Sprite の中心（既定ピボット）を dst 座標に合わせて回転描画する。
     // 透明色 kDiscTransp を抜くので、円の外とセンターホールは背景が残る。
     g_videoDiscSpr.pushRotateZoom(&g_videoDiscCanvas,
@@ -2837,6 +2902,7 @@ static void videoEnter() {
     g_videoPhase = VideoPhase::kSelecting;
     g_videoSel   = 0;
     g_videoDiscAnimMs = millis();    // 回転・浮遊アニメの時刻起点（#193）
+    videoBgBuild(kVideoBgDefaultAvg);  // 0件・SD無し・Sprite確保失敗でも背景テーブルは常に有効（#195）
 
     M5.Display.fillScreen(kColBg);
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
@@ -2848,8 +2914,6 @@ static void videoEnter() {
         // 再生を試みて誤った理由（meta が読めない）を出す。真因は SD 未検出なので必ず空にする
         // （reviewer 指摘）。
         video_list_clear(&g_videoList);
-        M5.Display.setTextColor(TFT_CYAN, kColBg);
-        M5.Display.drawString("動画を選ぶのだ", 6, 4);
         videoShowError("SDを認識できないのだ", "microSDを挿してね");
         return;
     }

@@ -230,6 +230,66 @@ void test_pack_entry_failure_keeps_outputs() {
     TEST_ASSERT_EQUAL_UINT32(0xBBBBBBBBu, len);
 }
 
+// ───────── 背景グラデーションの色算術（#195） ─────────
+
+// 最大成分が target_max になるよう等比スケールされ、色相（成分比）が保たれる
+void test_bg_tone_normalizes_max() {
+    // (16,32,64) → 最大 64 を 96 へ → (24,48,96)
+    TEST_ASSERT_EQUAL_HEX32(0x183060u, video_bg_tone(0x102040u, 96));
+}
+
+// 明るすぎる色は暗い方向へも正規化される（白飛びサムネでも背景が落ち着く）
+void test_bg_tone_keeps_hue_when_bright() {
+    // (255,128,0) → 最大 255 を 64 へ → (64,32,0)
+    TEST_ASSERT_EQUAL_HEX32(0x402000u, video_bg_tone(0xFF8000u, 64));
+}
+
+// 真っ黒は色味が無いので黒のまま（0 除算も起きない）
+void test_bg_tone_black_stays_black() {
+    TEST_ASSERT_EQUAL_HEX32(0x000000u, video_bg_tone(0x000000u, 96));
+}
+
+// 最大成分が既に target と一致していれば恒等（丸めで色がずれない）
+void test_bg_tone_identity_at_full_target() {
+    TEST_ASSERT_EQUAL_HEX32(0xFF7F00u, video_bg_tone(0xFF7F00u, 255));
+}
+
+// i=0 が top、i=n-1 が bottom に正確に一致する。暗→明の逆向きでも同じ
+// （a+(b-a)*i/d 形だと差の符号で切り捨ての向きが揺れて端点を外す。その回帰テスト）
+void test_bg_lerp_endpoints_both_directions() {
+    TEST_ASSERT_EQUAL_HEX32(0x102030u, video_bg_lerp(0x102030u, 0x405060u, 0, 240));
+    TEST_ASSERT_EQUAL_HEX32(0x405060u, video_bg_lerp(0x102030u, 0x405060u, 239, 240));
+    TEST_ASSERT_EQUAL_HEX32(0x405060u, video_bg_lerp(0x405060u, 0x102030u, 0, 240));
+    TEST_ASSERT_EQUAL_HEX32(0x102030u, video_bg_lerp(0x405060u, 0x102030u, 239, 240));
+}
+
+// 最小構成: 2行は両端そのもの、3行の中央は四捨五入つき算術平均
+void test_bg_lerp_two_and_three_rows() {
+    TEST_ASSERT_EQUAL_HEX32(0x000000u, video_bg_lerp(0x000000u, 0x0000FFu, 0, 2));
+    TEST_ASSERT_EQUAL_HEX32(0x0000FFu, video_bg_lerp(0x000000u, 0x0000FFu, 1, 2));
+    TEST_ASSERT_EQUAL_HEX32(0x000080u, video_bg_lerp(0x000000u, 0x0000FFu, 1, 3));  // 127.5 → 128
+}
+
+// n<=1 は top、範囲外の i はクランプ（落ちない・変な色を返さない）
+void test_bg_lerp_robust() {
+    TEST_ASSERT_EQUAL_HEX32(0x123456u, video_bg_lerp(0x123456u, 0x654321u, 5, 1));
+    TEST_ASSERT_EQUAL_HEX32(0x123456u, video_bg_lerp(0x123456u, 0x654321u, -3, 240));
+    TEST_ASSERT_EQUAL_HEX32(0x654321u, video_bg_lerp(0x123456u, 0x654321u, 999, 240));
+}
+
+// 全行を通して各成分が単調（グラデーションに縞・逆行が出ない不変条件）
+void test_bg_lerp_monotone_per_component() {
+    const uint32_t top = 0x203040u, bottom = 0x000000u;
+    uint32_t prev = video_bg_lerp(top, bottom, 0, 240);
+    for (int i = 1; i < 240; ++i) {
+        const uint32_t c = video_bg_lerp(top, bottom, i, 240);
+        for (int s = 16; s >= 0; s -= 8) {
+            TEST_ASSERT_TRUE(((c >> s) & 0xFF) <= ((prev >> s) & 0xFF));
+        }
+        prev = c;
+    }
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_starts_at_first_frame);
@@ -261,5 +321,13 @@ int main(int, char**) {
     RUN_TEST(test_pack_entry_zero_length);
     RUN_TEST(test_pack_entry_invalid_args);
     RUN_TEST(test_pack_entry_failure_keeps_outputs);
+    RUN_TEST(test_bg_tone_normalizes_max);
+    RUN_TEST(test_bg_tone_keeps_hue_when_bright);
+    RUN_TEST(test_bg_tone_black_stays_black);
+    RUN_TEST(test_bg_tone_identity_at_full_target);
+    RUN_TEST(test_bg_lerp_endpoints_both_directions);
+    RUN_TEST(test_bg_lerp_two_and_three_rows);
+    RUN_TEST(test_bg_lerp_robust);
+    RUN_TEST(test_bg_lerp_monotone_per_component);
     return UNITY_END();
 }
