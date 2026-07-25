@@ -32,3 +32,7 @@ uint8_t fractal_value(int x, int y, uint32_t t_ms) {
 uint8_t fractal_gamma(uint8_t v) {
     return static_cast<uint8_t>(static_cast<uint32_t>(v) * v / 255u);
 }
+
+uint8_t fractal_gray(uint8_t max, uint8_t v) {
+    return static_cast<uint8_t>(static_cast<uint32_t>(max) * v / 255u);
+}

@@ -100,8 +100,32 @@ void test_split_matches_combined() {
     }
 }
 
+// --- fractal_gray ---
+// （トーン着色 fractal_shade は #203 の白黒統一で1成分版 fractal_gray に置き換えた。
+//   固定する性質は同じ: 両端・単調・上限超過なし）
+
+// 両端: v=0 は 0、v=255 は max そのもの
+void test_gray_endpoints() {
+    TEST_ASSERT_EQUAL_UINT8(0, fractal_gray(120, 0));
+    TEST_ASSERT_EQUAL_UINT8(120, fractal_gray(120, 255));
+    TEST_ASSERT_EQUAL_UINT8(0, fractal_gray(0, 255));  // max=0 なら常に真っ黒
+}
+
+// v について単調非減少、かつ max を超えない（明るさの段階が逆転しない・帯が主役を食わない）
+void test_gray_monotonic_and_capped() {
+    const uint8_t maxes[] = { 40, 120, 255 };
+    for (size_t m = 0; m < sizeof(maxes) / sizeof(maxes[0]); ++m) {
+        uint8_t prev = 0;
+        for (int v = 0; v <= 255; ++v) {
+            const uint8_t g = fractal_gray(maxes[m], static_cast<uint8_t>(v));
+            TEST_ASSERT_TRUE(g >= prev);
+            TEST_ASSERT_TRUE(g <= maxes[m]);
+            prev = g;
+        }
+    }
+}
+
 // --- fractal_gamma ---
-// （fractal_shade のテスト群は #203 の白黒統一で関数ごと削除した）
 
 // 両端固定・単調非減少（パレットの明暗の順序が崩れない）
 void test_gamma_endpoints_and_monotonic() {
@@ -126,6 +150,8 @@ int main(int, char**) {
     RUN_TEST(test_value_matches_unmasked_reference);
     RUN_TEST(test_value_uses_wide_range_in_one_frame);
     RUN_TEST(test_split_matches_combined);
+    RUN_TEST(test_gray_endpoints);
+    RUN_TEST(test_gray_monotonic_and_capped);
     RUN_TEST(test_gamma_endpoints_and_monotonic);
     return UNITY_END();
 }

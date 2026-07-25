@@ -34,7 +34,7 @@
 #include "pacman.h"   // Tile/Dir/Pos / pac_tile_at / pac_can_move / pac_step（パックマン迷路・純粋ロジック・#134）
 #include "video.h"    // video_frame_at（動画フレーム時刻・純粋ロジック・#142）
 #include "meta.h"     // meta_get_int（動画 manifest の key=value 取り出し・純粋ロジック・#148）
-#include "fractal.h"  // fractal_at / fractal_gamma（曲選択背景の動く幾何学模様・純粋ロジック・#199）
+#include "fractal.h"  // fractal_offsets / fractal_at / fractal_gamma / fractal_gray（曲選択背景の動く幾何学模様・純粋ロジック・#199）
 #include "video_list.h"  // video_name_valid / VideoList 等（動画選択の純粋ロジック・#175）
 #include "sd_pins.h"  // kSdCsPin 等（microSD の SPI ピン・転送専用ファームと共有・#157）
 #include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
@@ -2534,7 +2534,7 @@ static bool     g_videoDiscUiUp   = false;  // 2枚とも確保できたか（fa
 static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊・模様アニメの時刻起点（シーン入場時に1回）
 
 // ── 選択画面の背景（#195 グラデーション → #199 動く模様 → #203 白黒化） ──
-// 通常経路の背景は XOR フラクタル模様（fractal.h・下の g_videoFractalLut）に置き換えた。
+// 通常経路の背景は XOR フラクタル模様（fractal.h・下の LUT 2本）に置き換えた。
 // この行テーブルは静的フォールバック（SD 無し・0件・Sprite 確保失敗）の縦グラデーション
 // 専用に残す。色の算術は純粋関数 video_bg_tone / video_bg_lerp（native テスト済み）。
 static uint16_t g_videoBgRows[kScreenH];
@@ -2544,7 +2544,7 @@ static_assert(kDiscAreaY + kDiscAreaS <= kScreenH,
               "disc area must fit on screen");
 
 // ── 動く模様のパレット LUT（#199 → #203 で白黒化） ──
-// fractal_value の強度 0..255 → RGB565 の 256 段テーブル。シーン入場時（videoFractalBuildLut）に
+// fractal_at の強度 0..255 → RGB565 の 256 段テーブル。シーン入場時（videoFractalBuildLut）に
 // 一度だけ焼き、毎フレームは引くだけにする（76,800 画素 × 毎フレームの色計算をしないため）。
 // #203: 色はサムネイル平均色連動をやめ、白黒（グレースケール）に統一した。
 // 通常用と、曲名帯だけ暗くする「スモーク」用の2本を持ち、行ごとに引き分ける
@@ -2556,9 +2556,15 @@ static constexpr uint8_t kVideoFractalMax = 120;
 // スモーク帯の明るさ上限。白文字とのコントラストを確保しつつ、模様がうっすら透けて見える水準
 // （すりガラス越しの見え方。真っ黒にすると帯だけ切り取られたような断絶になる）。
 static constexpr uint8_t kVideoFractalSmokeMax = 40;
-// スモーク帯の開始行。曲名 y=196〜（16px フォント）とエラー文 y=220〜 をまとめて覆い、
-// 曲名の少し上から画面下端まで敷く。
-static constexpr int kVideoSmokeY = 188;
+// 曲名とエラー文の描画行（videoDrawSelectOverlay が使う・16px フォント）。スモーク帯の
+// 開始行はここから導出する（リテラルの二重管理だと片方だけ動かした時に帯と文字が黙って
+// ズレる・reviewer 指摘）。帯は曲名の少し上から画面下端まで敷く。
+static constexpr int kVideoNameY  = 196;
+static constexpr int kVideoErrY   = 220;
+static constexpr int kVideoSmokeY = kVideoNameY - 8;
+static_assert(0 <= kVideoSmokeY && kVideoSmokeY < kScreenH,
+              "smoke band must start on screen");
+static_assert(kVideoErrY + 16 <= kScreenH, "error line must fit on screen");
 // 選択画面に出す失敗理由（再生に入れなかった時・#175）。毎フレーム合成し直すためコピーで
 // 保持する（ポインタ保持だと、将来 snprintf した局所バッファを渡した瞬間に「毎フレーム
 // 解放済みスタックを読む」発見しにくい壊れ方をする・reviewer 指摘）。空文字列＝エラー無し。
@@ -2595,8 +2601,8 @@ static void videoBgBuild(uint32_t avg) {
 static void videoFractalBuildLut() {
     for (int i = 0; i < 256; ++i) {
         const uint8_t v = fractal_gamma(static_cast<uint8_t>(i));
-        const uint8_t g = static_cast<uint8_t>(kVideoFractalMax * v / 255u);
-        const uint8_t d = static_cast<uint8_t>(kVideoFractalSmokeMax * v / 255u);
+        const uint8_t g = fractal_gray(kVideoFractalMax, v);
+        const uint8_t d = fractal_gray(kVideoFractalSmokeMax, v);
         g_videoFractalLut[i]    = M5.Display.color565(g, g, g);
         g_videoFractalLutDim[i] = M5.Display.color565(d, d, d);
     }
@@ -2774,7 +2780,7 @@ static void videoDrawSelectOverlay(lgfx::LovyanGFX& g, const char* err) {
     if (name) {
         g.setTextDatum(textdatum_t::top_center);
         g.setTextColor(TFT_WHITE);
-        g.drawString(name, kScreenW / 2, 196);
+        g.drawString(name, kScreenW / 2, kVideoNameY);
     }
     char pos[16];
     snprintf(pos, sizeof(pos), "%d/%d", g_videoSel + 1, g_videoList.count);
@@ -2793,7 +2799,7 @@ static void videoDrawSelectOverlay(lgfx::LovyanGFX& g, const char* err) {
 
     if (err) {
         g.setTextColor(TFT_RED);
-        g.drawString(err, 8, 220);  // 曲名(y=196..212)の下・kScreenH=240 に収まる
+        g.drawString(err, 8, kVideoErrY);  // 曲名の下・画面内に収まることは static_assert で担保
     }
     g.setFont(&fonts::Font0);  // 既定へ戻す（他描画への影響回避）
 }

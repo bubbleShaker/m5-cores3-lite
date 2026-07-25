@@ -29,6 +29,9 @@ uint8_t fractal_value(int x, int y, uint32_t t_ms);
 
 // 強度のガンマ補正 v²/255（0..255 → 0..255・単調・両端固定）。線形のままだと中間調が
 // 支配的になり模様の輪郭がぼやけるため、パレットを焼く時に暗部を締める用途で使う。
-// （#203 で背景を白黒に統一し、トーン着色 fractal_shade は用済みになったため削除した。
-//   グレー化は表示側が kVideoFractalMax * v / 255 の1成分スケールで行う。）
 uint8_t fractal_gamma(uint8_t v);
+
+// 強度 v (0..255) を明るさ上限 max のグレー輝度に線形スケールする（max*v/255・単調・
+// v=0 で 0、v=255 で max、max を超えない）。#203 の白黒統一でトーン着色 fractal_shade を
+// 置き換えた1成分版。256 段のグレー LUT を焼く時に使う。
+uint8_t fractal_gray(uint8_t max, uint8_t v);
