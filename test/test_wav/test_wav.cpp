@@ -156,6 +156,91 @@ void test_rejects_missing_fmt() {
     TEST_ASSERT_FALSE(parse_wav_header(w.data(), w.size(), &info));
 }
 
+// ---- #208: parse_wav_header_prefix（ストリーミング読みの先頭だけでヘッダを解析）----
+// 動画音声のチャンクストリーミングでは、data の中身（数MB）を読む前にヘッダだけで
+// フォーマットと PCM の位置を知る必要がある。既存 parse_wav_header は「data の中身が
+// バッファ内に全部あること」を要求するため、prefix 版を対で検証する。
+
+// data の中身が prefix に無くても、チャンクヘッダまで読めていれば解析できる
+void test_prefix_parses_header_only() {
+    auto w = make_wav(16000, 1, 16, 320);
+    WavInfo info;
+    // data チャンクの中身の直前＝44 バイトだけ読めている状態
+    TEST_ASSERT_TRUE(parse_wav_header_prefix(w.data(), 44, w.size(), &info));
+    TEST_ASSERT_EQUAL_UINT32(16000, info.sample_rate);
+    TEST_ASSERT_EQUAL(44, info.data_offset);
+    TEST_ASSERT_EQUAL(320, info.data_bytes);
+}
+
+// data がファイル全長に収まらない（途中で切れたファイル）は prefix 版でも弾く
+void test_prefix_rejects_truncated_file() {
+    auto w = make_wav(16000, 1, 16, 320);
+    WavInfo info;
+    TEST_ASSERT_FALSE(parse_wav_header_prefix(w.data(), 44, w.size() - 1, &info));
+}
+
+// prefix_len == file_len なら parse_wav_header と同じ結果（等価な特殊形）
+void test_prefix_equals_full_parse() {
+    auto w = make_wav(16000, 1, 16, 320);
+    WavInfo a, b;
+    TEST_ASSERT_TRUE(parse_wav_header(w.data(), w.size(), &a));
+    TEST_ASSERT_TRUE(parse_wav_header_prefix(w.data(), w.size(), w.size(), &b));
+    TEST_ASSERT_EQUAL_UINT32(a.sample_rate, b.sample_rate);
+    TEST_ASSERT_EQUAL(a.data_offset, b.data_offset);
+    TEST_ASSERT_EQUAL(a.data_bytes, b.data_bytes);
+}
+
+// prefix が fmt の途中で切れていたら解析しない（読めていないフィールドを読まない）
+void test_prefix_rejects_cut_inside_fmt() {
+    auto w = make_wav(16000, 1, 16, 320);
+    WavInfo info;
+    TEST_ASSERT_FALSE(parse_wav_header_prefix(w.data(), 20, w.size(), &info));
+}
+
+// prefix_len > file_len は契約違反として false（呼び出し側のバグを黙って通さない）
+void test_prefix_rejects_prefix_longer_than_file() {
+    auto w = make_wav(16000, 1, 16, 320);
+    WavInfo info;
+    TEST_ASSERT_FALSE(parse_wav_header_prefix(w.data(), w.size(), w.size() - 10, &info));
+}
+
+// prefix 内に収まらない LIST（file には収まる）は「そこで走査が止まる」だけ。
+// data がその先にあれば見つからず false（prefix を伸ばして再挑戦する契約）。
+void test_prefix_stops_at_chunk_beyond_prefix() {
+    std::vector<uint8_t> chunks;
+    put_fmt(chunks, 1, 1, 16000, 16);
+    put_tag(chunks, "LIST");
+    put_u32(chunks, 100);  // 中身 100B（prefix には入り切らない）
+    for (int i = 0; i < 100; ++i) chunks.push_back(0);
+    put_tag(chunks, "data");
+    put_u32(chunks, 4);
+    for (int i = 0; i < 4; ++i) chunks.push_back(0);
+    auto w = wrap_riff(chunks);
+    WavInfo info;
+    // fmt と LIST ヘッダまでは読めているが、LIST の中身の途中で prefix が切れている
+    TEST_ASSERT_FALSE(parse_wav_header_prefix(w.data(), 50, w.size(), &info));
+    // prefix を伸ばして data のチャンクヘッダまで届けば解析できる
+    TEST_ASSERT_TRUE(parse_wav_header_prefix(w.data(), w.size() - 4, w.size(), &info));
+    TEST_ASSERT_EQUAL(4, info.data_bytes);
+}
+
+// sample_rate=0 は再生位置が進まない毒入力なので弾く（#208・SD 上の外部入力）
+void test_rejects_zero_sample_rate() {
+    auto w = make_wav(0, 1, 16, 16);
+    WavInfo info;
+    TEST_ASSERT_FALSE(parse_wav_header(w.data(), w.size(), &info));
+}
+
+// 3ch 以上はモノラル扱いで誤った速度で鳴るので弾く（#208）
+void test_rejects_more_than_two_channels() {
+    auto w = make_wav(16000, 3, 16, 24);
+    WavInfo info;
+    TEST_ASSERT_FALSE(parse_wav_header(w.data(), w.size(), &info));
+    auto w2 = make_wav(16000, 2, 16, 24);  // 2ch は受理（境界の確認）
+    TEST_ASSERT_TRUE(parse_wav_header(w2.data(), w2.size(), &info));
+    TEST_ASSERT_EQUAL_UINT16(2, info.channels);
+}
+
 // ---- M3b-1（Issue #53）: write_wav（書く側）----
 
 // wav_size は 44byte ヘッダ + PCM 本体。
@@ -218,6 +303,14 @@ int main(int, char**) {
     RUN_TEST(test_rejects_truncated_data);
     RUN_TEST(test_rejects_too_short_and_null);
     RUN_TEST(test_rejects_missing_fmt);
+    RUN_TEST(test_prefix_parses_header_only);
+    RUN_TEST(test_prefix_rejects_truncated_file);
+    RUN_TEST(test_prefix_equals_full_parse);
+    RUN_TEST(test_prefix_rejects_cut_inside_fmt);
+    RUN_TEST(test_prefix_rejects_prefix_longer_than_file);
+    RUN_TEST(test_prefix_stops_at_chunk_beyond_prefix);
+    RUN_TEST(test_rejects_zero_sample_rate);
+    RUN_TEST(test_rejects_more_than_two_channels);
     RUN_TEST(test_wav_size);
     RUN_TEST(test_write_then_parse_roundtrip);
     RUN_TEST(test_write_empty_pcm);
