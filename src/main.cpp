@@ -2530,6 +2530,11 @@ static uint32_t g_videoDiscAnimMs = 0;      // 回転・浮遊アニメの時刻
 // 静的画面の描画も同じテーブルから塗る。毎フレーム lerp と color565 を 160 行ぶん計算
 // し直さないためと、画面とキャンバスで同じ y が必ず同じ色になる（継ぎ目が出ない）ため。
 static uint16_t g_videoBgRows[kScreenH];
+// キャンバス行→画面行の対応（videoDiscAnimate の kDiscCanvasY + y）がテーブルの外を読まない
+// ことをコンパイル時に固める（reviewer 指摘）。ディスクの寸法・位置を変える改修が入った時、
+// コメントの約束ではなくビルドが破綻を教える（g_videoDir の static_assert と同じ作法）。
+static_assert(kDiscCanvasY + kDiscCanvasS <= kScreenH,
+              "disc canvas must fit in the bg row table");
 // サムネイルが無い/読めない時の基準色（落ち着いたスレートブルー）。トーンは
 // video_bg_tone が揃えるので、ここは色味だけの指定でよい。
 static constexpr uint32_t kVideoBgDefaultAvg = 0x3C5068;
@@ -2555,7 +2560,7 @@ static void videoBgBuild(uint32_t avg) {
 
 // ディスク Sprite（デコード直後・円形マスク前）を格子サンプリングして平均色を取る。
 // 全画素を読むと 132²=17k 回の readPixel になるので、円の内側だけを 6px 刻みで
-// 約380点拾う（背景の雰囲気を決めるだけなので密度はこれで十分）。
+// 317 点拾う（背景の雰囲気を決めるだけなので密度はこれで十分）。
 static uint32_t videoDiscSampleAvg() {
     const int   c = kDiscSize / 2;
     const int   r = kDiscSize / 2 - 6;  // マスクで消える縁ぎりぎりは避ける
@@ -2565,9 +2570,12 @@ static uint32_t videoDiscSampleAvg() {
             const int dx = x - c, dy = y - c;
             if (dx * dx + dy * dy > r * r) continue;  // 円の外（マスクで消える領域）は数えない
             const uint16_t p = g_videoDiscSpr.readPixel(x, y);  // 16bit Sprite なので RGB565
-            sr += ((p >> 11) & 0x1F) << 3;
-            sg += ((p >> 5) & 0x3F) << 2;
-            sb += (p & 0x1F) << 3;
+            // 5/6bit→8bit は上位ビットを下位へ複製して展開する（単純シフトだと最大値が
+            // 248/252 になり、純白がわずかに緑へ寄る・reviewer 指摘）。
+            const uint32_t r5 = (p >> 11) & 0x1F, g6 = (p >> 5) & 0x3F, b5 = p & 0x1F;
+            sr += (r5 << 3) | (r5 >> 2);
+            sg += (g6 << 2) | (g6 >> 4);
+            sb += (b5 << 3) | (b5 >> 2);
             cnt++;
         }
     }
@@ -2735,10 +2743,14 @@ static void videoDiscPrepare() {
 // err を渡すと画面下部に赤字で理由を出す（選んだ曲が壊れていて再生に入れず戻した時・#175 設計メモ）。
 static void videoRenderSelect(const char* err = nullptr) {
     // 背景はサムネイル連動の縦グラデーション（#195）。行テーブルは videoDiscPrepare（または
-    // videoEnter の既定値）で作成済み。1回きりの全画面描画なので行ループで十分速い。
+    // videoEnter の既定値）で作成済み。startWrite で囲んで 240 本の fillRect を 1 つの SPI
+    // トランザクションにまとめる（reviewer 指摘。囲まないと 1 本ごとに begin/end transaction と
+    // setWindow が乗る。同一 loop タスク内なので #157 のバス共有の制約には抵触しない）。
+    M5.Display.startWrite();
     for (int y = 0; y < kScreenH; ++y) {
         M5.Display.fillRect(0, y, kScreenW, 1, g_videoBgRows[y]);
     }
+    M5.Display.endWrite();
     M5.Display.setFont(&fonts::lgfxJapanGothic_16);
     M5.Display.setTextDatum(textdatum_t::top_left);
     // 文字は背景色を指定せず透明で載せる（#195）。グラデーションの上に矩形の地色が
@@ -2768,7 +2780,9 @@ static void videoRenderSelect(const char* err = nullptr) {
     M5.Display.setTextColor(TFT_LIGHTGREY);
     M5.Display.drawString(pos, kScreenW - 6, 4);
 
-    // 左右にスワイプできることの手掛かり（ディスクの両脇）
+    // 左右にスワイプできることの手掛かり（ディスクの両脇）。色は暗黙に引き継がず明示する
+    // （reviewer 指摘: ブロックの並べ替えで黙って変わらないように）。
+    M5.Display.setTextColor(TFT_LIGHTGREY);
     M5.Display.setTextDatum(textdatum_t::middle_left);
     M5.Display.drawString("<", 8, kDiscCanvasY + kDiscCanvasS / 2);
     M5.Display.setTextDatum(textdatum_t::middle_right);
