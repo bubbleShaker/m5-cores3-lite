@@ -16,6 +16,13 @@ param(
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$')]
     [string]$ProcessName,
 
+    # apps.json に登録された実行パス。Get-Process -Name は**ベース名一致**なので、
+    # これで「登録した実行ファイルそのもの」まで絞り込む
+    # （同名の別プロセスの窓を巻き添えで動かさないため）。
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$ExePath,
+
     # ValidateSet に無い値は PowerShell が束縛の時点で弾く（実行前に落ちる）。
     [Parameter(Mandatory = $true)]
     [ValidateSet('minimize', 'maximize', 'restore', 'focus')]
@@ -50,14 +57,32 @@ $SHOW_WINDOW = @{
 }
 
 # MainWindowHandle が 0 のプロセス（バックグラウンド・別セッション）は対象外。
-$targets = @(
+$candidates = @(
     Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
     Where-Object { $_.MainWindowHandle -ne 0 }
 )
 
-if ($targets.Count -eq 0) {
+if ($candidates.Count -eq 0) {
     exit 3
 }
+
+# 実行パスが一致するものがあれば、そこまで絞る（同名の別プロセスを巻き添えにしない）。
+# $_.Path は保護されたプロセスで例外になり得るので握る。
+$exact = @(
+    $candidates | Where-Object {
+        $path = $null
+        try { $path = $_.Path } catch { $path = $null }
+        $path -ieq $ExePath
+    }
+)
+
+# ⚠ 一致が 0 でも名前一致へフォールバックする。
+# Windows 11 の notepad.exe のように、**起動したパスと実プロセスのパスが違う**アプリがある
+# （Store 版へリダイレクトされ、実体は WindowsApps\...\Notepad.exe になる。実測で確認済み）。
+# 厳密一致だけにすると、そういうアプリのウィンドウ操作が永久に効かなくなる。
+# フォールバック時の影響は「同名の別プロセスの窓も最小化/最大化/前面化され得る」までで、
+# 起動や引数には広がらない。
+$targets = if ($exact.Count -gt 0) { $exact } else { $candidates }
 
 foreach ($p in $targets) {
     [RelayWin32.Native]::ShowWindow($p.MainWindowHandle, $SHOW_WINDOW[$Action]) | Out-Null

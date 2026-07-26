@@ -8,8 +8,8 @@ import { resolve } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt, buildMessages, parseClaudeReply } from "./chat";
 import { EMPTY_APPS, parseAppsConfig, toolSpeech, type AppsConfig } from "./tools";
-import { createExecutor, DEFAULT_TIMEOUT_MS } from "./executor";
-import { formatAudit } from "./audit";
+import { createExecutor, DEFAULT_TIMEOUT_MS, isDryRun } from "./executor";
+import { formatAudit, type AuditOutcome } from "./audit";
 import { validateAppPath } from "./winexec";
 import {
   adjustAudioQuery,
@@ -118,12 +118,24 @@ const APPS = readAppsOrExit();
 
 // 実際に PC を操作するかどうか。**既定は dry-run（操作しない）**。
 // 声で PC が動くのは戻せない副作用なので、opt-in（RELAY_DRY_RUN=0）でしか有効にしない。
-const DRY_RUN = (process.env.RELAY_DRY_RUN ?? "1") !== "0";
+// 判定そのものは純粋関数（executor.ts の isDryRun）にあり、単体テストで固定してある。
+const DRY_RUN = isDryRun(process.env);
 
 // 実行アダプタ（#219）。OS に触るのはこの下だけ。
-const EXECUTOR = createExecutor(APPS.apps, {
-  timeoutMs: Number(process.env.RELAY_EXEC_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS),
-});
+// ⚠ タイムアウトは検証してから渡す。空文字は 0、非数値は NaN になり、どちらも setTimeout では
+// 0ms 扱い＝**全てのウィンドウ操作が spawn 直後に kill されて「タイムアウト」**になる。
+function execTimeoutMs(): number {
+  const raw = process.env.RELAY_EXEC_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_TIMEOUT_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`RELAY_EXEC_TIMEOUT_MS が不正なので既定値 ${DEFAULT_TIMEOUT_MS}ms を使う`);
+    return DEFAULT_TIMEOUT_MS;
+  }
+  return value;
+}
+
+const EXECUTOR = createExecutor(APPS.apps, { timeoutMs: execTimeoutMs() });
 
 const app = new Hono();
 
@@ -176,7 +188,7 @@ app.post("/chat", async (c) => {
       .join("");
 
     // 検証は純粋ロジックへ委譲。ここへ来た時点で tool は「実行してよい形」に閉じている。
-    const { rejectedTool, ...reply } = parseClaudeReply(text, APPS.keys);
+    const { rejectedTool, rejectedRequest, ...reply } = parseClaudeReply(text, APPS.keys);
 
     // 監査ログ: いつ・どの発話から・どのツールを・どの引数で実行したかを 1 行で残す（#219）。
     //
@@ -184,7 +196,7 @@ app.post("/chat", async (c) => {
     // 実際には拒否された／実行に失敗した、という食い違いが起きる。
     // そのまま喋らせると「開いたよ」と言いながら何も起きない、が既定の挙動になってしまう。
     // 何が起きたかは LLM ではなくこちらの定型文で伝える。
-    const audit = (outcome: Parameters<typeof formatAudit>[0]["outcome"], detail?: string) =>
+    const audit = (outcome: AuditOutcome, detail?: string) =>
       console.log(
         formatAudit({
           time: new Date().toISOString(),
@@ -192,6 +204,8 @@ app.post("/chat", async (c) => {
           call: reply.tool,
           outcome,
           detail,
+          // 拒否時は call が reply_only に落ちているので、要求内容は別に残す。
+          requested: rejectedRequest,
         }),
       );
 
@@ -206,6 +220,9 @@ app.post("/chat", async (c) => {
         reply.reply = "その操作はまだできないのだ。";
       } else {
         // ここから先が唯一 OS に触る経路。executor は例外を投げず必ず outcome を返す。
+        // ⚠ 実行の**前**にも 1 行残す。spawn 済み（＝副作用が起きた）直後に relay が死ぬと、
+        // 結果だけを書く設計では「操作した記録」ごと消えてしまう。
+        audit("start");
         const result = await EXECUTOR.execute(reply.tool);
         audit(result.outcome, result.detail);
         reply.reply = toolSpeech(reply.tool, result.outcome);

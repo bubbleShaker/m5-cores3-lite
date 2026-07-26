@@ -1,7 +1,7 @@
 // 実行アダプタのテスト（#219）。**実際にアプリは 1 つも起動しない**。
 // spawn を差し替えて「何を・どんな引数で起動しようとしたか」だけを検証する。
 import { describe, it, expect, beforeEach } from "vitest";
-import { createExecutor, type SpawnFn, type SpawnedProcess } from "../src/executor";
+import { createExecutor, isDryRun, type SpawnFn, type SpawnedProcess } from "../src/executor";
 
 // spawn された子プロセスの偽物。イベントは呼び出し側の listener 登録後に発火させる。
 class FakeChild implements SpawnedProcess {
@@ -9,7 +9,7 @@ class FakeChild implements SpawnedProcess {
   unrefed = false;
   killed = false;
 
-  on(event: string, listener: (...args: never[]) => void) {
+  on(event: "error" | "spawn" | "exit", listener: (...args: never[]) => void) {
     const list = this.listeners.get(event) ?? [];
     list.push(listener);
     this.listeners.set(event, list);
@@ -49,8 +49,12 @@ const spawn: SpawnFn = (command, args, options) => {
 const APPS = {
   browser: "C:/Program Files/Edge/msedge.exe",
   editor: "C:/Users/x/Code.exe",
+  // 大文字拡張子。プロセス名の導出が case-sensitive だとウィンドウ操作が永久に効かなくなる。
+  upper: "C:/Users/x/Painter.EXE",
   // 起動時検証を通らない値。executor が実行直前に再検証することの確認用。
   broken: "C:/apps/../Windows/System32/cmd.exe",
+  // シェルは登録できない（登録されていても実行しない）。
+  shell: "C:/Windows/System32/cmd.exe",
 };
 
 const make = (timeoutMs = 50) =>
@@ -88,6 +92,17 @@ describe("launch_app", () => {
     const result = await executor.execute({ name: "launch_app", app: "browser" });
     expect(result.outcome).toBe("failed");
   });
+
+  it("spawn も error も返ってこない場合はタイムアウトで諦める（/chat をハングさせない）", async () => {
+    let spawned: FakeChild | undefined;
+    behavior = (child) => {
+      spawned = child; // spawn も error も emit しない
+    };
+    const result = await make(10).execute({ name: "launch_app", app: "browser" });
+    expect(result.outcome).toBe("failed");
+    expect(result.detail).toContain("タイムアウト");
+    expect(spawned?.killed).toBe(true);
+  });
 });
 
 describe("許可リスト", () => {
@@ -111,6 +126,64 @@ describe("許可リスト", () => {
     expect(result.outcome).toBe("denied");
     expect(calls).toHaveLength(0);
   });
+
+  it("シェル・スクリプトホストは登録されていても実行しない", async () => {
+    const result = await make().execute({ name: "launch_app", app: "shell" });
+    expect(result.outcome).toBe("denied");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("同時実行", () => {
+  it("実行中の間は次の操作を受け付けない（プロセスの無制限増殖を防ぐ）", async () => {
+    let pending: FakeChild | undefined;
+    behavior = (child) => {
+      pending = child; // 終わらせない
+    };
+    const executor = make(1000);
+    const first = executor.execute({ name: "launch_app", app: "browser" });
+    // 1 件目が走っている間の 2 件目。
+    const second = await executor.execute({ name: "launch_app", app: "editor" });
+    expect(second.outcome).toBe("denied");
+    expect(calls).toHaveLength(1);
+
+    pending?.emit("spawn");
+    expect((await first).outcome).toBe("ok");
+
+    // 終わったら次は通る（解放漏れがあるとここで denied になる）。
+    behavior = (child) => child.emit("spawn");
+    const third = await executor.execute({ name: "launch_app", app: "editor" });
+    expect(third.outcome).toBe("ok");
+  });
+
+  it("失敗しても次の操作を受け付ける（解放漏れが無い）", async () => {
+    behavior = (child) => child.emit("error", new Error("boom"));
+    const executor = make();
+    expect((await executor.execute({ name: "launch_app", app: "browser" })).outcome).toBe(
+      "failed",
+    );
+    behavior = (child) => child.emit("spawn");
+    expect((await executor.execute({ name: "launch_app", app: "browser" })).outcome).toBe("ok");
+  });
+});
+
+describe("既定は dry-run", () => {
+  // ⚠ この既定が反転すると「声が届いた瞬間に PC が動く」に変わる。
+  // 環境変数を設定しない状態を明示的に固定する。
+  it("RELAY_DRY_RUN 未設定なら dry-run", () => {
+    expect(isDryRun({})).toBe(true);
+    expect(isDryRun({ RELAY_DRY_RUN: undefined })).toBe(true);
+  });
+
+  it("0 以外は全て dry-run（実行は明示的な opt-in のみ）", () => {
+    for (const value of ["1", "", "true", "false", "no", "yes", "00", " 0"]) {
+      expect(isDryRun({ RELAY_DRY_RUN: value })).toBe(true);
+    }
+  });
+
+  it("0 のときだけ実行する", () => {
+    expect(isDryRun({ RELAY_DRY_RUN: "0" })).toBe(false);
+  });
 });
 
 describe("ウィンドウ操作", () => {
@@ -122,7 +195,9 @@ describe("ウィンドウ操作", () => {
       state: "minimize",
     });
     expect(result.outcome).toBe("ok");
-    expect(calls[0].command).toBe("powershell.exe");
+    // ⚠ ベース名（"powershell.exe"）ではなく**絶対パス**であること。
+    // ベース名だと PATH 解決になり、PATH の前方に置かれた別物を起動し得る。
+    expect(calls[0].command).toMatch(/^[A-Za-z]:\\.*\\powershell\.exe$/i);
     expect(calls[0].args).toEqual([
       "-NoProfile",
       "-NonInteractive",
@@ -132,6 +207,8 @@ describe("ウィンドウ操作", () => {
       "C:\\relay\\window.ps1",
       "-ProcessName",
       "msedge",
+      "-ExePath",
+      "C:\\Program Files\\Edge\\msedge.exe",
       "-Action",
       "minimize",
     ]);
@@ -156,6 +233,14 @@ describe("ウィンドウ操作", () => {
     behavior = (child) => child.emit("exit", 1);
     const result = await make().execute({ name: "focus_window", app: "browser" });
     expect(result.outcome).toBe("failed");
+  });
+
+  it("大文字拡張子でもプロセス名を正しく導出する", async () => {
+    behavior = (child) => child.emit("exit", 0);
+    await make().execute({ name: "focus_window", app: "upper" });
+    // ".EXE" が落ちないと Get-Process が誰にもマッチせず永久に not_running になる。
+    expect(calls[0].args).toContain("Painter");
+    expect(calls[0].args).not.toContain("Painter.EXE");
   });
 
   it("無応答なら kill してタイムアウト扱いにする", async () => {

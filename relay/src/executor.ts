@@ -10,10 +10,9 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { safeLabel, type ToolCall } from "./tools";
 import {
-  POWERSHELL_BIN_DEFAULT,
   EXIT_NO_WINDOW,
   EXIT_OK,
-  processNameOf,
+  powerShellPath,
   validateAppPath,
   windowActionOf,
   windowScriptArgs,
@@ -31,8 +30,13 @@ export interface ExecResult {
 
 // spawn を差し替え可能にするための最小のインターフェース。
 // これがあるおかげで、テストは**実際にアプリを起動せずに**「何を spawn したか」を検証できる。
+//
+// ⚠ event を string ではなくユニオンで縛る。string のままだと "spwan" のような打ち間違いが
+// 型検査を素通りし、**リスナーが誰にも呼ばれず /chat が永久に待つ**（無言でハングする）。
 export interface SpawnedProcess {
-  on(event: string, listener: (...args: never[]) => void): unknown;
+  on(event: "error", listener: (err: Error) => void): unknown;
+  on(event: "spawn", listener: () => void): unknown;
+  on(event: "exit", listener: (code: number | null) => void): unknown;
   unref(): void;
   kill(signal?: NodeJS.Signals | number): boolean;
 }
@@ -69,13 +73,21 @@ export const DEFAULT_SCRIPT_PATH = fileURLToPath(
 // PowerShell が無応答になっても /chat を道連れにしないための門番。
 export const DEFAULT_TIMEOUT_MS = 10_000;
 
+// 実際に PC を操作するかどうか。**未設定なら必ず dry-run（操作しない）**。
+// この既定はこの機能の生命線なので、環境変数の読み出しを純粋関数に切り出して
+// 単体テストで固定する。server.ts に直接書くと「既定が実行側に反転しても
+// 全テストが緑のまま通る」状態になり、誰も気づけない。
+export function isDryRun(env: { RELAY_DRY_RUN?: string }): boolean {
+  return (env.RELAY_DRY_RUN ?? "1") !== "0";
+}
+
 export function createExecutor(
   apps: Readonly<Record<string, string>>,
   options: Partial<ExecutorOptions> = {},
 ): Executor {
   const opts: ExecutorOptions = {
     spawn: nodeSpawn as unknown as SpawnFn,
-    powershell: POWERSHELL_BIN_DEFAULT,
+    powershell: powerShellPath(process.env.SystemRoot),
     scriptPath: DEFAULT_SCRIPT_PATH,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     ...options,
@@ -92,13 +104,7 @@ export function createExecutor(
   //   （例: terminal に "-c ..." を渡せたら任意コマンド実行と同じ）。
   function launch(exePath: string): Promise<ExecResult> {
     return new Promise((resolve) => {
-      let settled = false;
-      const done = (result: ExecResult) => {
-        if (!settled) {
-          settled = true;
-          resolve(result);
-        }
-      };
+      const { done } = settler(resolve);
       let child: SpawnedProcess;
       try {
         child = opts.spawn(exePath, [], {
@@ -110,28 +116,28 @@ export function createExecutor(
       } catch (err) {
         return done({ outcome: "failed", detail: safeLabel(String((err as Error).message)) });
       }
+      // spawn / error のどちらも来ない事故（プラットフォーム差・差し替えた spawn の不備）で
+      // /chat が永久に待たないよう、ここにも門番を置く。
+      const timer = armTimeout(child, done);
       // spawn 失敗（ENOENT 等）は例外ではなく error イベントで来る。握って failed に写像する。
-      child.on("error", ((err: Error) =>
-        done({ outcome: "failed", detail: safeLabel(err.message) })) as never);
+      child.on("error", (err: Error) => {
+        clearTimeout(timer);
+        done({ outcome: "failed", detail: safeLabel(err.message) });
+      });
       // spawn イベント＝子プロセスの生成に成功した瞬間。
-      child.on("spawn", (() => {
+      // ⚠ ここでは「起動できた」までしか分からない。直後にアプリが自分で落ちても ok を返す。
+      child.on("spawn", () => {
+        clearTimeout(timer);
         child.unref(); // 参照を切る。切らないと relay のイベントループが子に縛られる
         done({ outcome: "ok", detail: "" });
-      }) as never);
+      });
     });
   }
 
   // window.ps1 を実行し、終了コードを ExecOutcome へ写像する。
   function runWindowScript(args: readonly string[]): Promise<ExecResult> {
     return new Promise((resolve) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | undefined;
-      const done = (result: ExecResult) => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        resolve(result);
-      };
+      const { done } = settler(resolve);
       let child: SpawnedProcess;
       try {
         child = opts.spawn(opts.powershell, args, {
@@ -142,29 +148,58 @@ export function createExecutor(
       } catch (err) {
         return done({ outcome: "failed", detail: safeLabel(String((err as Error).message)) });
       }
-      timer = setTimeout(() => {
-        child.kill();
-        done({ outcome: "failed", detail: "タイムアウト" });
-      }, opts.timeoutMs);
-      // タイマーがプロセス終了を引き止めないようにする（テストの終了も速くなる）。
-      timer.unref?.();
+      const timer = armTimeout(child, done);
 
-      child.on("error", ((err: Error) =>
-        done({ outcome: "failed", detail: safeLabel(err.message) })) as never);
-      child.on("exit", ((code: number | null) => {
+      child.on("error", (err: Error) => {
+        clearTimeout(timer);
+        done({ outcome: "failed", detail: safeLabel(err.message) });
+      });
+      child.on("exit", (code: number | null) => {
+        clearTimeout(timer);
         if (code === EXIT_OK) return done({ outcome: "ok", detail: "" });
         // 「窓が無い」は失敗ではなく状態。ユーザーには別の文で伝える。
         if (code === EXIT_NO_WINDOW) {
           return done({ outcome: "not_running", detail: "窓が見つからない" });
         }
         done({ outcome: "failed", detail: `powershell exit=${code}` });
-      }) as never);
+      });
     });
   }
+
+  // 「最初の 1 回だけ resolve する」を共通化する。
+  function settler(resolve: (r: ExecResult) => void) {
+    let settled = false;
+    return {
+      done(result: ExecResult) {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      },
+    };
+  }
+
+  // 無応答の子プロセスを見捨てる門番。
+  function armTimeout(child: SpawnedProcess, done: (r: ExecResult) => void): NodeJS.Timeout {
+    const timer = setTimeout(() => {
+      child.kill();
+      done({ outcome: "failed", detail: "タイムアウト" });
+    }, opts.timeoutMs);
+    // タイマーがプロセス終了を引き止めないようにする（テストの終了も速くなる）。
+    timer.unref?.();
+    return timer;
+  }
+
+  // 同時に走らせる操作は 1 つまで。人が声で出す指示は元々直列だが、
+  // STT の誤爆でループした場合やトークンを持つ相手の連打で、
+  // PowerShell（数十 MB）やアプリが**無制限に増える**のを防ぐ。
+  let inFlight = false;
 
   return {
     async execute(call: ToolCall): Promise<ExecResult> {
       if (call.name === "reply_only") return { outcome: "ok", detail: "" };
+      if (inFlight) {
+        return { outcome: "denied", detail: "別の操作を実行中" };
+      }
 
       // 許可リストに無いキーは**実行経路に入る前**で止める。
       // tools.ts でも弾いているが、ここが最後の門なので二重に持つ（片方の改変で穴が開かない）。
@@ -181,19 +216,23 @@ export function createExecutor(
         return { outcome: "denied", detail: safeLabel((err as Error).message) };
       }
 
-      if (call.name === "launch_app") {
-        return launch(exePath);
-      }
-
+      // ここから先が実際に子プロセスを作る区間。**必ず finally で解放する**
+      // （解放し忘れると 1 回の失敗で操作機能が永久に閉じる）。
+      inFlight = true;
       try {
+        if (call.name === "launch_app") {
+          return await launch(exePath);
+        }
         const action = windowActionOf(
           call.name,
           call.name === "window_state" ? call.state : undefined,
         );
-        const args = windowScriptArgs(opts.scriptPath, processNameOf(exePath), action);
+        const args = windowScriptArgs(opts.scriptPath, exePath, action);
         return await runWindowScript(args);
       } catch (err) {
         return { outcome: "denied", detail: safeLabel((err as Error).message) };
+      } finally {
+        inFlight = false;
       }
     },
   };

@@ -37,6 +37,10 @@ export interface ToolParseResult {
   call: ToolCall;
   // 拒否した理由。ログと「できません」の返答に使う。拒否していなければ null。
   rejected: string | null;
+  // 拒否した場合に「何を要求されたか」（監査ログ用・#219）。
+  // 拒否すると call は reply_only へ落ちるので、これが無いと
+  // **監査ログから「何をやろうとして止められたのか」が消える**。
+  requested?: { tool?: string; app?: string };
 }
 
 // アプリのキーとして許す形。プロンプトにもログにも出るので、
@@ -148,9 +152,13 @@ export function parseToolCall(
   allowedApps: readonly string[],
 ): ToolParseResult {
   const allow = (call: ToolCall): ToolParseResult => ({ call, rejected: null });
-  const deny = (reason: string): ToolParseResult => ({
+  const deny = (
+    reason: string,
+    requested?: { tool?: string; app?: string },
+  ): ToolParseResult => ({
     call: { name: "reply_only" },
     rejected: reason,
+    requested,
   });
 
   // tool 自体が無いのは正常（操作を伴わない普通の会話）。拒否ではない。
@@ -163,7 +171,7 @@ export function parseToolCall(
   const name = typeof obj.name === "string" ? obj.name.trim().toLowerCase() : "";
   if (name === "") return deny("tool.name が無い");
   if (!(TOOL_NAMES as readonly string[]).includes(name)) {
-    return deny(`未知のツール: ${safeLabel(name)}`);
+    return deny(`未知のツール: ${safeLabel(name)}`, { tool: safeLabel(name) });
   }
   if (name === "reply_only") return allow({ name: "reply_only" });
 
@@ -174,10 +182,10 @@ export function parseToolCall(
       : {};
 
   const app = typeof args.app === "string" ? args.app.trim().toLowerCase() : "";
-  if (app === "") return deny("args.app が無い");
+  if (app === "") return deny("args.app が無い", { tool: name });
   // 許可リストに無い名前は実行しない。ここが「任意の exe を走らせない」担保。
   if (!allowedApps.includes(app)) {
-    return deny(`登録されていないアプリ: ${safeLabel(app)}`);
+    return deny(`登録されていないアプリ: ${safeLabel(app)}`, { tool: name, app: safeLabel(app) });
   }
 
   if (name === "launch_app") return allow({ name: "launch_app", app });
@@ -186,9 +194,9 @@ export function parseToolCall(
   // window_state だけ追加の引数を取る。
   const state =
     typeof args.state === "string" ? args.state.trim().toLowerCase() : "";
-  if (state === "") return deny("args.state が無い");
+  if (state === "") return deny("args.state が無い", { tool: name, app });
   if (!(WINDOW_STATES as readonly string[]).includes(state)) {
-    return deny(`未知の state: ${safeLabel(state)}`);
+    return deny(`未知の state: ${safeLabel(state)}`, { tool: name, app });
   }
   return allow({ name: "window_state", app, state: state as WindowState });
 }

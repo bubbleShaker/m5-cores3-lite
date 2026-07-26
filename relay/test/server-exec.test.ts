@@ -20,15 +20,19 @@ const mocks = vi.hoisted(() => ({
   result: { outcome: "ok", detail: "" } as ExecResult,
 }));
 
-vi.mock("../src/executor", () => ({
-  DEFAULT_TIMEOUT_MS: 10_000,
-  createExecutor: () => ({
-    execute: async (call: ToolCall) => {
-      mocks.executed.push(call);
-      return mocks.result;
-    },
-  }),
-}));
+// createExecutor だけ差し替え、他（isDryRun 等）は本物のまま使う。
+vi.mock("../src/executor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/executor")>();
+  return {
+    ...actual,
+    createExecutor: () => ({
+      execute: async (call: ToolCall) => {
+        mocks.executed.push(call);
+        return mocks.result;
+      },
+    }),
+  };
+});
 
 let claudeText = "";
 
@@ -97,6 +101,8 @@ async function chat(text: string, message = "テスト") {
 
 const auditLines = () =>
   logs.filter((l) => l.startsWith("audit ")).map((l) => JSON.parse(l.slice(6)));
+// 実行経路では「実行前（start）」と「結果」の 2 行が出る。結果の方を見たい時に使う。
+const auditResult = () => auditLines().filter((r) => r.outcome !== "start").at(-1);
 
 describe("/chat の実行結線（RELAY_DRY_RUN=0）", () => {
   it("検証済みの操作が実行層へ渡る", async () => {
@@ -157,7 +163,7 @@ describe("/chat の実行結線（RELAY_DRY_RUN=0）", () => {
       '{"reply":"最小化するね","expression":"happy","action":"none","tool":{"name":"window_state","args":{"app":"browser","state":"minimize"}}}',
       "ブラウザ最小化して",
     );
-    const [record] = auditLines();
+    const record = auditResult();
     expect(record.utterance).toBe("ブラウザ最小化して");
     expect(record.tool).toBe("window_state");
     expect(record.app).toBe("browser");
@@ -166,13 +172,40 @@ describe("/chat の実行結線（RELAY_DRY_RUN=0）", () => {
     expect(typeof record.time).toBe("string");
   });
 
-  it("拒否も監査ログに残る", async () => {
+  it("実行の前にも 1 行残す（副作用の直後に落ちても記録が消えない）", async () => {
+    await chat(
+      '{"reply":"開くね","expression":"happy","action":"none","tool":{"name":"launch_app","args":{"app":"browser"}}}',
+      "ブラウザ開いて",
+    );
+    const records = auditLines();
+    expect(records.map((r) => r.outcome)).toEqual(["start", "ok"]);
+    expect(records[0].tool).toBe("launch_app");
+    expect(records[0].app).toBe("browser");
+  });
+
+  it("拒否も監査ログに残り、要求された内容が分かる", async () => {
     await chat(
       '{"reply":"開くね","expression":"happy","action":"none","tool":{"name":"launch_app","args":{"app":"cmd"}}}',
       "コマンドプロンプト開いて",
     );
-    const [record] = auditLines();
+    const record = auditResult();
     expect(record.outcome).toBe("denied");
     expect(record.utterance).toBe("コマンドプロンプト開いて");
+    // ⚠ 拒否すると tool は reply_only に落ちる。要求内容が残っていないと
+    // 「何をやろうとして止められたのか」が監査ログから消える。
+    expect(record.requested_tool).toBe("launch_app");
+    expect(record.requested_app).toBe("cmd");
+    // 拒否は実行前で止まるので start 行は出ない。
+    expect(auditLines().map((r) => r.outcome)).toEqual(["denied"]);
+  });
+
+  it("未知のツールも要求内容が監査ログに残る", async () => {
+    await chat(
+      '{"reply":"やるね","expression":"happy","action":"none","tool":{"name":"run_shell","args":{"cmd":"del C:/"}}}',
+      "全部消して",
+    );
+    const record = auditResult();
+    expect(record.outcome).toBe("denied");
+    expect(record.requested_tool).toBe("run_shell");
   });
 });

@@ -56,14 +56,49 @@ audit {"time":"2026-07-26T09:00:00.000Z","utterance":"ブラウザ最小化し�
 1 行 1 レコードの JSON。発話も `detail` も外部由来なので改行を潰してから載せる
 （残すと偽のログ行を注入できる＝ログインジェクション）。
 
+## レビュー指摘の反映（reviewer サブエージェント）
+
+🔴 must 2 件・🟡 should 8 件。主なもの:
+
+- **PowerShell 本体だけ PATH 解決だった** → `SystemRoot` から絶対パスを組み立てる。
+  apps.json に絶対パスを厳しく要求しながら、実際に特権的に動く実行体が PATH 依存では非対称。
+- **「既定は dry-run」を守るテストが 1 本も無かった** → 判定を純粋関数 `isDryRun` に切り出して固定。
+  既定が実行側に反転しても全テストが緑のまま通る状態だった（しかも `server-tools.test.ts` は
+  executor をモックしておらず、反転した瞬間にテストが本物の PowerShell を起動していた）。
+- `win32.basename(p, ".exe")` は**拡張子比較が case-sensitive** → `.EXE` だとウィンドウ操作が
+  永久に `not_running` になる。自前で落とすよう修正。
+- `RELAY_EXEC_TIMEOUT_MS` が無検証（空文字→0、非数値→NaN で全操作が即タイムアウト）→ 検証を追加。
+- 拒否時の監査ログに**要求内容が残っていなかった**（`tool` が `reply_only` に落ちるため）
+  → `requested_tool` / `requested_app` を追加。
+- `launch` にタイムアウトが無く、イベント名の打ち間違いで `/chat` が永久にハングし得た
+  → `SpawnedProcess.on` をユニオン型で縛り、`launch` にも門番を追加。
+- 同時実行の上限が無かった → 実行中は `denied`（PowerShell やアプリの無制限増殖を防ぐ）。
+- シェル・スクリプトホスト（`cmd.exe` `powershell.exe` `mshta.exe` 等）の denylist を追加。
+- `window.ps1` の BOM を守るテストを追加（編集で落とすと即壊れるため）。
+
 ## 検証
 
-- `npm test` … 16 ファイル / 237 件 通過（winexec 24・executor 12・audit 5・結線 8 を追加）
+- `npm test` … 16 ファイル / 254 件 通過（winexec 31・executor 20・audit 7・結線 10 を追加）
 - `npm run typecheck` 通過
 - **Windows 実機で一巡確認**（メモ帳を起動 → 最小化 → 復帰 → 前面化 → 未登録アプリは `denied`）
   - `window.ps1` 単体でも確認: 対象プロセス無し → `exit 3`（`not_running`）、
-    列挙外の `-Action` → PowerShell の束縛時点で失敗
+    列挙外の `-Action` → PowerShell の束縛時点で失敗（`exit 1` → `failed`）
 - CoreS3 実機からの一巡は #220（M4）で行う
+
+## 実機で分かった罠: 起動パスと実プロセスのパスが違う
+
+レビュー指摘を受けて「`Get-Process -Name` はベース名一致なので実行パスでも絞る」を入れたら、
+**メモ帳のウィンドウ操作が全部 `not_running` になった**。
+
+```
+起動したパス: C:\Windows\System32\notepad.exe
+実プロセス  : C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_11.2605.34.0_x64__.../Notepad.exe
+```
+
+Windows 11 の `notepad.exe` は Store 版へリダイレクトされる。厳密一致だけにすると
+この手のアプリが永久に操作できない。**パス一致があればそこまで絞り、0 件なら名前一致へ
+フォールバック**する形に落ち着かせた（フォールバック時の影響は同名プロセスの窓が
+巻き添えで最小化/最大化される所まで。起動や引数には広がらない）。
 
 ## ハマったところ
 

@@ -180,7 +180,8 @@ cp apps.example.json apps.json   # apps.json は gitignore 済み
 - `RELAY_APPS_FILE` で別の場所を指せる。
 - **実行パスは絶対パスの `.exe` だけ**（#219）。次のいずれかに当たると**起動を止める**:
   相対パス / `..` を含む / `%WINDIR%` や `$env:` などの展開記法 / UNC(`\\server\share`) /
-  `.bat` `.cmd` `.ps1` `.lnk`。
+  `.bat` `.cmd` `.ps1` `.lnk` / シェル・スクリプトホスト
+  （`cmd.exe` `powershell.exe` `wscript.exe` `mshta.exe` 等）。
 
 > なぜ `.bat` / `.cmd` を許さないか: Node は Windows でバッチファイルを**シェル経由でしか
 > 起動できない**（CVE-2024-27980 の緩和）。許した瞬間に「シェルを介さない」という前提が崩れる。
@@ -211,6 +212,28 @@ cp apps.example.json apps.json   # apps.json は gitignore 済み
 |---|---|---|
 | `RELAY_DRY_RUN` | `1` | `0` で実行を有効化。既定は PC に触れない |
 | `RELAY_EXEC_TIMEOUT_MS` | `10000` | PowerShell が無応答の時に諦めるまで |
+
+> ⚠ `RELAY_DRY_RUN=0` は**信頼できる LAN でのみ**。トークンは平文で流れるので、
+> 公衆 Wi-Fi では盗聴者が同じ操作を再実行できる（#226）。
+
+`window.ps1` の終了コード:
+
+| コード | 意味 | 返す outcome |
+|---|---|---|
+| 0 | 成功 | `ok` |
+| 3 | 対象の窓が無い | `not_running` |
+| その他 | 失敗（引数の束縛失敗を含む） | `failed` |
+
+既知の制約:
+
+- **ウィンドウの特定はプロセス名 + 実行パス。** `Get-Process -Name` はベース名一致なので、
+  実行パスが一致するものがあればそこまで絞る。一致が 0 件なら名前一致へフォールバックする
+  ── Windows 11 の `notepad.exe` のように**起動したパスと実プロセスのパスが違う**アプリが
+  あるため（Store 版へリダイレクトされ実体は `WindowsApps\...\Notepad.exe`）。
+  フォールバック時は同名の別プロセスの窓も動き得るが、影響は最小化/最大化/前面化まで。
+- **`launch_app` の `ok` は「起動できた」まで。** 直後にアプリが自分で落ちても成功と答える。
+- **同時に走る操作は 1 つ。** 実行中の操作要求は `denied`（プロセスの無制限増殖を防ぐため）。
+- **監査ログは stdout に出すだけ。** ローテーション・永続化は運用側の責務。
 
 監査ログ（1 行 1 レコードの JSON。`grep` / `jq` で追える）:
 

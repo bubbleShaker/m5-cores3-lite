@@ -61,6 +61,34 @@ describe("formatAudit", () => {
     expect(JSON.parse(line.slice("audit ".length)).utterance).not.toContain("\n");
   });
 
+  it("拒否時は要求された内容を残す（call は reply_only に落ちているため）", () => {
+    const record = JSON.parse(
+      formatAudit({
+        time: TIME,
+        utterance: "コマンドプロンプト開いて",
+        call: { name: "reply_only" },
+        outcome: "denied",
+        detail: "登録されていないアプリ: cmd",
+        requested: { tool: "launch_app", app: "cmd" },
+      }).slice("audit ".length),
+    );
+    expect(record.requested_tool).toBe("launch_app");
+    expect(record.requested_app).toBe("cmd");
+  });
+
+  it("要求内容にも制御文字を残さない（値は LLM 由来）", () => {
+    const record = JSON.parse(
+      formatAudit({
+        time: TIME,
+        utterance: "x",
+        call: { name: "reply_only" },
+        outcome: "denied",
+        requested: { tool: "launch\napp" },
+      }).slice("audit ".length),
+    );
+    expect(record.requested_tool).not.toContain("\n");
+  });
+
   it("長すぎる発話は切り詰める", () => {
     const record = JSON.parse(
       formatAudit({

@@ -28,8 +28,35 @@ const FORBIDDEN_CHARS_RE = /[%`$"<>|?*]/;
 // 「シェルを介さない」という前提が崩れる。ショートカット(.lnk)も同じ理由で許さない。
 const ALLOWED_EXT = ".exe";
 
-// PowerShell 実行ファイル。Windows に必ず入っている Windows PowerShell 5.1 を既定にする。
-export const POWERSHELL_BIN_DEFAULT = "powershell.exe";
+// シェル・スクリプトホストは apps.json に登録できない。
+// これらは「窓を開くだけ」に留まらず、そこから任意のコマンドを実行できてしまうため、
+// 「破壊的操作・任意コマンド実行はスコープに入れない」という宣言と実装が食い違う。
+const DENIED_BASENAMES = new Set([
+  "cmd.exe",
+  "powershell.exe",
+  "powershell_ise.exe",
+  "pwsh.exe",
+  "wscript.exe",
+  "cscript.exe",
+  "mshta.exe",
+  "rundll32.exe",
+  "regsvr32.exe",
+  "wsl.exe",
+  "bash.exe",
+]);
+
+// PowerShell 実行ファイル。Windows に必ず入っている Windows PowerShell 5.1 を使う。
+//
+// ⚠ ベース名（"powershell.exe"）のまま spawn すると **PATH 解決**になる。
+// apps.json 側にはあれだけ厳しく絶対パスを要求しておきながら、実際に特権的な動作をする
+// この実行体だけ PATH 依存、では非対称。PATH の前方に書き込める場所があればすり替えられる。
+// SystemRoot から絶対パスを組み立てる。
+export function powerShellPath(systemRoot: string | undefined): string {
+  const root = systemRoot && systemRoot.trim() !== "" ? systemRoot : "C:\\Windows";
+  const path = win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  // 形の検証は apps.json のパスと同じものを通す（denylist だけは当然ここでは掛けない）。
+  return checkPathShape(path);
+}
 
 // PowerShell へ渡す固定引数。
 //   -NoProfile      … 利用者のプロファイル（任意コードが書ける）を読ませない
@@ -54,6 +81,15 @@ export type WindowAction = (typeof WINDOW_ACTIONS)[number];
 // apps.json の値を「起動してよい実行パス」へ正規化する。**不正なら投げる**（起動時に落とす）。
 // ここを通らない値は spawn に渡らない。
 export function validateAppPath(raw: string): string {
+  const normalized = checkPathShape(raw);
+  if (DENIED_BASENAMES.has(win32.basename(normalized).toLowerCase())) {
+    throw new Error("シェル・スクリプトホストは登録できない（任意コマンド実行になるため）");
+  }
+  return normalized;
+}
+
+// パスの「形」だけを見る共通部分。apps.json のパスと PowerShell 本体の両方が通る。
+function checkPathShape(raw: string): string {
   const value = raw.trim();
   if (value === "") throw new Error("実行パスが空");
   if (value.length > 512) throw new Error("実行パスが長すぎる");
@@ -66,6 +102,8 @@ export function validateAppPath(raw: string): string {
     throw new Error("UNC パスは許可しない");
   }
   if (!ABSOLUTE_RE.test(value)) throw new Error("絶対パスではない");
+  // 末尾が区切りなら実行ファイルを指していない（spawn が失敗するだけだが、入口で落とす）。
+  if (/[\\/]$/.test(value)) throw new Error("実行ファイルを指していない");
   // ⚠ normalize より**前**に見る。normalize は `..` を畳んでしまい、
   // 「a/../b」が素通りしたのか元から b だったのか区別できなくなる。
   const segments = value.split(/[\\/]/);
@@ -83,9 +121,11 @@ export function validateAppPath(raw: string): string {
 }
 
 // 実行パス → `Get-Process -Name` に渡すプロセス名（拡張子なしのファイル名）。
-// 検証済みパスを前提にするので、ここでは形の心配をしなくてよい。
+// ⚠ win32.basename(p, ".exe") は**拡張子の比較が大文字小文字を区別する**ので、
+// "msedge.EXE" だと拡張子が落ちず `Get-Process -Name msedge.EXE` が誰にもマッチしない
+// （launch_app だけ動いてウィンドウ操作が永久に not_running になる）。自前で落とす。
 export function processNameOf(validatedPath: string): string {
-  return win32.basename(validatedPath, ALLOWED_EXT);
+  return win32.basename(validatedPath).replace(/\.exe$/i, "");
 }
 
 // ToolCall の種類 → ps1 の -Action 値。
@@ -106,9 +146,12 @@ export function windowActionOf(
 // PowerShell のパーサが決めることになり、値がコードに化ける余地が生まれる。
 export function windowScriptArgs(
   scriptPath: string,
-  processName: string,
+  exePath: string,
   action: WindowAction,
 ): string[] {
+  // exePath は検証済みのはずだが、ここでも通す（この関数だけを他所から呼んでも壊れないように）。
+  const validated = validateAppPath(exePath);
+  const processName = processNameOf(validated);
   if (!BASENAME_RE.test(processName)) {
     throw new Error("プロセス名が不正");
   }
@@ -120,6 +163,10 @@ export function windowScriptArgs(
     scriptPath,
     "-ProcessName",
     processName,
+    // ⚠ 実行パスも渡して ps1 側で絞り込む。`Get-Process -Name` は**ベース名一致**なので、
+    // 同名の別プロセス（登録していない方の notepad 等）の窓まで動かしてしまう。
+    "-ExePath",
+    validated,
     "-Action",
     action,
   ];
