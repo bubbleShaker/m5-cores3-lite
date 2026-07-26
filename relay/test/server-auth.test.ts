@@ -15,6 +15,7 @@ const JSON_HEADERS = { "content-type": "application/json" };
 // ⚠ process.env はまるごと差し替えない（describe 間で壊れる）。個別キーだけ退避・復元する。
 let prevToken: string | undefined;
 let prevApiKey: string | undefined;
+let prevAppsFile: string | undefined;
 // Hono の request() は Response も Promise<Response> も返し得る（await でどちらも扱える）。
 let app: {
   request: (path: string, init?: RequestInit) => Response | Promise<Response>;
@@ -27,6 +28,10 @@ beforeAll(async () => {
   // ここで入れた値が relay/.env より優先される（実測で確認済み）。
   process.env.RELAY_TOKEN = TOKEN;
   process.env.ANTHROPIC_API_KEY = "dummy-not-used";
+  // 開発者ローカルの relay/apps.json に引きずられないよう、存在しないパスを指す。
+  // 壊れた apps.json があると server.ts が process.exit(1) してテストごと落ちるため（#218）。
+  prevAppsFile = process.env.RELAY_APPS_FILE;
+  process.env.RELAY_APPS_FILE = "does-not-exist-apps.json";
   // 401 のたびに console.warn が出てテスト出力が汚れるので黙らせる。
   vi.spyOn(console, "warn").mockImplementation(() => {});
   app = (await import("../src/server")).default;
@@ -37,6 +42,8 @@ afterAll(() => {
   else process.env.RELAY_TOKEN = prevToken;
   if (prevApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = prevApiKey;
+  if (prevAppsFile === undefined) delete process.env.RELAY_APPS_FILE;
+  else process.env.RELAY_APPS_FILE = prevAppsFile;
   vi.restoreAllMocks();
 });
 

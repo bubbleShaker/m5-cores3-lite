@@ -3,8 +3,11 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { pathToFileURL } from "node:url";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
-import { SYSTEM_PROMPT, buildMessages, parseClaudeReply } from "./chat";
+import { buildSystemPrompt, buildMessages, parseClaudeReply } from "./chat";
+import { EMPTY_APPS, parseAppsConfig, toolSpeech, type AppsConfig } from "./tools";
 import {
   adjustAudioQuery,
   audioQueryUrl,
@@ -67,6 +70,44 @@ function readTokenOrExit(): string {
 
 const RELAY_TOKEN = readTokenOrExit();
 
+// 声で操作してよいアプリの一覧（#218）。キー→実行パスの対応を apps.json に置く。
+// **LLM が触れるのはキーだけ**で、パスは設定ファイル側にしか存在しない。
+// ファイルが無い場合は「操作できないが対話はできる」状態で起動する（対話は #216 以前から動く機能で、
+// 設定ファイルの有無で壊すべきではないため）。壊れている場合だけは起動を止める。
+// 設定ミスに気づかないまま「操作できない」と悩む方が損失が大きい。
+function readAppsOrExit(): AppsConfig {
+  // 相対パスのまま warn すると、起動ディレクトリ違いで「なぜか操作できない」時に
+  // どこを見に行ったのか分からない。絶対パスに直してからログに出す。
+  const path = resolve(process.env.RELAY_APPS_FILE ?? "apps.json");
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    // 「無い」だけは正常（操作しない構成）。権限エラーやディレクトリだった等は設定ミスなので、
+    // 握り潰すと「壊れていれば起動を止める」という方針がここだけ破れる。
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`relay refused to start: cannot read ${path}: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    console.warn(`no ${path}: PC 操作は無効で起動する（対話のみ）`);
+    return EMPTY_APPS;
+  }
+  try {
+    const cfg = parseAppsConfig(text);
+    console.log(`apps.json loaded: ${cfg.keys.length ? cfg.keys.join(", ") : "(空)"}`);
+    return cfg;
+  } catch (err) {
+    console.error(`relay refused to start: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
+const APPS = readAppsOrExit();
+
+// 実行層（#219）が入るまでは、決まった操作をログに出すだけで PC には一切触れない。
+// 既定を dry-run にしてあるのは、実行層を書く前に誤って実行経路へ繋がるのを防ぐため。
+const DRY_RUN = (process.env.RELAY_DRY_RUN ?? "1") !== "0";
+
 const app = new Hono();
 
 // 認証ミドルウェア。**全ルートに掛けて /health だけ免除する**（許可リスト方式）。
@@ -108,7 +149,7 @@ app.post("/chat", async (c) => {
     const res = await client.messages.create({
       model: MODEL,
       max_tokens: 512,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(APPS.keys),
       messages: buildMessages(body.message),
     });
     // content は複数ブロックになり得るのでテキストブロックだけ連結する。
@@ -116,7 +157,30 @@ app.post("/chat", async (c) => {
       .filter((b): b is Anthropic.TextBlock => b.type === "text")
       .map((b) => b.text)
       .join("");
-    return c.json(parseClaudeReply(text));
+
+    // 検証は純粋ロジックへ委譲。ここへ来た時点で tool は「実行してよい形」に閉じている。
+    const { rejectedTool, ...reply } = parseClaudeReply(text, APPS.keys);
+
+    // 監査ログ: どの発話から何をしようとしたかを残す（#219 の実行層でも同じ記録を使う）。
+    //
+    // ⚠ 返答文の差し替えが要る。LLM は操作できたつもりで「開くね」と書いてくるが、
+    // 実際には拒否された／まだ実行層が無い、という食い違いが起きる。
+    // そのまま喋らせると「開いたよ」と言いながら何も起きない、が既定の挙動になってしまう。
+    // 何が起きたかは LLM ではなくこちらの定型文で伝える。
+    if (rejectedTool) {
+      console.warn(`tool rejected: ${rejectedTool}`);
+      reply.reply = toolSpeech(reply.tool, "denied");
+    } else if (reply.tool.name !== "reply_only") {
+      console.log(
+        `${DRY_RUN ? "[dry-run] would execute" : "execute"}: ${JSON.stringify(reply.tool)}`,
+      );
+      // ⚠ 実行層はまだ無い（#219）。決めた操作を返すだけで PC には触れない。
+      if (DRY_RUN) {
+        reply.reply = "その操作はまだできないのだ。";
+      }
+    }
+
+    return c.json(reply);
   } catch (err) {
     console.error("claude call failed:", err);
     if (err instanceof Anthropic.APIConnectionTimeoutError) {
