@@ -8,10 +8,11 @@
 //   3. どんな失敗も例外で外へ漏らさない。必ず ExecOutcome へ写像して呼び出し側へ返す
 import { spawn as nodeSpawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { safeLabel, type ToolCall } from "./tools";
+import { safeLabel, type ToolCall, type ToolOutcome } from "./tools";
 import {
   EXIT_NO_WINDOW,
   EXIT_OK,
+  EXIT_OK_BY_NAME,
   powerShellPath,
   validateAppPath,
   windowActionOf,
@@ -19,8 +20,10 @@ import {
 } from "./winexec";
 
 // 実行結果。denied は「実行しなかった」、failed は「実行しようとして駄目だった」。
-// not_running は「そのアプリの窓がまだ無い」＝異常ではないので言い方を分ける。
-export type ExecOutcome = "ok" | "denied" | "failed" | "not_running";
+// not_running は「そのアプリの窓がまだ無い」、busy は「他の操作が走っていた」。
+// ⚠ busy を denied に混ぜない。「攻撃/誤作動で止めた」と「混んでいただけ」が
+// 監査ログ上で同じ記号になると、この記録の目的（誤作動の切り分け）が薄れる。
+export type ExecOutcome = ToolOutcome;
 
 export interface ExecResult {
   outcome: ExecOutcome;
@@ -73,12 +76,13 @@ export const DEFAULT_SCRIPT_PATH = fileURLToPath(
 // PowerShell が無応答になっても /chat を道連れにしないための門番。
 export const DEFAULT_TIMEOUT_MS = 10_000;
 
-// 実際に PC を操作するかどうか。**未設定なら必ず dry-run（操作しない）**。
-// この既定はこの機能の生命線なので、環境変数の読み出しを純粋関数に切り出して
-// 単体テストで固定する。server.ts に直接書くと「既定が実行側に反転しても
-// 全テストが緑のまま通る」状態になり、誰も気づけない。
-export function isDryRun(env: { RELAY_DRY_RUN?: string }): boolean {
-  return (env.RELAY_DRY_RUN ?? "1") !== "0";
+// SystemRoot が壊れていても既定の場所へフォールバックする。
+function safePowerShellPath(): string {
+  try {
+    return powerShellPath(process.env.SystemRoot);
+  } catch {
+    return powerShellPath("C:\\Windows");
+  }
 }
 
 export function createExecutor(
@@ -87,7 +91,10 @@ export function createExecutor(
 ): Executor {
   const opts: ExecutorOptions = {
     spawn: nodeSpawn as unknown as SpawnFn,
-    powershell: powerShellPath(process.env.SystemRoot),
+    // SystemRoot が異常な環境でも起動そのものは止めない（対話は使えるべき）。
+    // ここで投げるとトップレベル未捕捉例外になり、server.ts の「relay refused to start: 」の
+    // 体裁を通らずに落ちてしまう。
+    powershell: safePowerShellPath(),
     scriptPath: DEFAULT_SCRIPT_PATH,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     ...options,
@@ -118,7 +125,9 @@ export function createExecutor(
       }
       // spawn / error のどちらも来ない事故（プラットフォーム差・差し替えた spawn の不備）で
       // /chat が永久に待たないよう、ここにも門番を置く。
-      const timer = armTimeout(child, done);
+      // ⚠ ここでは kill しない。対象は**ユーザーが今開こうとしたアプリ自身**なので、
+      // 開きかけの窓を relay が勝手に閉じる方が驚きが大きい（PowerShell とは性質が違う）。
+      const timer = armTimeout(child, done, { kill: false });
       // spawn 失敗（ENOENT 等）は例外ではなく error イベントで来る。握って failed に写像する。
       child.on("error", (err: Error) => {
         clearTimeout(timer);
@@ -157,6 +166,11 @@ export function createExecutor(
       child.on("exit", (code: number | null) => {
         clearTimeout(timer);
         if (code === EXIT_OK) return done({ outcome: "ok", detail: "" });
+        // 実行パスは一致しなかったが、名前一致の候補が 1 つだけだったので操作した。
+        // 成功ではあるが「登録した実行ファイルそのもの」だとは確認できていないので記録に残す。
+        if (code === EXIT_OK_BY_NAME) {
+          return done({ outcome: "ok", detail: "名前一致で実行（実行パス不一致）" });
+        }
         // 「窓が無い」は失敗ではなく状態。ユーザーには別の文で伝える。
         if (code === EXIT_NO_WINDOW) {
           return done({ outcome: "not_running", detail: "窓が見つからない" });
@@ -179,9 +193,13 @@ export function createExecutor(
   }
 
   // 無応答の子プロセスを見捨てる門番。
-  function armTimeout(child: SpawnedProcess, done: (r: ExecResult) => void): NodeJS.Timeout {
+  function armTimeout(
+    child: SpawnedProcess,
+    done: (r: ExecResult) => void,
+    { kill = true }: { kill?: boolean } = {},
+  ): NodeJS.Timeout {
     const timer = setTimeout(() => {
-      child.kill();
+      if (kill) child.kill();
       done({ outcome: "failed", detail: "タイムアウト" });
     }, opts.timeoutMs);
     // タイマーがプロセス終了を引き止めないようにする（テストの終了も速くなる）。
@@ -198,7 +216,7 @@ export function createExecutor(
     async execute(call: ToolCall): Promise<ExecResult> {
       if (call.name === "reply_only") return { outcome: "ok", detail: "" };
       if (inFlight) {
-        return { outcome: "denied", detail: "別の操作を実行中" };
+        return { outcome: "busy", detail: "別の操作を実行中" };
       }
 
       // 許可リストに無いキーは**実行経路に入る前**で止める。

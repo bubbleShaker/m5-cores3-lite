@@ -22,6 +22,7 @@ flowchart LR
 | ファイル | 性質 | 役割 |
 |---|---|---|
 | `relay/src/winexec.ts` | 純粋 | 実行パスの検証・プロセス名の導出・PowerShell 引数配列の組み立て |
+| `relay/src/config.ts` | 純粋 | 環境変数の解釈（dry-run の既定・タイムアウトの範囲検証） |
 | `relay/src/executor.ts` | 副作用 | **唯一 OS に触る層**。`spawn` で起動、失敗は全て `outcome` へ写像 |
 | `relay/scripts/window.ps1` | スクリプト | user32 の `ShowWindow` / `SetForegroundWindow` |
 | `relay/src/audit.ts` | 純粋 | 監査ログ 1 行（JSON）の整形 |
@@ -76,9 +77,30 @@ audit {"time":"2026-07-26T09:00:00.000Z","utterance":"ブラウザ最小化し�
 - シェル・スクリプトホスト（`cmd.exe` `powershell.exe` `mshta.exe` 等）の denylist を追加。
 - `window.ps1` の BOM を守るテストを追加（編集で落とすと即壊れるため）。
 
+### 2 巡目（再レビュー）で追加した対応
+
+🔴 は 0 件。マージ前推奨として挙がった 2 件と、記録の識別性に効くものを取り込んだ。
+
+- **タイムアウトの上限が無かった。** `RELAY_EXEC_TIMEOUT_MS=3000000000` のような 32bit 超の値は
+  `setTimeout` が **1ms に丸める**ので、直したはずの「全操作が即タイムアウト」が別の入口から
+  復活していた。範囲検証を入れ、環境変数の解釈は純粋モジュール `config.ts` へ切り出して
+  `""` / `"abc"` / `"0"` / `"-1"` / `"3000000000"` を表で固定した。
+- **フォールバックを「候補が 1 件のときだけ」に制限。** 元の実装は一致 0 件で候補全員に作用し、
+  「同一性が最も怪しい状況で最も広く手を出す」形になっていた。
+- **フォールバックしたことを記録に残す。** `window.ps1` が `exit 5` を返し、
+  `ok` + `detail: "名前一致で実行（実行パス不一致）"` に写像する。これが無いと監査ログが
+  「登録した実行ファイルを操作したのか、同名の別物か」に答えられない。
+- **`busy` を `denied` から分離。** 「攻撃/誤作動で止めた」と「混んでいただけ」が同じ記号だと
+  監査ログの目的が薄れる。返答も「今ちょっと待つのだ。」に分けた。
+- **`window.ps1` のスモークテストを追加**（Windows でのみ実行・副作用ゼロの経路だけ）。
+  BOM の 3 バイトだけでは「BOM はあるが構文が壊れた」「ValidateSet が外れた」を検出できない。
+- `launch` のタイムアウトでアプリを kill しない（ユーザーが開こうとした窓を勝手に閉じない）。
+- denylist に `wt.exe` / `conhost.exe` / `openconsole.exe` を追加。
+- `SystemRoot` が異常でも起動を止めない（既定パスへフォールバック）。
+
 ## 検証
 
-- `npm test` … 16 ファイル / 254 件 通過（winexec 31・executor 20・audit 7・結線 10 を追加）
+- `npm test` … 18 ファイル / 261 件 通過（winexec 31・executor 21・audit 7・config 6・ps1 3・結線 10 を追加）
 - `npm run typecheck` 通過
 - **Windows 実機で一巡確認**（メモ帳を起動 → 最小化 → 復帰 → 前面化 → 未登録アプリは `denied`）
   - `window.ps1` 単体でも確認: 対象プロセス無し → `exit 3`（`not_running`）、

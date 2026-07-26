@@ -8,7 +8,8 @@ import { resolve } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt, buildMessages, parseClaudeReply } from "./chat";
 import { EMPTY_APPS, parseAppsConfig, toolSpeech, type AppsConfig } from "./tools";
-import { createExecutor, DEFAULT_TIMEOUT_MS, isDryRun } from "./executor";
+import { createExecutor, DEFAULT_TIMEOUT_MS } from "./executor";
+import { execTimeoutMs, isDryRun } from "./config";
 import { formatAudit, type AuditOutcome } from "./audit";
 import { validateAppPath } from "./winexec";
 import {
@@ -122,20 +123,13 @@ const APPS = readAppsOrExit();
 const DRY_RUN = isDryRun(process.env);
 
 // 実行アダプタ（#219）。OS に触るのはこの下だけ。
-// ⚠ タイムアウトは検証してから渡す。空文字は 0、非数値は NaN になり、どちらも setTimeout では
-// 0ms 扱い＝**全てのウィンドウ操作が spawn 直後に kill されて「タイムアウト」**になる。
-function execTimeoutMs(): number {
-  const raw = process.env.RELAY_EXEC_TIMEOUT_MS;
-  if (raw === undefined || raw.trim() === "") return DEFAULT_TIMEOUT_MS;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    console.warn(`RELAY_EXEC_TIMEOUT_MS が不正なので既定値 ${DEFAULT_TIMEOUT_MS}ms を使う`);
-    return DEFAULT_TIMEOUT_MS;
-  }
-  return value;
+// タイムアウトの解釈は純粋関数（config.ts）にあり、不正値の表は単体テストで固定してある。
+const EXEC_TIMEOUT = execTimeoutMs(process.env);
+if (EXEC_TIMEOUT.invalid) {
+  console.warn(`RELAY_EXEC_TIMEOUT_MS が不正なので既定値 ${DEFAULT_TIMEOUT_MS}ms を使う`);
 }
 
-const EXECUTOR = createExecutor(APPS.apps, { timeoutMs: execTimeoutMs() });
+const EXECUTOR = createExecutor(APPS.apps, { timeoutMs: EXEC_TIMEOUT.value });
 
 const app = new Hono();
 

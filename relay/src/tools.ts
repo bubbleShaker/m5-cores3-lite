@@ -204,9 +204,10 @@ export function parseToolCall(
 // 実行結果をユーザーへ返す日本語の一文に整形する（/tts へ渡す文）。
 // LLM の reply をそのまま喋らせると「開いたよ」と言いながら失敗している事故が起きるため、
 // **実際に何が起きたか**はこちらの定型文で伝える。
-// not_running は「そのアプリの窓がまだ無い」（#219）。失敗と同じ文にすると
-// 「起動していないだけ」なのか「操作に失敗した」のか利用者が切り分けられない。
-export type ToolOutcome = "ok" | "denied" | "failed" | "not_running";
+// not_running は「そのアプリの窓がまだ無い」、busy は「他の操作を実行中だった」（#219）。
+// どちらも failed と同じ文にすると「起動していないだけ」「混んでいただけ」なのか
+// 「操作に失敗した」のかを利用者が切り分けられない。
+export type ToolOutcome = "ok" | "denied" | "failed" | "not_running" | "busy";
 
 export function toolSpeech(call: ToolCall, outcome: ToolOutcome): string {
   // 拒否・失敗の判定を **reply_only より先**に置く。拒否された要求は
@@ -214,6 +215,7 @@ export function toolSpeech(call: ToolCall, outcome: ToolOutcome): string {
   if (outcome === "denied") return "それはできないのだ。";
   if (outcome === "failed") return "うまくいかなかったのだ。";
   if (outcome === "not_running") return "まだ開いていないのだ。";
+  if (outcome === "busy") return "今ちょっと待つのだ。";
   if (call.name === "reply_only") return "";
 
   switch (call.name) {

@@ -43,6 +43,10 @@ const DENIED_BASENAMES = new Set([
   "regsvr32.exe",
   "wsl.exe",
   "bash.exe",
+  // ターミナル系。"terminal" として真っ先に登録されそうな筆頭。
+  "wt.exe",
+  "conhost.exe",
+  "openconsole.exe",
 ]);
 
 // PowerShell 実行ファイル。Windows に必ず入っている Windows PowerShell 5.1 を使う。
@@ -71,8 +75,11 @@ export const POWERSHELL_FIXED_ARGS = [
 ] as const;
 
 // window.ps1 が返す終了コード。3 は「そのアプリの窓が無い」＝失敗ではなく状態。
+// 5 は「実行パスは一致しなかったが、名前一致の候補が 1 つだけだったので操作した」。
+// 成功だが**登録した実行ファイルそのものだと確認できていない**ので、監査ログで区別する。
 export const EXIT_OK = 0;
 export const EXIT_NO_WINDOW = 3;
+export const EXIT_OK_BY_NAME = 5;
 
 // ps1 に渡す操作名。ToolCall の state に focus を足しただけ（focus_window 用）。
 export const WINDOW_ACTIONS = ["minimize", "maximize", "restore", "focus"] as const;

@@ -1,7 +1,7 @@
 // 実行アダプタのテスト（#219）。**実際にアプリは 1 つも起動しない**。
 // spawn を差し替えて「何を・どんな引数で起動しようとしたか」だけを検証する。
 import { describe, it, expect, beforeEach } from "vitest";
-import { createExecutor, isDryRun, type SpawnFn, type SpawnedProcess } from "../src/executor";
+import { createExecutor, type SpawnFn, type SpawnedProcess } from "../src/executor";
 
 // spawn された子プロセスの偽物。イベントは呼び出し側の listener 登録後に発火させる。
 class FakeChild implements SpawnedProcess {
@@ -101,7 +101,9 @@ describe("launch_app", () => {
     const result = await make(10).execute({ name: "launch_app", app: "browser" });
     expect(result.outcome).toBe("failed");
     expect(result.detail).toContain("タイムアウト");
-    expect(spawned?.killed).toBe(true);
+    // ⚠ 対象はユーザーが今開こうとしたアプリ自身なので kill しない
+    //（開きかけの窓を relay が勝手に閉じる方が驚きが大きい）。
+    expect(spawned?.killed).toBe(false);
   });
 });
 
@@ -144,7 +146,9 @@ describe("同時実行", () => {
     const first = executor.execute({ name: "launch_app", app: "browser" });
     // 1 件目が走っている間の 2 件目。
     const second = await executor.execute({ name: "launch_app", app: "editor" });
-    expect(second.outcome).toBe("denied");
+    // ⚠ denied（＝許可リスト違反）ではなく busy。監査ログで「攻撃/誤作動で止めた」と
+    // 「混んでいただけ」が同じ記号になると、記録の意味が薄れる。
+    expect(second.outcome).toBe("busy");
     expect(calls).toHaveLength(1);
 
     pending?.emit("spawn");
@@ -167,24 +171,6 @@ describe("同時実行", () => {
   });
 });
 
-describe("既定は dry-run", () => {
-  // ⚠ この既定が反転すると「声が届いた瞬間に PC が動く」に変わる。
-  // 環境変数を設定しない状態を明示的に固定する。
-  it("RELAY_DRY_RUN 未設定なら dry-run", () => {
-    expect(isDryRun({})).toBe(true);
-    expect(isDryRun({ RELAY_DRY_RUN: undefined })).toBe(true);
-  });
-
-  it("0 以外は全て dry-run（実行は明示的な opt-in のみ）", () => {
-    for (const value of ["1", "", "true", "false", "no", "yes", "00", " 0"]) {
-      expect(isDryRun({ RELAY_DRY_RUN: value })).toBe(true);
-    }
-  });
-
-  it("0 のときだけ実行する", () => {
-    expect(isDryRun({ RELAY_DRY_RUN: "0" })).toBe(false);
-  });
-});
 
 describe("ウィンドウ操作", () => {
   it("window.ps1 を -File で呼ぶ（プロセス名と操作はパラメータで渡す）", async () => {
@@ -227,6 +213,13 @@ describe("ウィンドウ操作", () => {
     behavior = (child) => child.emit("exit", 3);
     const result = await make().execute({ name: "focus_window", app: "browser" });
     expect(result.outcome).toBe("not_running");
+  });
+
+  it("終了コード 5 は成功だが「名前一致で実行した」と記録に残す", async () => {
+    behavior = (child) => child.emit("exit", 5);
+    const result = await make().execute({ name: "focus_window", app: "browser" });
+    expect(result.outcome).toBe("ok");
+    expect(result.detail).toContain("名前一致");
   });
 
   it("その他の終了コードは failed", async () => {

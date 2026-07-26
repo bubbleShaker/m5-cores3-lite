@@ -76,13 +76,24 @@ $exact = @(
     }
 )
 
-# ⚠ 一致が 0 でも名前一致へフォールバックする。
+# ⚠ 一致が 0 でも、候補が**ちょうど 1 つ**なら名前一致で操作する。
 # Windows 11 の notepad.exe のように、**起動したパスと実プロセスのパスが違う**アプリがある
 # （Store 版へリダイレクトされ、実体は WindowsApps\...\Notepad.exe になる。実測で確認済み）。
 # 厳密一致だけにすると、そういうアプリのウィンドウ操作が永久に効かなくなる。
-# フォールバック時の影響は「同名の別プロセスの窓も最小化/最大化/前面化され得る」までで、
-# 起動や引数には広がらない。
-$targets = if ($exact.Count -gt 0) { $exact } else { $candidates }
+#
+# 候補が複数ある時にフォールバックしないのは、「登録した実行パスと一致するものが 1 つも無い」
+# ＝同一性が最も怪しい状況で、最も広く手を出すことになるため。
+$fallback = $false
+if ($exact.Count -gt 0) {
+    $targets = $exact
+}
+elseif ($candidates.Count -eq 1) {
+    $targets = $candidates
+    $fallback = $true
+}
+else {
+    exit 3
+}
 
 foreach ($p in $targets) {
     [RelayWin32.Native]::ShowWindow($p.MainWindowHandle, $SHOW_WINDOW[$Action]) | Out-Null
@@ -91,6 +102,12 @@ foreach ($p in $targets) {
         # 最小化からの復帰までは効いているので、ここは best effort として成功扱いにする。
         [RelayWin32.Native]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
     }
+}
+
+# 名前一致で操作した場合は 5 を返す。呼び出し側は成功として扱うが、
+# 「登録した実行ファイルそのものだと確認できていない」ことを監査ログに残す。
+if ($fallback) {
+    exit 5
 }
 
 exit 0
