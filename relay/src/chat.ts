@@ -88,7 +88,10 @@ function extractJson(text: string): string {
 export function parseClaudeReply(
   text: string,
   allowedApps: readonly string[] = [],
-): ChatReply & { rejectedTool: string | null } {
+): ChatReply & {
+  rejectedTool: string | null;
+  rejectedRequest?: { tool?: string; app?: string };
+} {
   let parsed: unknown;
   try {
     parsed = JSON.parse(extractJson(text));
@@ -112,5 +115,8 @@ export function parseClaudeReply(
     action: normalizeAction(obj.action),
     tool: tool.call,
     rejectedTool: tool.rejected,
+    // 拒否時に「何を要求されたか」（#219 の監査ログ用）。拒否すると tool は reply_only へ
+    // 落ちるので、これが無いと監査ログから要求内容が消える。
+    rejectedRequest: tool.requested,
   };
 }

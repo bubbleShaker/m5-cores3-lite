@@ -18,6 +18,23 @@ const APPS_FILE = join(tmpdir(), `relay-apps-${process.pid}.json`);
 // Claude が返してくるテキストをテストごとに差し替える。
 let claudeText = "";
 
+// ⚠ 実行層もモックする。dry-run の既定が壊れた瞬間に、**このテストスイート自身が
+// 開発機で本物の PowerShell やアプリを起動する**のを物理的に防ぐため。
+const execMock = vi.hoisted(() => ({ executed: [] as unknown[] }));
+
+vi.mock("../src/executor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/executor")>();
+  return {
+    ...actual,
+    createExecutor: () => ({
+      execute: async (call: unknown) => {
+        execMock.executed.push(call);
+        return { outcome: "ok" as const, detail: "" };
+      },
+    }),
+  };
+});
+
 vi.mock("@anthropic-ai/sdk", () => {
   class APIConnectionTimeoutError extends Error {}
   class MockAnthropic {
@@ -108,12 +125,15 @@ describe("/chat のツール結線", () => {
     expect(body.reply).toContain("できない");
   });
 
-  it("dry-run 中は「やった」と喋らない（実行層が無いので嘘になる）", async () => {
+  it("dry-run 中は「やった」と喋らず、実行層も呼ばない", async () => {
+    execMock.executed.length = 0;
     const { body } = await chat(
       '{"reply":"開いたよ！","expression":"happy","action":"none","tool":{"name":"launch_app","args":{"app":"browser"}}}',
     );
     expect(body.reply).not.toContain("開いたよ");
     expect(body.reply).toContain("まだ");
+    // ⚠ dry-run なのに実行層が呼ばれていたら、PC に触れない保証が壊れている。
+    expect(execMock.executed).toEqual([]);
   });
 
   it("操作を伴わない会話は LLM の返答をそのまま返す", async () => {

@@ -37,6 +37,10 @@ export interface ToolParseResult {
   call: ToolCall;
   // 拒否した理由。ログと「できません」の返答に使う。拒否していなければ null。
   rejected: string | null;
+  // 拒否した場合に「何を要求されたか」（監査ログ用・#219）。
+  // 拒否すると call は reply_only へ落ちるので、これが無いと
+  // **監査ログから「何をやろうとして止められたのか」が消える**。
+  requested?: { tool?: string; app?: string };
 }
 
 // アプリのキーとして許す形。プロンプトにもログにも出るので、
@@ -49,11 +53,12 @@ const MAX_APP_PATH_LENGTH = 512;
 // LLM 由来の文字列をログや返答へ載せる前に無害化する（#219 の実行エラーの記録でも使う）。
 // 改行を残すとログの 1 行を偽装できる（ログインジェクション）ため潰す。長さも切る。
 // Zl/Zp（U+2028 / U+2029）も落とす。JS ベースのログビューアでは行分割として解釈され得るため。
-export function safeLabel(value: string): string {
+// maxLength は監査ログ（#219）で発話をもう少し長く残したい場合に広げるためのもの。
+export function safeLabel(value: string, maxLength = 40): string {
   const cleaned = value.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").trim();
   // サロゲートペアを割らないよう、コードポイント単位で切る。
   const points = [...cleaned];
-  return points.length > 40 ? `${points.slice(0, 40).join("")}…` : cleaned;
+  return points.length > maxLength ? `${points.slice(0, maxLength).join("")}…` : cleaned;
 }
 
 export interface AppsConfig {
@@ -147,9 +152,13 @@ export function parseToolCall(
   allowedApps: readonly string[],
 ): ToolParseResult {
   const allow = (call: ToolCall): ToolParseResult => ({ call, rejected: null });
-  const deny = (reason: string): ToolParseResult => ({
+  const deny = (
+    reason: string,
+    requested?: { tool?: string; app?: string },
+  ): ToolParseResult => ({
     call: { name: "reply_only" },
     rejected: reason,
+    requested,
   });
 
   // tool 自体が無いのは正常（操作を伴わない普通の会話）。拒否ではない。
@@ -162,7 +171,7 @@ export function parseToolCall(
   const name = typeof obj.name === "string" ? obj.name.trim().toLowerCase() : "";
   if (name === "") return deny("tool.name が無い");
   if (!(TOOL_NAMES as readonly string[]).includes(name)) {
-    return deny(`未知のツール: ${safeLabel(name)}`);
+    return deny(`未知のツール: ${safeLabel(name)}`, { tool: safeLabel(name) });
   }
   if (name === "reply_only") return allow({ name: "reply_only" });
 
@@ -173,10 +182,10 @@ export function parseToolCall(
       : {};
 
   const app = typeof args.app === "string" ? args.app.trim().toLowerCase() : "";
-  if (app === "") return deny("args.app が無い");
+  if (app === "") return deny("args.app が無い", { tool: name });
   // 許可リストに無い名前は実行しない。ここが「任意の exe を走らせない」担保。
   if (!allowedApps.includes(app)) {
-    return deny(`登録されていないアプリ: ${safeLabel(app)}`);
+    return deny(`登録されていないアプリ: ${safeLabel(app)}`, { tool: name, app: safeLabel(app) });
   }
 
   if (name === "launch_app") return allow({ name: "launch_app", app });
@@ -185,9 +194,9 @@ export function parseToolCall(
   // window_state だけ追加の引数を取る。
   const state =
     typeof args.state === "string" ? args.state.trim().toLowerCase() : "";
-  if (state === "") return deny("args.state が無い");
+  if (state === "") return deny("args.state が無い", { tool: name, app });
   if (!(WINDOW_STATES as readonly string[]).includes(state)) {
-    return deny(`未知の state: ${safeLabel(state)}`);
+    return deny(`未知の state: ${safeLabel(state)}`, { tool: name, app });
   }
   return allow({ name: "window_state", app, state: state as WindowState });
 }
@@ -195,13 +204,18 @@ export function parseToolCall(
 // 実行結果をユーザーへ返す日本語の一文に整形する（/tts へ渡す文）。
 // LLM の reply をそのまま喋らせると「開いたよ」と言いながら失敗している事故が起きるため、
 // **実際に何が起きたか**はこちらの定型文で伝える。
-export type ToolOutcome = "ok" | "denied" | "failed";
+// not_running は「そのアプリの窓がまだ無い」、busy は「他の操作を実行中だった」（#219）。
+// どちらも failed と同じ文にすると「起動していないだけ」「混んでいただけ」なのか
+// 「操作に失敗した」のかを利用者が切り分けられない。
+export type ToolOutcome = "ok" | "denied" | "failed" | "not_running" | "busy";
 
 export function toolSpeech(call: ToolCall, outcome: ToolOutcome): string {
   // 拒否・失敗の判定を **reply_only より先**に置く。拒否された要求は
   // parseToolCall が reply_only に落とすので、後ろに置くと「何も言わない」になってしまう。
   if (outcome === "denied") return "それはできないのだ。";
   if (outcome === "failed") return "うまくいかなかったのだ。";
+  if (outcome === "not_running") return "まだ開いていないのだ。";
+  if (outcome === "busy") return "今ちょっと待つのだ。";
   if (call.name === "reply_only") return "";
 
   switch (call.name) {
