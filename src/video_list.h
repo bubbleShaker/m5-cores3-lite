@@ -19,7 +19,11 @@ static const size_t kVideoNameMax = 31;
 // これを超える分は列挙側で黙って捨て、呼び出し側は count が頭打ちになることで気づく。
 // #189 で 8→16 に拡張（10曲＋既存動画を全部選べるように）。#193 でディスク表示（1画面1曲の
 // カルーセル）になったため行数の制約は消えたが、上限は列挙バッファの意味で残る。
-static const int kVideoListCap = 16;
+// #230 で 16→32 に拡張（既存15＋新規3で16を超えたため）。VideoList は main.cpp で
+// static 配置（内蔵SRAM/.bss。PSRAM 指定は無い）なので、names[32][32]=1KB は 512B→1024B、
+// +512B の内蔵RAM消費。絶対量が小さいので許容。ここを更に増やす時は内蔵RAM残量を意識すること。
+// パス長系の static_assert は kVideoNameMax(31) だけに依存し kVideoListCap とは独立（増やしても無関係）。
+static const int kVideoListCap = 32;
 
 // エントリ名が「単一のディレクトリ名」として妥当か（#175 設計メモ「エントリ名の妥当性判定」）。
 // 弾く条件: null / 空 / "." / 区切り文字('/'・'\\')を含む / ".." を含む / kVideoNameMax 超え。
