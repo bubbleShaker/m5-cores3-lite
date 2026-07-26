@@ -104,9 +104,64 @@ curl -s -X POST localhost:3000/stt \
 
 Whisper が別ホスト/ポートなら `STT_URL`（既定 `http://localhost:9000`）で上書きする。
 
+## 声で PC を操作する（#218・現在は dry-run）
+
+`/chat` の応答に、検証済みの操作 `tool` が入る。
+
+```json
+{"reply":"ブラウザ開くね","expression":"happy","action":"none",
+ "tool":{"name":"launch_app","app":"browser"}}
+```
+
+**⚠ 現時点では実行層が無い（#219）。** 決まった操作をログに出すだけで PC には一切触れない。
+そのため操作を選んだ場合は `reply` を「その操作はまだできないのだ。」に差し替える。
+LLM は操作できたつもりで「開いたよ」と書いてくるので、そのまま喋らせると
+**何も起きていないのに成功したと嘘をつく**ことになるため。拒否した場合も同様に差し替える。
+
+### 設計の一線: LLM にシェルの文字列を作らせない
+
+選ばせるのは「列挙された関数名 + 型検証済みの引数」だけ。
+
+```
+NG: {"command": "start chrome.exe && rm -rf ..."}
+OK: {"name": "launch_app", "args": {"app": "browser"}}
+```
+
+STT は聞き間違え、LLM は幻覚を出す。前段が 2 つとも確率的なので「正しく動くこと」に
+賭けた設計は必ず破れる。列挙型に閉じ込めれば、どちらが暴走しても**定義外の操作は起き得ない**。
+不正な `tool` は理由をログに残して `reply_only`（何もしない）へ落ちる。
+
+### 使えるツール
+
+| name | args | 動作 |
+|---|---|---|
+| `launch_app` | `app` | 登録済みアプリを起動 |
+| `focus_window` | `app` | 開いている窓へ切り替え |
+| `window_state` | `app`, `state`（`minimize`/`maximize`/`restore`） | 窓の状態を変える |
+| `reply_only` | — | 操作せず喋るだけ |
+
+### apps.json（操作してよいアプリの一覧）
+
+```sh
+cp apps.example.json apps.json   # apps.json は gitignore 済み
+```
+
+```json
+{ "browser": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" }
+```
+
+- **LLM が指定できるのはキー（`browser`）だけ**で、実行パスはこのファイルにしか存在しない。
+- キーは `a-z 0-9 _ -` の 32 文字までに制限する（プロンプトとログに出るため）。
+- ファイルが無ければ「操作は無効・対話のみ」で起動する。**壊れている場合は起動を止める**
+  （設定ミスに気づかないまま「なぜか操作できない」と悩む方が損失が大きいため）。
+- `RELAY_APPS_FILE` で別の場所を指せる。
+- `RELAY_DRY_RUN=0` で実行を有効化する予定（**実行層は #219 でまだ無い**）。
+
 ## 設計
 
 - `src/chat.ts` — 純粋ロジック（プロンプト組み立て・応答パース＆検証）。ネットワーク非依存で単体テスト可能。
+- `src/auth.ts` — 純粋ロジック（トークン検証・定数時間照合・認証免除パスの判定）。
+- `src/tools.ts` — 純粋ロジック（apps.json の検証・ツール呼び出しの検証・喋る文の整形）。OS も fs も触らない。
 - `src/tts.ts` — 純粋ロジック（入力検証・話者解決・audio_query 整形・URL 組み立て）。
 - `src/stt.ts` — 純粋ロジック（オプション検証・WAV 検証・/asr URL 組み立て・レスポンス解析）。
 - `src/server.ts` — Hono サーバ。環境変数読込→Claude / VOICEVOX / Whisper 呼び出し→整形のみ。

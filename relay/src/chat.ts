@@ -1,5 +1,6 @@
 // 中継サーバの「純粋ロジック」。ネットワーク非依存なので native 同様に単体テストできる。
-// 役割は2つ: (1) Claude へ渡すプロンプト組み立て (2) Claude 応答のパース＆検証。
+// 役割は2つ: (1) LLM へ渡すプロンプト組み立て (2) LLM 応答のパース＆検証。
+import { buildToolsPrompt, parseToolCall, type ToolCall } from "./tools";
 
 // アバター側(face_logic.h)の表情語彙と一致させる。ここがクラウドとデバイスの「契約」になる。
 export type Expression = "neutral" | "happy" | "thinking" | "sad" | "surprised";
@@ -9,6 +10,9 @@ export interface ChatReply {
   reply: string;
   expression: Expression;
   action: Action;
+  // 検証済みの操作（#218）。tool が無い/不正なら reply_only（＝何もしない）になる。
+  // 実機の parse_relay_reply は知らないフィールドを読まないので、この追加は後方互換。
+  tool: ToolCall;
 }
 
 const VALID_EXPRESSIONS: readonly Expression[] = [
@@ -51,6 +55,17 @@ export const SYSTEM_PROMPT = [
   "expression は返答の感情に最も近いものを選ぶ。action は通知すべき要件があれば notify、無ければ none。",
 ].join("\n");
 
+// ツール（PC 操作）付きの system プロンプト（#218）。
+// SYSTEM_PROMPT をそのまま残して合成する形にしたのは、
+// (1) 既存の呼び出しと契約を壊さない (2) 許可アプリの一覧は起動時にしか決まらないため。
+export function buildSystemPrompt(allowedApps: readonly string[]): string {
+  return [
+    SYSTEM_PROMPT,
+    '上の JSON には "tool" フィールドも必ず含めてください。',
+    buildToolsPrompt(allowedApps),
+  ].join("\n");
+}
+
 // Claude SDK の messages 配列を組み立てる（ユーザー発話1件）。
 export function buildMessages(userMessage: string): { role: "user"; content: string }[] {
   return [{ role: "user", content: userMessage }];
@@ -67,19 +82,35 @@ function extractJson(text: string): string {
   return text;
 }
 
-// Claude の応答テキストを ChatReply に変換。失敗時もデバイスが死なないよう必ず妥当な値を返す。
-export function parseClaudeReply(text: string): ChatReply {
+// LLM の応答テキストを ChatReply に変換。失敗時もデバイスが死なないよう必ず妥当な値を返す。
+// allowedApps を渡さない場合、操作は一切許可されない（＝安全側の既定）。
+// 拒否した場合の理由は rejectedTool に入る。ログと「できません」の返答に使う。
+export function parseClaudeReply(
+  text: string,
+  allowedApps: readonly string[] = [],
+): ChatReply & { rejectedTool: string | null } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(extractJson(text));
   } catch {
     // JSON にできなければテキスト全体を reply として扱う（フォールバック）。
-    return { reply: text.trim(), expression: "neutral", action: "none" };
+    // この経路では操作を実行しない。構造化に失敗した応答から意図を推測して
+    // PC を触るのは危険なので、必ず reply_only に落とす。
+    return {
+      reply: text.trim(),
+      expression: "neutral",
+      action: "none",
+      tool: { name: "reply_only" },
+      rejectedTool: null,
+    };
   }
   const obj = (parsed ?? {}) as Record<string, unknown>;
+  const tool = parseToolCall(obj.tool, allowedApps);
   return {
     reply: typeof obj.reply === "string" ? obj.reply : "",
     expression: normalizeExpression(obj.expression),
     action: normalizeAction(obj.action),
+    tool: tool.call,
+    rejectedTool: tool.rejected,
   };
 }

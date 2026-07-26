@@ -28,6 +28,9 @@ src/secrets.h
 # relay (中継サーバ)
 relay/node_modules/
 relay/.env
+# 声で操作してよいアプリの一覧（#218）。実行パスは環境ごとに違うのでコミットしない。
+# 雛形は relay/apps.example.json。
+relay/apps.json
 
 # 動画変換アセット（tools/video2frames.py の出力。実行時のみ・非コミット）
 video/
