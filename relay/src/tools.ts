@@ -49,11 +49,12 @@ const MAX_APP_PATH_LENGTH = 512;
 // LLM 由来の文字列をログや返答へ載せる前に無害化する（#219 の実行エラーの記録でも使う）。
 // 改行を残すとログの 1 行を偽装できる（ログインジェクション）ため潰す。長さも切る。
 // Zl/Zp（U+2028 / U+2029）も落とす。JS ベースのログビューアでは行分割として解釈され得るため。
-export function safeLabel(value: string): string {
+// maxLength は監査ログ（#219）で発話をもう少し長く残したい場合に広げるためのもの。
+export function safeLabel(value: string, maxLength = 40): string {
   const cleaned = value.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").trim();
   // サロゲートペアを割らないよう、コードポイント単位で切る。
   const points = [...cleaned];
-  return points.length > 40 ? `${points.slice(0, 40).join("")}…` : cleaned;
+  return points.length > maxLength ? `${points.slice(0, maxLength).join("")}…` : cleaned;
 }
 
 export interface AppsConfig {
@@ -195,13 +196,16 @@ export function parseToolCall(
 // 実行結果をユーザーへ返す日本語の一文に整形する（/tts へ渡す文）。
 // LLM の reply をそのまま喋らせると「開いたよ」と言いながら失敗している事故が起きるため、
 // **実際に何が起きたか**はこちらの定型文で伝える。
-export type ToolOutcome = "ok" | "denied" | "failed";
+// not_running は「そのアプリの窓がまだ無い」（#219）。失敗と同じ文にすると
+// 「起動していないだけ」なのか「操作に失敗した」のか利用者が切り分けられない。
+export type ToolOutcome = "ok" | "denied" | "failed" | "not_running";
 
 export function toolSpeech(call: ToolCall, outcome: ToolOutcome): string {
   // 拒否・失敗の判定を **reply_only より先**に置く。拒否された要求は
   // parseToolCall が reply_only に落とすので、後ろに置くと「何も言わない」になってしまう。
   if (outcome === "denied") return "それはできないのだ。";
   if (outcome === "failed") return "うまくいかなかったのだ。";
+  if (outcome === "not_running") return "まだ開いていないのだ。";
   if (call.name === "reply_only") return "";
 
   switch (call.name) {

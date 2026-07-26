@@ -8,6 +8,9 @@ import { resolve } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt, buildMessages, parseClaudeReply } from "./chat";
 import { EMPTY_APPS, parseAppsConfig, toolSpeech, type AppsConfig } from "./tools";
+import { createExecutor, DEFAULT_TIMEOUT_MS } from "./executor";
+import { formatAudit } from "./audit";
+import { validateAppPath } from "./winexec";
 import {
   adjustAudioQuery,
   audioQueryUrl,
@@ -94,6 +97,15 @@ function readAppsOrExit(): AppsConfig {
   }
   try {
     const cfg = parseAppsConfig(text);
+    // 実行パスの妥当性は**起動時**に見る（#219）。「声で操作して初めて設定ミスに気づく」より、
+    // 立ち上がらない方が分かりやすい（フェイルクローズ）。executor 側でも実行直前に再検証する。
+    for (const [key, exePath] of Object.entries(cfg.apps)) {
+      try {
+        validateAppPath(exePath);
+      } catch (err) {
+        throw new Error(`apps.json entry "${key}": ${(err as Error).message}`);
+      }
+    }
     console.log(`apps.json loaded: ${cfg.keys.length ? cfg.keys.join(", ") : "(空)"}`);
     return cfg;
   } catch (err) {
@@ -104,9 +116,14 @@ function readAppsOrExit(): AppsConfig {
 
 const APPS = readAppsOrExit();
 
-// 実行層（#219）が入るまでは、決まった操作をログに出すだけで PC には一切触れない。
-// 既定を dry-run にしてあるのは、実行層を書く前に誤って実行経路へ繋がるのを防ぐため。
+// 実際に PC を操作するかどうか。**既定は dry-run（操作しない）**。
+// 声で PC が動くのは戻せない副作用なので、opt-in（RELAY_DRY_RUN=0）でしか有効にしない。
 const DRY_RUN = (process.env.RELAY_DRY_RUN ?? "1") !== "0";
+
+// 実行アダプタ（#219）。OS に触るのはこの下だけ。
+const EXECUTOR = createExecutor(APPS.apps, {
+  timeoutMs: Number(process.env.RELAY_EXEC_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS),
+});
 
 const app = new Hono();
 
@@ -161,22 +178,37 @@ app.post("/chat", async (c) => {
     // 検証は純粋ロジックへ委譲。ここへ来た時点で tool は「実行してよい形」に閉じている。
     const { rejectedTool, ...reply } = parseClaudeReply(text, APPS.keys);
 
-    // 監査ログ: どの発話から何をしようとしたかを残す（#219 の実行層でも同じ記録を使う）。
+    // 監査ログ: いつ・どの発話から・どのツールを・どの引数で実行したかを 1 行で残す（#219）。
     //
     // ⚠ 返答文の差し替えが要る。LLM は操作できたつもりで「開くね」と書いてくるが、
-    // 実際には拒否された／まだ実行層が無い、という食い違いが起きる。
+    // 実際には拒否された／実行に失敗した、という食い違いが起きる。
     // そのまま喋らせると「開いたよ」と言いながら何も起きない、が既定の挙動になってしまう。
     // 何が起きたかは LLM ではなくこちらの定型文で伝える。
+    const audit = (outcome: Parameters<typeof formatAudit>[0]["outcome"], detail?: string) =>
+      console.log(
+        formatAudit({
+          time: new Date().toISOString(),
+          utterance: body.message,
+          call: reply.tool,
+          outcome,
+          detail,
+        }),
+      );
+
     if (rejectedTool) {
       console.warn(`tool rejected: ${rejectedTool}`);
+      audit("denied", rejectedTool);
       reply.reply = toolSpeech(reply.tool, "denied");
     } else if (reply.tool.name !== "reply_only") {
-      console.log(
-        `${DRY_RUN ? "[dry-run] would execute" : "execute"}: ${JSON.stringify(reply.tool)}`,
-      );
-      // ⚠ 実行層はまだ無い（#219）。決めた操作を返すだけで PC には触れない。
       if (DRY_RUN) {
+        // 既定はこちら。決めた操作をログに出すだけで PC には触れない。
+        audit("dry-run");
         reply.reply = "その操作はまだできないのだ。";
+      } else {
+        // ここから先が唯一 OS に触る経路。executor は例外を投げず必ず outcome を返す。
+        const result = await EXECUTOR.execute(reply.tool);
+        audit(result.outcome, result.detail);
+        reply.reply = toolSpeech(reply.tool, result.outcome);
       }
     }
 
