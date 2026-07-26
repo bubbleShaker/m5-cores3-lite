@@ -41,6 +41,7 @@ Wi-Fi 認証情報はリポジトリに含めない。テンプレートをコ�
 ```sh
 cp src/secrets.h.example src/secrets.h
 # src/secrets.h を編集して WIFI_SSID / WIFI_PASS を自分の Wi-Fi に書き換える
+# あわせて RELAY_TOKEN を relay/.env と同じ値にする（#216・未定義だとビルドが止まる）
 ```
 
 `src/secrets.h` は `.gitignore` 済みなのでコミットされない。
