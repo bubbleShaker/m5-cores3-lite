@@ -3,14 +3,47 @@
 テーマK AIアバターのクラウド対話（案B: 中継サーバ経由）の中継サーバ。
 デバイスに API キーを載せないため、このサーバが `ANTHROPIC_API_KEY` を保持して Claude を呼ぶ。
 
+## 認証（#216）
+
+`/health` を除く**全エンドポイント**が共有トークンを要求する。
+リクエストに `X-Relay-Token: <RELAY_TOKEN>` を付ける。一致しなければ `401 {"error":"unauthorized"}`。
+
+```sh
+curl -s -X POST localhost:3000/chat \
+  -H "x-relay-token: $RELAY_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"message":"おはよう"}'
+```
+
+- `RELAY_TOKEN` が未設定、または 16 文字未満なら**サーバは起動しない**。
+  設定を忘れた時に無認証で立ち上がる方が危険なため（フェイルクローズ）。
+- 実機側は `src/secrets.h` の `RELAY_TOKEN` に同じ値を入れる（`.gitignore` 済み）。
+- 認証は**許可リスト方式**（`src/auth.ts` の `PUBLIC_PATHS`）。エンドポイントを追加すると
+  既定で保護されるので、付け忘れが穴にならない。
+
+> なぜ要るか: relay は `ANTHROPIC_API_KEY` を持ったまま LAN に口を開けている。無認証だと
+> 同じ Wi-Fi の誰でもそのキーで課金でき、`/pokemon/*` は外部 CDN への踏み台になる。
+
+### 既知の限界（この認証で防げないこと）
+
+`RELAY_URL` は `http://` なので、**トークンは平文で LAN を流れる**。同じアクセスポイントに
+いる攻撃者は通信を覗いてトークンを拾い、そのまま再利用できる（リプレイ）。
+つまりこの認証が守るのは「通信を盗聴していない第三者」までで、盗聴者は防げない。
+
+現状は「LAN 内の他人が偶然/故意に叩く」を塞ぐのが目的なので許容している。
+**#219 で PC 操作を足す時にここを再評価する**（HTTPS 化、または署名付きリクエストへの移行）。
+
 ## エンドポイント
 
-| メソッド | パス | リクエスト | レスポンス |
-|---------|------|-----------|-----------|
-| `POST` | `/chat` | `{ "message": "..." }` | `{ "reply", "expression", "action" }` |
-| `POST` | `/tts` | `{ "text": "...", "voice_id"?: 3 }` | `audio/wav`（16kHz/モノラル） |
-| `POST` | `/stt` | raw WAV body（`?language=ja&task=transcribe`） | `{ "text": "..." }` |
-| `GET`  | `/health` | — | `{ "ok": true }` |
+| メソッド | パス | リクエスト | レスポンス | 認証 |
+|---------|------|-----------|-----------|------|
+| `POST` | `/chat` | `{ "message": "..." }` | `{ "reply", "expression", "action" }` | 要 |
+| `POST` | `/tts` | `{ "text": "...", "voice_id"?: 3 }` | `audio/wav`（16kHz/モノラル） | 要 |
+| `POST` | `/stt` | raw WAV body（`?language=ja&task=transcribe`） | `{ "text": "..." }` | 要 |
+| `GET`  | `/pokemon/info/:id` | — | コンパクト JSON | 要 |
+| `GET`  | `/pokemon/sprite/:id` | — | RGB565 raw（18432B） | 要 |
+| `GET`  | `/pokemon/cry/:id` | — | `audio/wav` | 要 |
+| `GET`  | `/health` | — | `{ "ok": true }` | 不要 |
 
 - `expression`: `neutral` / `happy` / `thinking` / `sad` / `surprised`（アバターの語彙と一致）
 - `action`: `none` / `notify`
@@ -22,7 +55,7 @@
 ```sh
 cd relay
 npm install
-cp .env.example .env   # .env を編集して ANTHROPIC_API_KEY を入れる（.env は gitignore 済み）
+cp .env.example .env   # .env を編集して RELAY_TOKEN と ANTHROPIC_API_KEY を入れる（.env は gitignore 済み）
 ```
 
 ## 実行・テスト

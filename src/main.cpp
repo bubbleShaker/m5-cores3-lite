@@ -38,7 +38,13 @@
 #include "video_list.h"  // video_name_valid / VideoList 等（動画選択の純粋ロジック・#175）
 #include "video_fade.h"  // 曲選択スワイプの CD フェード遷移（状態機械の純粋ロジック・#209）
 #include "sd_pins.h"  // kSdCsPin 等（microSD の SPI ピン・転送専用ファームと共有・#157）
-#include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL（git管理外。secrets.h.example を参照）
+#include "secrets.h"  // WIFI_SSID / WIFI_PASS / RELAY_URL / RELAY_TOKEN（git管理外。secrets.h.example を参照）
+
+// 中継サーバの共有トークン（#216）。未定義のままだと全リクエストが 401 になり、
+// 「Wi-Fi は繋がるのに何も返ってこない」という分かりにくい症状になるので、ビルド時に止める。
+#if !defined(RELAY_TOKEN)
+#error "RELAY_TOKEN is not defined. Copy the RELAY_TOKEN line from src/secrets.h.example into src/secrets.h and set the same value as relay/.env"
+#endif
 
 // 定番OSS「スタックチャン」の顔（#121 で lib_deps 追加 / #125 でシーン化）。
 // ライブラリも Expression という型を持ち自作 face_logic.h と同名なので、名前空間は開かず
@@ -271,6 +277,27 @@ static void drawDialog(const std::string& reply, Expression expr) {
     M5.Display.setFont(&fonts::Font0);  // 既定に戻す（他描画への影響回避）
 }
 
+// 中継サーバへ HTTP を張る共通の入口（#216）。begin() と認証ヘッダの付与をここ 1 箇所に集約する。
+// 呼び出し側で addHeader を書く方式にしないのは、通信箇所を増やした時の付け忘れが
+// そのまま「認証を通らず 401 で黙って失敗する」不具合になるため（サーバ側の許可リスト方式と対）。
+// 中継サーバ宛て以外の URL には使わない（トークンを外部へ漏らさないため）。
+static void relayBegin(HTTPClient& http, const char* url) {
+    http.begin(url);
+    http.addHeader("X-Relay-Token", RELAY_TOKEN);
+}
+
+// 中継サーバの応答コードが 401 の時だけシリアルに記録する（#216）。
+// ビルド時の #error は「未定義」しか救えず、**値が違う**場合（例: .env だけ作り直した）は
+// ビルドが通って全通信が黙って失敗する。「Wi-Fi は繋がるのに返事が来ない」という
+// 切り分けにくい症状になるため、原因がトークン不一致だと分かる手掛かりを残す。
+// トークンが違えば中継宛ての 6 箇所すべてが同時に 401 になるので、呼び出し元は区別しない。
+// ⚠ トークンの値そのものは出さない（ログが漏洩経路になる）。
+static void relayWarnIfDenied(int code) {
+    if (code == 401) {
+        Serial.println("[relay] 401 unauthorized: src/secrets.h の RELAY_TOKEN と relay/.env の値が一致していない");
+    }
+}
+
 // 中継 /chat(Claude) に message を投げ、返答を out に格納する（実機依存部）。成否を返す。
 // 起動挨拶(fetchGreeting)と対話ループ(sheepOnTap)の両方から使う共通の問い合わせ部。
 // ※ Claude の推論は数秒かかるため、/stt と同様に既定5秒のタイムアウトを延ばす（既定だと -11）。
@@ -279,7 +306,7 @@ static bool fetchChatReply(const std::string& message, ReplyMessage& out) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
     HTTPClient http;
-    http.begin(RELAY_URL);
+    relayBegin(http, RELAY_URL);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(20000);  // Claude 推論待ち（読み取りタイムアウト回避）
 
@@ -290,7 +317,7 @@ static bool fetchChatReply(const std::string& message, ReplyMessage& out) {
     serializeJson(req, body);
 
     const int code = http.POST(String(body.c_str()));
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { relayWarnIfDenied(code); http.end(); return false; }
     out = parse_relay_reply(http.getString().c_str());
     http.end();
     return true;
@@ -454,7 +481,7 @@ static bool fetchTtsWav(const std::string& text, uint8_t** outBuf, size_t* outLe
     if (WiFi.status() != WL_CONNECTED) return false;
 
     HTTPClient http;
-    http.begin(ttsUrlFromRelay().c_str());
+    relayBegin(http, ttsUrlFromRelay().c_str());
     http.addHeader("Content-Type", "application/json");
 
     // body は ArduinoJson で組み立て（特殊文字を安全にエスケープ）。
@@ -466,7 +493,7 @@ static bool fetchTtsWav(const std::string& text, uint8_t** outBuf, size_t* outLe
     serializeJson(req, body);
 
     const int code = http.POST(String(body.c_str()));
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { relayWarnIfDenied(code); http.end(); return false; }
 
     // Content-Length。不明(-1)や上限超過は安全側に弾く。
     // 24kHz 化(#107)で同じ文字数でも WAV が約1.5倍になるため、長文解説が新たに無音落ちしないよう
@@ -636,12 +663,12 @@ static bool recordAndTranscribe(std::string& out) {
 
     // /stt へ raw WAV を POST。言語/タスクはサーバ既定（ja / transcribe）に委ねる。
     HTTPClient http;
-    http.begin(sttUrlFromRelay().c_str());
+    relayBegin(http, sttUrlFromRelay().c_str());
     http.addHeader("Content-Type", "audio/wav");
     // Whisper の CPU 推論は数秒かかることがあるため、既定5秒では読み取りタイムアウト(-11)する。
     http.setTimeout(20000);  // 20秒まで待つ
     const int code = http.POST(g_recWav, wavCap);
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { relayWarnIfDenied(code); http.end(); return false; }
 
     const String payload = http.getString();
     http.end();
@@ -1287,9 +1314,9 @@ bool            g_pokeHasSprite = false;   // スプライト取得に成功し�
 static bool httpGetString(const std::string& url, std::string& out) {
     if (WiFi.status() != WL_CONNECTED) return false;
     HTTPClient http;
-    http.begin(url.c_str());
+    relayBegin(http, url.c_str());
     const int code = http.GET();
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { relayWarnIfDenied(code); http.end(); return false; }
     // info JSON は中継契約で <1KB。Content-Length が判れば上限超過を先に弾く（sprite 側と一貫）。
     const int len = http.getSize();
     constexpr int kMaxInfoBytes = 8 * 1024;
@@ -1304,9 +1331,9 @@ static bool httpGetString(const std::string& url, std::string& out) {
 static bool fetchPokeSprite(int id) {
     if (WiFi.status() != WL_CONNECTED) return false;
     HTTPClient http;
-    http.begin(pokeSpriteUrl(id).c_str());
+    relayBegin(http, pokeSpriteUrl(id).c_str());
     const int code = http.GET();
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { relayWarnIfDenied(code); http.end(); return false; }
 
     const int len = http.getSize();
     if (len != static_cast<int>(kPokeSprBytes)) { http.end(); return false; }  // 契約長のみ受理
@@ -1348,9 +1375,9 @@ static bool speakCry(int id) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
     HTTPClient http;
-    http.begin(pokeCryUrl(id).c_str());
+    relayBegin(http, pokeCryUrl(id).c_str());
     const int code = http.GET();
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { relayWarnIfDenied(code); http.end(); return false; }
 
     // Content-Length。cry は relay 契約で 16kHz mono 16bit（~30-64KB）。TTS と同じ上限で安全側に弾く。
     const int len = http.getSize();

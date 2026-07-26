@@ -2,6 +2,7 @@
 // 純粋ロジックは chat.ts に分離済みなので、ここは「環境変数→Claude 呼び出し→整形」だけ。
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
+import { pathToFileURL } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
 import { SYSTEM_PROMPT, buildMessages, parseClaudeReply } from "./chat";
 import {
@@ -12,6 +13,7 @@ import {
   ttsCacheKey,
 } from "./tts";
 import { asrUrl, parseAsrText, parseSttOptions, validateAudio } from "./stt";
+import { isPublicPath, loadToken, TOKEN_HEADER, tokenMatches } from "./auth";
 import {
   extractPokemonInfo,
   parsePokemonId,
@@ -50,7 +52,42 @@ try {
 // 軽量・低レイテンシなのでアバターの即応チャットには Haiku が好適。
 const MODEL = "claude-haiku-4-5-20251001";
 
+// 共有トークンを起動時に一度だけ読む。未設定・短すぎる・テンプレートのままなら
+// ここで**起動を失敗させる**（#216）。「未設定なら無認証で起動」にすると設定を忘れた時に
+// 静かに丸腰になるため、起動しない方を選ぶ（フェイルクローズ）。
+// process.exit は never を返すので、この関数の戻り値は必ず妥当なトークンになる。
+function readTokenOrExit(): string {
+  try {
+    return loadToken(process.env);
+  } catch (err) {
+    console.error(`relay refused to start: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
+const RELAY_TOKEN = readTokenOrExit();
+
 const app = new Hono();
+
+// 認証ミドルウェア。**全ルートに掛けて /health だけ免除する**（許可リスト方式）。
+// エンドポイントごとに足す方式にしないのは、今後増やした時の付け忘れがそのまま穴になるため。
+// ルート定義より前に登録する必要がある（Hono は登録順にミドルウェアを適用する）。
+app.use("*", async (c, next) => {
+  // 判定には c.req.path を使う（Hono がルーティングに使う値そのもの）。
+  // new URL(c.req.url).pathname で別計算すると「認可した対象」と「実行されるハンドラ」が
+  // 別経路で決まることになり、パス正規化の差がそのままバイパスの余地になる。
+  if (isPublicPath(c.req.path)) {
+    return next();
+  }
+  if (!tokenMatches(RELAY_TOKEN, c.req.header(TOKEN_HEADER))) {
+    // 攻撃の兆候と、利用者側のトークン不一致（設定ミス）を切り分けるための記録。
+    // ⚠ 受け取ったトークンの値は絶対に出さない（ログが漏洩経路になる）。
+    console.warn(`unauthorized ${c.req.method} ${c.req.path}`);
+    // 理由（未設定/不一致）はレスポンスに含めない。攻撃者に手がかりを与えないため。
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  await next();
+});
 
 app.get("/health", (c) => c.json({ ok: true }));
 
@@ -407,8 +444,18 @@ app.get("/pokemon/cry/:id", async (c) => {
   }
 });
 
-const port = Number(process.env.PORT ?? 3000);
-serve({ fetch: app.fetch, port });
-console.log(`relay listening on http://localhost:${port}`);
+// 実際に待ち受けるのは「このファイルを直接実行した時」だけにする。
+// こうしないと test 側から app を import した瞬間にポートを掴んでしまい、
+// 認証ミドルウェアの結線（登録順・免除の範囲）を app.request() で検証できない。
+// 純粋ロジックのテストだけでは「middleware をルート定義より前に置いた」ことを保証できず、
+// そこが今回いちばん壊れやすい箇所なので、テストできる形にしておく。
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  const port = Number(process.env.PORT ?? 3000);
+  serve({ fetch: app.fetch, port });
+  console.log(`relay listening on http://localhost:${port}`);
+}
 
 export default app;
