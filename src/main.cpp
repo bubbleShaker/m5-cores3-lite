@@ -20,6 +20,7 @@
 #include "gesture.h"  // touch_update（短タップ/長押し検出・純粋ロジック）
 #include "scene.h"    // next_scene（シーン巡回・純粋ロジック）
 #include "menu.h"     // menu_move（メニューのカーソル移動・純粋ロジック・#132）
+#include "squeeze.h"  // squeeze_*（傾け・シェイクで動くぷにぷに玉の物理・純粋ロジック・#240）
 #include "voice.h"    // voice_baa_pcm（メェの PCM 合成・純粋ロジック）
 #include "gem.h"      // Gem / gem_count / gem_at（宝石図鑑データ・純粋ロジック）
 #include "gem3d.h"    // gem3d_*（宝石3D回転の純粋数学：回転/投影/カリング/法線/明るさ）
@@ -3476,6 +3477,214 @@ static void videoExit() {
     g_videoReady = false;
 }
 
+// ───────── スクイーズシーン（傾け・シェイクで動くぷにぷに玉 / Issue #240） ─────────
+// 物理は squeeze.cpp（native テスト済み）が全て持ち、ここは「IMU を読む」「描く」だけを担う。
+// 反発係数・シェイク閾値のような調整点は squeeze.h の定数側にあり、この層には無い。
+
+// IMU の軸を画面座標へ写すための符号。
+// squeeze.h の約束どおり、渡すのは「玉が引っ張られる向き」であってセンサの生値ではない。
+// 加速度センサは静止時に **上を向いている軸が +1G** を示すため、重力の向きは生値の逆になる。
+//   例) 端末を立てて持つと画面上向き＝IMU +Y なので ay=+1 → 玉は画面下(+y)へ落ちてほしい
+//       ⇒ gy = +ay。同様に右へ傾けると ax<0 になるので gx = -ax。
+// ⚠ M5Unified の軸割り当てと setRotation(1) の組み合わせに依存するため、実機で
+//   「傾けた向きへ転がる」ことを必ず目視で確認する（#240 M3）。逆だったらここの符号だけ直す。
+constexpr float kSqImuSignX = -1.0f;
+constexpr float kSqImuSignY = +1.0f;
+// 面外成分(z)に符号の定数は要らない。物理側では二乗して「合力の大きさ」にしか使わないので、
+// 反転しても結果が変わらない。ここに定数を置くと「調整できる」という誤情報になる。
+
+constexpr float kSqRadius = 34.0f;  // 玉の基準半径(px)
+
+// 配色。背景は暗いスレート、玉はぷにぷにしたピンク。
+constexpr uint16_t kColSqBg    = 0x18C4;  // 暗いスレート
+constexpr uint16_t kColSqFrame = 0x39C7;  // 壁を示す枠線
+constexpr uint16_t kColSqBody  = 0xFB74;  // 玉の本体（ピンク）
+constexpr uint16_t kColSqEdge  = 0xC94B;  // 玉の輪郭（濃いピンク）
+constexpr uint16_t kColSqShine = 0xFE5B;  // 玉のハイライト（淡いピンク）
+constexpr uint16_t kColSqGlow  = 0xFD20;  // 吸着した壁の発光
+constexpr uint16_t kColSqHint  = 0x6B4D;  // 操作ヒントの文字
+
+static SqueezeField g_sqField;               // 中身は enter で画面サイズに合わせる
+static SqueezeState g_sqState;               // 玉の物理状態
+static uint32_t     g_sqPrevMs = 0;          // 前フレームの時刻（dt の算出用）
+static bool         g_sqImuOk  = false;      // IMU が載っているか（enter で1回だけ判定）
+static M5Canvas     g_sqCanvas(&M5.Display); // ちらつき防止のフルスクリーンキャンバス
+
+// 直近に読めた「引っ張られる向き」。読み取り失敗フレームで使い回す（下記参照）。
+// 初期値は平置き相当。全ゼロ (|g|=0) は自由落下を意味しシェイクと誤検出されるため使えない。
+static float g_sqPullX = 0.0f, g_sqPullY = 0.0f, g_sqPullZ = 1.0f;
+
+// キャンバス確保に失敗した時のフォールバック用。前フレームに玉を描いた矩形を覚えておき、
+// そこだけ塗り潰して消す（全面クリアだと直描きでは激しくちらつくため）。
+static int g_sqPrevX = 0, g_sqPrevY = 0, g_sqPrevW = 0, g_sqPrevH = 0;
+
+// キャンバス確保の前後で PSRAM の空きを出す。videoLogPsram と同じ数字だが、
+// あちらの "[video]" 前置は PLAN.md に grep 手順として載っているため流用しない。
+static void squeezeLogPsram(const char* tag, size_t want) {
+    Serial.printf("[squeeze] %s want=%u psram_free=%u psram_largest=%u\n",
+                  tag,
+                  static_cast<unsigned>(want),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
+// 玉が引っ張られる向き（画面座標・G単位）を IMU から読む。
+// ⚠ M5.Imu.getAccel() の戻り値は「IMU があるか」ではなく IMU_Class::update() のセンサマスク、
+//   すなわち **新しいサンプルが取れたか** である（M5Unified の IMU_Class.cpp）。BMI270 は
+//   データレディビットが立っていなければ 0 を返すので、正常動作中でも false は普通に起きる。
+//   その場合も引数には直近の有効値が入っているが、ここでは自前の前回値を使い回す方が
+//   意図が明確なのでそうする。false を「IMU 無し」と解釈してはいけない。
+static void squeezeReadPull(float& gx, float& gy, float& gz) {
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    if (M5.Imu.getAccel(&ax, &ay, &az)) {
+        g_sqPullX = kSqImuSignX * ax;
+        g_sqPullY = kSqImuSignY * ay;
+        g_sqPullZ = az;
+    }
+    gx = g_sqPullX;
+    gy = g_sqPullY;
+    gz = g_sqPullZ;
+}
+
+// 背景（壁の枠・吸着中の発光・操作ヒント）を描く。玉より先に呼ぶ。
+static void squeezeDrawBg(LovyanGFX& gfx, const SqueezeState& s) {
+    gfx.fillScreen(kColSqBg);
+
+    // 吸着中の壁を光らせる。残り時間に応じて帯を細くし、剥がれる直前が分かるようにする。
+    if (s.wall != SqueezeWall::None) {
+        const float ratio = s.stuck_left / kSqStickSec;  // 1.0 → 0.0
+        const int   band  = 3 + static_cast<int>(9.0f * (ratio < 0.0f ? 0.0f : ratio));
+        switch (s.wall) {
+            case SqueezeWall::Left:   gfx.fillRect(0, 0, band, kScreenH, kColSqGlow); break;
+            case SqueezeWall::Right:  gfx.fillRect(kScreenW - band, 0, band, kScreenH, kColSqGlow); break;
+            case SqueezeWall::Top:    gfx.fillRect(0, 0, kScreenW, band, kColSqGlow); break;
+            case SqueezeWall::Bottom: gfx.fillRect(0, kScreenH - band, kScreenW, band, kColSqGlow); break;
+            case SqueezeWall::None:   break;
+        }
+    }
+
+    // 振られている最中は枠を明るくする。玉が壁へ飛ぶ前に「効いている」ことが分かる。
+    const uint16_t frame = s.shake > 0.6f ? kColSqGlow
+                         : s.shake > 0.25f ? kColSqShine
+                                           : kColSqFrame;
+    gfx.drawRect(0, 0, kScreenW, kScreenH, frame);
+    gfx.drawRect(1, 1, kScreenW - 2, kScreenH - 2, frame);
+
+    gfx.setFont(&fonts::lgfxJapanGothic_16);
+    gfx.setTextDatum(textdatum_t::top_left);
+    gfx.setTextColor(kColSqHint, kColSqBg);
+    gfx.drawString("かたむける=ころがる / ふる=かべにつく", 8, 6);
+    if (!g_sqImuOk) {
+        gfx.setTextColor(TFT_RED, kColSqBg);
+        gfx.drawString("IMU が見つかりません", 8, kScreenH - 24);
+    }
+}
+
+// 玉そのものを描き、描いた矩形を out に返す（フォールバック時の消去範囲に使う）。
+static void squeezeDrawBlob(LovyanGFX& gfx, const SqueezeState& s, const SqueezeField& f,
+                            int* out_x, int* out_y, int* out_w, int* out_h) {
+    const float sx = squeeze_scale_x(s);
+    const float sy = squeeze_scale_y(s);
+    int rx = static_cast<int>(f.radius * sx);
+    int ry = static_cast<int>(f.radius * sy);
+    if (rx < 3) rx = 3;
+    if (ry < 3) ry = 3;
+
+    // 吸着中は潰れたぶんだけ壁へ寄せて描く。物理側は「中心は必ず半径ぶん内側」という不変条件を
+    // 守っており（テスト済み）、そのまま描くと壁との間に潰れた量だけ隙間が空いて浮いて見える。
+    // 見た目の都合なので物理には持ち込まず、この層で寄せる。
+    // 寄せ量は「基準半径 − 潰れた後の半径」＝ f.radius * (1 - 法線方向の倍率) で導く。
+    // 物理側の定数(kSqStickFlatN)を直接読まないので、物理を調整しても描画は追随する。
+    float cx = s.x, cy = s.y;
+    switch (s.wall) {
+        case SqueezeWall::Left:   cx -= f.radius * (1.0f - sx); break;
+        case SqueezeWall::Right:  cx += f.radius * (1.0f - sx); break;
+        case SqueezeWall::Top:    cy -= f.radius * (1.0f - sy); break;
+        case SqueezeWall::Bottom: cy += f.radius * (1.0f - sy); break;
+        case SqueezeWall::None:   break;
+    }
+    const int ix = static_cast<int>(cx);
+    const int iy = static_cast<int>(cy);
+
+    gfx.fillEllipse(ix, iy, rx, ry, kColSqBody);
+    gfx.drawEllipse(ix, iy, rx, ry, kColSqEdge);
+    // 左上のハイライト。潰れに合わせて位置と大きさも縮むので、変形が艶に伝わる。
+    gfx.fillEllipse(ix - rx / 3, iy - ry / 3, rx / 3, ry / 4, kColSqShine);
+    gfx.fillCircle(ix - rx / 2, iy - ry / 2, rx / 8 + 1, TFT_WHITE);
+
+    *out_x = ix - rx - 2;
+    *out_y = iy - ry - 2;
+    *out_w = rx * 2 + 5;
+    *out_h = ry * 2 + 5;
+}
+
+static void squeezeEnter() {
+    g_sqField.w      = static_cast<float>(kScreenW);
+    g_sqField.h      = static_cast<float>(kScreenH);
+    g_sqField.radius = kSqRadius;
+    squeeze_reset(g_sqState, g_sqField);
+    g_sqPrevMs = millis();
+    g_sqImuOk  = M5.Imu.isEnabled();
+
+    g_sqPullX = 0.0f;
+    g_sqPullY = 0.0f;
+    g_sqPullZ = 1.0f;  // 初回読み取りまでは平置き相当（全ゼロは自由落下扱いになるため不可）
+
+    // フルスクリーンキャンバスを PSRAM に確保（約150KB）。アート・宝石と同じ作法だが、
+    // あちらと違いこのシーンは exit で必ず返す。動画再生の音声は 7MB 級の「連続」確保で
+    // PSRAM の余裕が際どいため（#166）、常駐を1枚増やさない。
+    // ⚠ LovyanGFX は PSRAM 確保に失敗すると黙って内蔵RAM(DMA)へ落ちる。内蔵RAMから
+    //   150KB を奪うと Wi-Fi/TTS が窒息するので、確保の前後を必ずログに残す。
+    if (!g_sqCanvas.getBuffer()) {
+        constexpr size_t kSqCanvasBytes = static_cast<size_t>(kScreenW) * kScreenH * 2;
+        squeezeLogPsram("canvas-before", kSqCanvasBytes);
+        g_sqCanvas.setPsram(true);
+        g_sqCanvas.createSprite(kScreenW, kScreenH);
+        squeezeLogPsram(g_sqCanvas.getBuffer() ? "canvas-ok" : "canvas-fail", kSqCanvasBytes);
+    }
+    M5.Display.fillScreen(kColSqBg);
+    g_sqPrevW = g_sqPrevH = 0;  // 直描き経路の「前回の消し跡」を無効化する
+}
+
+static void squeezeUpdate(uint32_t now) {
+    // dt は実時刻から求める。物理側で [0, kSqMaxDt] にクランプされるので、
+    // 描画が詰まって間隔が開いても玉が壁を突き抜けることはない。
+    const float dt = (now - g_sqPrevMs) / 1000.0f;
+    g_sqPrevMs = now;
+
+    SqueezeInput in;
+    in.dt = dt;
+    squeezeReadPull(in.gx, in.gy, in.gz);
+    squeeze_update(g_sqState, g_sqField, in);
+
+    if (g_sqCanvas.getBuffer()) {
+        squeezeDrawBg(g_sqCanvas, g_sqState);
+        int bx, by, bw, bh;
+        squeezeDrawBlob(g_sqCanvas, g_sqState, g_sqField, &bx, &by, &bw, &bh);
+        g_sqCanvas.pushSprite(&M5.Display, 0, 0);
+        return;
+    }
+
+    // フォールバック（キャンバス確保に失敗）: 前回の玉だけ消してから描き直す。
+    // 壁の発光とヒントは出さない（全面描き直しになり直描きではちらつくため）。
+    if (g_sqPrevW > 0) M5.Display.fillRect(g_sqPrevX, g_sqPrevY, g_sqPrevW, g_sqPrevH, kColSqBg);
+    squeezeDrawBlob(M5.Display, g_sqState, g_sqField, &g_sqPrevX, &g_sqPrevY, &g_sqPrevW, &g_sqPrevH);
+    M5.Display.drawRect(0, 0, kScreenW, kScreenH, kColSqFrame);
+}
+
+// タップで仕切り直し（中央へ戻して静止させる）。壁に貼り付いたまま迷子になった時の逃げ道。
+// loop は onTap → update に **同じ now** を渡す。ここで millis() を読み直すと now より
+// 進んだ値が入り、直後の update で now - g_sqPrevMs が uint32 で巻き戻って巨大な dt になる。
+static void squeezeOnTap(uint32_t now, int /*touchX*/) {
+    squeeze_reset(g_sqState, g_sqField);
+    g_sqPrevMs = now;
+}
+
+// 退場時にキャンバス(約150KB)を返す。常駐させると動画再生の音声確保を圧迫する（#166）。
+static void squeezeExit() {
+    g_sqCanvas.deleteSprite();
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
 // exit を持たないシーンは4要素目を省略する（aggregate 初期化で nullptr になる）。
 const SceneDef kScenes[] = {
@@ -3488,6 +3697,7 @@ const SceneDef kScenes[] = {
     { "スタックチャン", stackchanEnter, stackchanUpdate, stackchanOnTap, stackchanExit },  // 本家アバター（#125）
     { "パックマン",   pacEnter,    pacUpdate,    pacOnTap    },  // 自作パックマン（#134 Step2）
     { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit, videoOnSwipe, videoOnLongPress, videoPaceLimitMs },  // CDカルーセルで選んで再生（#142/#148/#150/#152/#170/#175/#193/#198/#207）
+    { "スクイーズ",   squeezeEnter, squeezeUpdate, squeezeOnTap, squeezeExit },  // 傾け・シェイクで動くぷにぷに玉（#240）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号
@@ -3504,7 +3714,7 @@ constexpr int kMenuItemCount = kSceneCount + 1;  // 先頭の音声トグル + �
 
 // メニュー行のレイアウト（1行目Y・行間・行の文字高）。static_assert で使うためファイルスコープに置く。
 constexpr int kMenuRowY0    = 28;  // 1行目のY
-constexpr int kMenuRowH     = 21;  // 行間（シーン増加に合わせ 26→24→21 と詰めた・#134/#142）
+constexpr int kMenuRowH     = 19;  // 行間（シーン増加に合わせ 26→24→21→19 と詰めた・#134/#142/#240）
 constexpr int kMenuRowGlyphH = 16;  // lgfxJapanGothic_16 の文字高（下端計算用）
 // 全項目が画面(kScreenH)に収まることをコンパイル時に保証する。シーンを増やして溢れたらここで失敗し、
 // 実機で気付く前にビルドで止まる（開放閉鎖：シーン追加でレイアウトが黙って壊れないための安全網・#132）。
