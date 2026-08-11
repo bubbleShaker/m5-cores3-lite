@@ -39,6 +39,9 @@ constexpr float kSqKickSpeed = 900.0f;
 // シェイク検出の不応期(秒)。1回の振りは数フレームにまたがるため、これを置かないと
 // 同じ振りで何度もキックが入って挙動が暴れる。
 constexpr float kSqShakeCoolSec = 0.25f;
+// 演出用シェイク強度(SqueezeState::shake)が冷める速さ(1/s)。見た目の余韻だけを決める値で、
+// 物理には影響しない。変形の減衰(kSqWobbleDecay)とは別物なので定数も分ける。
+constexpr float kSqShakeCool = 3.0f;
 // 吸着方向を決めるのに必要な画面内成分の最小値(G)。画面に垂直(z)にだけ振った時に
 // 上下左右のどこかへ勝手に貼り付くのを防ぐ。
 constexpr float kSqStickMinPlane = 0.35f;
@@ -88,7 +91,7 @@ struct SqueezeState {
     float       stuck_left = 0.0f;  // 吸着の残り時間(秒)
 
     // シェイク検出。
-    float shake     = 0.0f;  // 直近のシェイク強度 0..1（減衰する・演出用）
+    float shake     = 0.0f;  // 直近のシェイク強度 0..1（減衰する・描画の演出に使う）
     float cool_left = 0.0f;  // 不応期の残り時間(秒)
 };
 
@@ -103,8 +106,11 @@ struct SqueezeInput {
 // 玉をフィールド中央に置き、速度・変形・吸着を全て初期化する。
 void squeeze_reset(SqueezeState& s, const SqueezeField& f);
 
-// 物理を dt だけ進める。dt は内部で [0, kSqMaxDt] にクランプされる。
+// 物理を dt だけ進める。dt は内部で [0, kSqMaxDt] にクランプされる（負値も 0 に丸まる）。
+// 入力に非有限値(NaN/Inf)が混じったフレームは丸ごと捨て、状態を汚さない。
 // 呼び出し後、玉の中心は必ずフィールド内に収まっている（不変条件）。
+// ただしこれは f.radius * 2 <= f.w かつ f.radius * 2 <= f.h の時に限る。玉がフィールドより
+// 大きい退化した設定では中心を収める場所が無いため、この保証は成り立たない。
 void squeeze_update(SqueezeState& s, const SqueezeField& f, const SqueezeInput& in);
 
 // 描画用の半径倍率。基準半径 f.radius に掛けて使う。無変形なら 1.0。

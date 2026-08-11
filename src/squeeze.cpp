@@ -33,8 +33,7 @@ void kick_wobble(SqueezeState& s, float amp, bool horiz) {
 }
 
 // 壁に当たった時の処理。位置を面まで戻し、法線速度を反転して減衰させ、変形を起こす。
-// 戻り値は「実際に当たったか」。
-bool bounce_axis(float& pos, float& vel, float lo, float hi, SqueezeState& s, bool horiz) {
+void bounce_axis(float& pos, float& vel, float lo, float hi, SqueezeState& s, bool horiz) {
     float hit_speed = 0.0f;
     if (pos < lo) {
         pos       = lo;
@@ -45,11 +44,10 @@ bool bounce_axis(float& pos, float& vel, float lo, float hi, SqueezeState& s, bo
         hit_speed = vel;
         vel       = -vel * kSqBounce;
     } else {
-        return false;
+        return;
     }
     // 衝突の強さを 0..1 に正規化して変形の振幅にする。速く当たるほど大きく潰れる。
     kick_wobble(s, hit_speed / kSqMaxSpeed, horiz);
-    return true;
 }
 
 // 吸着先の壁を、引っ張られている向きの支配的な軸から決める。
@@ -89,13 +87,19 @@ void squeeze_reset(SqueezeState& s, const SqueezeField& f) {
 }
 
 void squeeze_update(SqueezeState& s, const SqueezeField& f, const SqueezeInput& in) {
+    // 非有限な入力（センサ異常・未初期化）は入口で捨てる。1フレームでも通すと位置も速度も
+    // NaN になり、以降 clampf の比較が全て false になって素通しするため二度と復帰しない。
+    if (!std::isfinite(in.gx) || !std::isfinite(in.gy) ||
+        !std::isfinite(in.gz) || !std::isfinite(in.dt)) {
+        return;
+    }
     const float dt = clampf(in.dt, 0.0f, kSqMaxDt);
 
     // 変形と各種タイマーは、動いていなくても常に時間で進める。
     s.wob_t += dt;
     if (s.cool_left > 0.0f) s.cool_left -= dt;
     // 演出用のシェイク強度は指数的に冷ます（画面のエフェクトが一瞬で消えないように）。
-    s.shake -= s.shake * clampf(kSqWobbleDecay * dt, 0.0f, 1.0f);
+    s.shake -= s.shake * clampf(kSqShakeCool * dt, 0.0f, 1.0f);
 
     // ── シェイク検出 ──
     // 静止・傾けでは合力の大きさは常に 1G なので、1G からのズレがそのまま「振られた量」になる。
@@ -114,7 +118,10 @@ void squeeze_update(SqueezeState& s, const SqueezeField& f, const SqueezeInput& 
         // 強く振られた: 引っ張られた向きの壁へ叩きつけて貼り付ける。
         const SqueezeWall wall = pick_wall(in.gx, in.gy);
         if (wall != SqueezeWall::None) {
-            stick_to(s, f, wall, clampf(dev / kSqShakeStick, 0.0f, 1.0f));
+            // 吸着の強さは「閾値をどれだけ超えたか」で決める。閾値ちょうどで 0.5、
+            // 閾値の2倍で 1.0。dev/kSqShakeStick は必ず 1 以上なので使えない。
+            const float over = (dev - kSqShakeStick) / kSqShakeStick;
+            stick_to(s, f, wall, 0.5f + 0.5f * clampf(over, 0.0f, 1.0f));
             return;  // 貼り付いた瞬間は物理を進めない（この場で静止している）
         }
     }
@@ -133,6 +140,7 @@ void squeeze_update(SqueezeState& s, const SqueezeField& f, const SqueezeInput& 
         }
         // 剥がれた: 壁から内側へ弾き出してから通常の物理へ戻す。
         // 初速を与えないと壁に貼り付いたまま毎フレーム再衝突する。
+        const bool peel_horiz = (s.wall == SqueezeWall::Left || s.wall == SqueezeWall::Right);
         switch (s.wall) {
             case SqueezeWall::Left:   s.vx = +kSqPeelSpeed; break;
             case SqueezeWall::Right:  s.vx = -kSqPeelSpeed; break;
@@ -142,6 +150,9 @@ void squeeze_update(SqueezeState& s, const SqueezeField& f, const SqueezeInput& 
         }
         s.wall       = SqueezeWall::None;
         s.stuck_left = 0.0f;
+        // 張り付き形状と同じ潰れ量から減衰振動を始める（1 - kSqWobbleMax*amp == kSqStickFlatN
+        // となる amp）。こうしないと剥がれた瞬間に形が 1 コマで丸へ飛ぶ。
+        kick_wobble(s, clampf((1.0f - kSqStickFlatN) / kSqWobbleMax, 0.0f, 1.0f), peel_horiz);
     }
 
     // ── 自由運動 ──

@@ -332,6 +332,144 @@ void test_shake_cooldown_limits_repeat_kicks() {
     TEST_ASSERT_TRUE(s.vx - after_first < grav_only * 1.5f);
 }
 
+// dt=0 のフレーム（同じ時刻で2回呼ばれた等）は状態を変えない
+void test_zero_dt_is_noop() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    advance(s, f, 1.0f, 0.0f, 0.0f, 5);  // まず動かしておく
+    const float x = s.x, y = s.y, vx = s.vx, vy = s.vy;
+    SqueezeInput in;
+    in.gx = 1.0f;
+    in.dt = 0.0f;
+    squeeze_update(s, f, in);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, x, s.x);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, y, s.y);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, vx, s.vx);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, vy, s.vy);
+}
+
+// 負の dt（時刻が巻き戻った）でも位置が逆流しない（0 に丸まる）
+void test_negative_dt_does_not_rewind() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    advance(s, f, 1.0f, 0.0f, 0.0f, 5);
+    const float x = s.x;
+    SqueezeInput in;
+    in.gx = 1.0f;
+    in.dt = -1.0f;
+    squeeze_update(s, f, in);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, x, s.x);
+    TEST_ASSERT_TRUE(inside(s, f));
+}
+
+// 非有限な入力（センサ異常）は捨てられ、状態が NaN に汚染されない
+void test_non_finite_input_is_rejected() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    SqueezeInput bad;
+    bad.gx = std::nanf("");
+    bad.gy = 1.0f;
+    bad.dt = 0.033f;
+    squeeze_update(s, f, bad);
+    TEST_ASSERT_FALSE(std::isnan(s.x));
+    TEST_ASSERT_FALSE(std::isnan(s.vx));
+    // 汚染されていないので、以後の正常な入力にちゃんと反応する
+    advance(s, f, 1.0f, 0.0f, 0.0f, 5);
+    TEST_ASSERT_TRUE(s.x > 160.0f);
+    TEST_ASSERT_TRUE(inside(s, f));
+}
+
+// 吸着中でも、強く振れば別の壁へ貼り替わる
+void test_restick_moves_to_another_wall() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    SqueezeInput in;
+    in.gx = 3.0f;
+    in.dt = 0.033f;
+    squeeze_update(s, f, in);
+    TEST_ASSERT_EQUAL(static_cast<int>(SqueezeWall::Right), static_cast<int>(s.wall));
+    // 不応期を明けてから逆向きへ強く振る
+    advance(s, f, 0.0f, 0.0f, 1.0f, 10);
+    in.gx = -3.0f;
+    squeeze_update(s, f, in);
+    TEST_ASSERT_EQUAL(static_cast<int>(SqueezeWall::Left), static_cast<int>(s.wall));
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, f.radius, s.x);
+}
+
+// 剥がれる瞬間に形が飛ばない（張り付き形状から連続してぷるんと戻る）
+void test_peel_shape_is_continuous() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    SqueezeInput in;
+    in.gx = 3.0f;
+    in.dt = 0.033f;
+    squeeze_update(s, f, in);
+    const float stuck_sx = squeeze_scale_x(s);
+    // 剥がれるまで進める
+    SqueezeInput rest;
+    rest.gz = 1.0f;
+    rest.dt = 0.033f;
+    while (s.wall != SqueezeWall::None) squeeze_update(s, f, rest);
+    // 剥がれた直後もほぼ同じ潰れ具合から始まる（1コマで丸へ飛ばない）
+    TEST_ASSERT_FLOAT_WITHIN(0.06f, stuck_sx, squeeze_scale_x(s));
+}
+
+// 不応期が明ければ、続けて振った時にまたキックが入る
+void test_kick_resumes_after_cooldown() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    SqueezeInput in;
+    in.gx = 2.0f;  // ズレ 1.0（キックのみ）
+    in.dt = 0.033f;
+    squeeze_update(s, f, in);
+    const float first = s.vx;
+    TEST_ASSERT_TRUE(first > 0.0f);
+    // 不応期(0.25s)を無入力で明けてから、もう一度同じ強さで振る
+    advance(s, f, 0.0f, 0.0f, 1.0f, 12);
+    const float before = s.vx;
+    squeeze_update(s, f, in);
+    TEST_ASSERT_TRUE(s.vx - before > kSqKickSpeed * 0.5f);
+}
+
+// 斜めに弱く振った時、画面内成分が閾値に届かなければ吸着しない
+void test_stick_needs_enough_in_plane_component() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    SqueezeInput in;
+    // 画面内成分は kSqStickMinPlane 未満、合力の大きさは吸着閾値を超える
+    in.gx = kSqStickMinPlane * 0.5f;
+    in.gy = kSqStickMinPlane * 0.5f;
+    in.gz = 3.0f;
+    in.dt = 0.033f;
+    squeeze_update(s, f, in);
+    TEST_ASSERT_EQUAL(static_cast<int>(SqueezeWall::None), static_cast<int>(s.wall));
+}
+
+// 半径倍率は常に正（描画側が負の半径を渡されない）
+void test_scales_stay_positive() {
+    const SqueezeField f = field();
+    SqueezeState s;
+    squeeze_reset(s, f);
+    SqueezeInput in;
+    in.dt = 0.033f;
+    // 壁への叩きつけと自由運動を長時間混ぜ、あらゆる位相を通す
+    for (int i = 0; i < 600; ++i) {
+        in.gx = (i % 7 == 0) ? 3.0f : ((i % 3 == 0) ? -1.0f : 1.0f);
+        in.gy = (i % 5 == 0) ? -3.0f : 0.5f;
+        squeeze_update(s, f, in);
+        TEST_ASSERT_TRUE(squeeze_scale_x(s) > 0.0f);
+        TEST_ASSERT_TRUE(squeeze_scale_y(s) > 0.0f);
+        TEST_ASSERT_TRUE(inside(s, f));
+    }
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_reset_is_centered_and_idle);
@@ -354,5 +492,13 @@ int main(int, char**) {
     RUN_TEST(test_speed_is_capped);
     RUN_TEST(test_shake_level_decays);
     RUN_TEST(test_shake_cooldown_limits_repeat_kicks);
+    RUN_TEST(test_zero_dt_is_noop);
+    RUN_TEST(test_negative_dt_does_not_rewind);
+    RUN_TEST(test_non_finite_input_is_rejected);
+    RUN_TEST(test_restick_moves_to_another_wall);
+    RUN_TEST(test_peel_shape_is_continuous);
+    RUN_TEST(test_kick_resumes_after_cooldown);
+    RUN_TEST(test_stick_needs_enough_in_plane_component);
+    RUN_TEST(test_scales_stay_positive);
     return UNITY_END();
 }
