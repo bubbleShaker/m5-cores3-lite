@@ -3707,6 +3707,11 @@ constexpr int kSpLobeRad  = 44;  // ローブ（外周の丸い羽根）の半�
 constexpr int kSpLobeHole = 20;  // ローブ中央のベアリング穴の半径
 constexpr int kSpHubRad   = 26;  // 中央ハブの描画半径
 
+// タッチ判定（spinner.h・純粋層）が描画したスピナー全体を覆うことを保証する。
+// 形状を大きくした時にローブの外周が「触れない帯」になるのを、実機で気付く前に止める。
+static_assert(kSpBodyTouchR >= kSpLobeDist + kSpLobeRad,
+              "spinner touch radius must cover the drawn lobes");
+
 // タッチ判定の半径は spinner.h（kSpHubTouchR / kSpBodyTouchR）にある。座標だけで決まる
 // 純粋な判定なので純粋ロジック層に置き、ここは画面中心を引いて渡すだけにしてある。
 
@@ -3819,22 +3824,37 @@ static void spinnerDrawBody(LovyanGFX& gfx, const SpinnerState& s, bool held, bo
 }
 
 // 文字まわり（操作ヒントと回転数）。スピナーの外側だけに描く。
+// ⚠ 4隅に振り分けている。lgfxJapanGothic_16 は全角16px・半角8px なので、左右で同じ行を
+//   使う時は「左の文字数×16 + 右の文字数×16 < 320」を守ること。右側は背景ごと塗るため、
+//   はみ出すと左のヒントが黙って消える（最高rpm を足した時に実際にやった）。
 static void spinnerDrawText(LovyanGFX& gfx, const SpinnerState& s) {
     gfx.setFont(&fonts::lgfxJapanGothic_16);
-    gfx.setTextDatum(textdatum_t::top_left);
     gfx.setTextColor(kColSpHint, kColSpBg);
-    gfx.drawString("中央を押さえて本体をはじく", 4, 2);
 
+    // 左上と左下は常時（全角10文字=160px ≒ 画面の半分に収まる長さにしてある）。
+    gfx.setTextDatum(textdatum_t::top_left);
+    gfx.drawString("中央を押さえてはじく", 4, 2);
     gfx.setTextDatum(textdatum_t::bottom_left);
-    gfx.drawString("隅を長押し→メニュー", 4, kScreenH - 2);
+    gfx.drawString("長押し→メニュー", 4, kScreenH - 2);
 
-    // 回転数・最高回転数・累計回転。止まっている時は出さない（静止画面に 0 が居座るのを避ける）。
-    // peak_omega は完全停止でリセットされるので、この表示は「今回の回しのベスト」になる。
+    // 右上: 回転中は今回のベスト、止まっている時は仕切り直しの案内。
+    // peak は停止後も残るので、止まった直後にベストを読める。
+    gfx.setTextDatum(textdatum_t::top_right);
+    if (s.peak_omega > 0.0f) {
+        char peak[24];
+        snprintf(peak, sizeof(peak), "最高 %d rpm",
+                 static_cast<int>(spinner_peak_rpm(s) + 0.5f));
+        gfx.setTextColor(kColSpValue, kColSpBg);
+        gfx.drawString(peak, kScreenW - 4, 2);
+    } else {
+        gfx.drawString("外側タップで初期化", kScreenW - 4, 2);
+    }
+
+    // 右下: 現在の回転数と累計。止まっている時は出さない（静止画面に 0 が居座るのを避ける）。
     if (s.omega != 0.0f) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%d rpm (最高 %d)  %.1f 回転",
-                      static_cast<int>(spinner_rpm(s) + 0.5f),
-                      static_cast<int>(s.peak_omega / 6.0f + 0.5f), s.turns);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d rpm  %.1f 回転",
+                      static_cast<int>(spinner_rpm(s) + 0.5f), s.turns);
         gfx.setTextDatum(textdatum_t::bottom_right);
         gfx.setTextColor(kColSpValue, kColSpBg);
         gfx.drawString(buf, kScreenW - 4, kScreenH - 2);
@@ -3891,6 +3911,10 @@ static void spinnerEnter() {
     }
 }
 
+// ⚠ 前提: シーン表示中は毎フレーム呼ばれること。押下ラッチ（g_spBodyLatch）の更新をここで
+//   行っているため、条件付きで早期 return を足すとタップ判定が壊れる（「はじいて指を離した
+//   瞬間に回転が消える」バグの再発）。IMU 無しの分岐だけは、そもそも回らず onLongPress も
+//   消費しない＝タップ判定に依存しないので例外にしてある。
 static void spinnerUpdate(uint32_t now) {
     if (!g_spImuOk) return;  // enter で出した案内をそのまま残す
 
@@ -3903,12 +3927,8 @@ static void spinnerUpdate(uint32_t now) {
     spinnerReadTouch(in.held, in.braking, g_spOnBody);
     spinner_update(g_spState, in);
 
-    // 押下単位のラッチを更新する。指が全て離れた時点でクリアし、次の押下に備える。
-    if (M5.Touch.getCount() == 0) {
-        g_spBodyLatch = false;
-    } else if (g_spOnBody) {
-        g_spBodyLatch = true;
-    }
+    // 押下単位のラッチを更新する（判定そのものは純粋ロジック spinner_press_latch）。
+    g_spBodyLatch = spinner_press_latch(g_spBodyLatch, M5.Touch.getCount() > 0, g_spOnBody);
 
     LovyanGFX& gfx = g_spCanvas.getBuffer() ? static_cast<LovyanGFX&>(g_spCanvas)
                                             : static_cast<LovyanGFX&>(M5.Display);

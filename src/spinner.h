@@ -88,7 +88,8 @@ struct SpinnerState {
     // 逆回転でも減らさない（回した仕事量として積む）。
     float turns = 0.0f;
     // 直近で叩き出した最高角速度(deg/s)。turns と同じく表示専用。
-    // 完全停止した時だけ 0 に戻すので、1回の回しのベストが読み取れる。
+    // 止まった後も残し、**次に回し始めた瞬間**に 0 へ戻す。停止と同時に消すと、
+    // 一番読みたいタイミング（止まった直後）にベストが画面から消えてしまうため。
     float peak_omega = 0.0f;
 };
 
@@ -112,3 +113,14 @@ void spinner_update(SpinnerState& s, const SpinnerInput& in);
 
 // 表示用: 現在の回転数(rpm)。向きは問わないので常に 0 以上。
 float spinner_rpm(const SpinnerState& s);
+
+// 表示用: 今回の回しの最高回転数(rpm)。deg/s→rpm の換算を呼び出し側で書き直さないための口。
+float spinner_peak_rpm(const SpinnerState& s);
+
+// 押下単位のラッチ（「この押下で一度でもスピナーに触れたか」）を1フレーム進める純粋関数。
+//   離した瞬間に確定する短タップを「回転のリセット」に使ってよいかの判定に要る。
+//   touching が false（＝指が全て離れた）になったらクリアし、次の押下に備える。
+//   押下中に指がわずかにずれて一瞬 on_body が落ちても、ラッチは維持される。
+// この判定が壊れると「はじいて指を離した瞬間に回転が消える」という致命的な体感バグに
+// 直結する（実際に一度やった）ので、実機層の static ではなくここでテストする。
+bool spinner_press_latch(bool latched, bool touching, bool on_body);

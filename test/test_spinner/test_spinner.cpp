@@ -279,13 +279,71 @@ void test_peak_holds_maximum_while_slowing() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, peak, s.peak_omega);         // が、最高値は据え置き
 }
 
-// 最高角速度は回している間の最大を保ち、完全停止で 0 に戻る（1回しごとのベストになる）。
-void test_peak_resets_on_full_stop() {
+// 最高角速度は完全停止しても残る。止まった直後こそベストを読みたいタイミングなので、
+// 停止と同時に消してはいけない。
+void test_peak_survives_full_stop() {
     SpinnerState s = spun_up(2000.0f);
-    TEST_ASSERT_TRUE(s.peak_omega > 1000.0f);
+    const float peak = s.peak_omega;
+    TEST_ASSERT_TRUE(peak > 1000.0f);
     advance(s, 0.0f, /*held=*/false, /*braking=*/true, 20);
-    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, s.omega);
-    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, s.peak_omega);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, s.omega);      // 止まっているが
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, peak, s.peak_omega);  // 記録は残る
+}
+
+// 次に回し始めた瞬間に最高記録を取り直す（1回しごとのベストになる）。
+void test_peak_resets_when_spinning_starts_again() {
+    SpinnerState s = spun_up(2000.0f);
+    advance(s, 0.0f, /*held=*/false, /*braking=*/true, 20);
+    TEST_ASSERT_TRUE(s.peak_omega > 1000.0f);  // 前回の記録が残っている
+
+    // ゆっくり回し直すと、前回の記録ではなく今回の値になる。
+    advance(s, 300.0f, /*held=*/true, /*braking=*/false, 10);
+    TEST_ASSERT_TRUE(s.peak_omega > 0.0f);
+    TEST_ASSERT_TRUE(s.peak_omega < 400.0f);
+}
+
+void test_peak_rpm_conversion() {
+    SpinnerState s;
+    spinner_reset(s);
+    s.peak_omega = 720.0f;  // 2回転/秒 = 120rpm
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 120.0f, spinner_peak_rpm(s));
+}
+
+// ───────── 押下ラッチ（短タップで回転を消してよいかの判定） ─────────
+
+// 押下開始でスピナーに触れたらラッチが立ち、押下中は維持される。
+void test_latch_sets_on_body_and_holds() {
+    bool latched = false;
+    latched = spinner_press_latch(latched, /*touching=*/true, /*on_body=*/true);
+    TEST_ASSERT_TRUE(latched);
+    // 指がわずかにずれて一瞬スピナーから外れても落ちない（押下が続いている限り維持）。
+    latched = spinner_press_latch(latched, /*touching=*/true, /*on_body=*/false);
+    TEST_ASSERT_TRUE(latched);
+}
+
+// 指を離したらクリアされ、次の押下に持ち越さない。
+void test_latch_clears_when_released() {
+    bool latched = spinner_press_latch(false, true, true);
+    TEST_ASSERT_TRUE(latched);
+    latched = spinner_press_latch(latched, /*touching=*/false, /*on_body=*/false);
+    TEST_ASSERT_FALSE(latched);
+}
+
+// スピナーの外だけを触った押下ではラッチが立たない（＝この短タップは仕切り直しになる）。
+void test_latch_stays_clear_outside() {
+    bool latched = false;
+    for (int i = 0; i < 10; ++i) {
+        latched = spinner_press_latch(latched, /*touching=*/true, /*on_body=*/false);
+    }
+    TEST_ASSERT_FALSE(latched);
+}
+
+// 押下の途中からスピナーに触れた場合も立つ（外から中へ指をずらした操作）。
+void test_latch_sets_midway_through_press() {
+    bool latched = spinner_press_latch(false, true, false);
+    TEST_ASSERT_FALSE(latched);
+    latched = spinner_press_latch(latched, true, true);
+    TEST_ASSERT_TRUE(latched);
 }
 
 // ───────── 触れた場所の区分 ─────────
@@ -354,7 +412,13 @@ int main(int, char**) {
     RUN_TEST(test_rpm_conversion);
     RUN_TEST(test_turns_accumulate_both_directions);
     RUN_TEST(test_peak_holds_maximum_while_slowing);
-    RUN_TEST(test_peak_resets_on_full_stop);
+    RUN_TEST(test_peak_survives_full_stop);
+    RUN_TEST(test_peak_resets_when_spinning_starts_again);
+    RUN_TEST(test_peak_rpm_conversion);
+    RUN_TEST(test_latch_sets_on_body_and_holds);
+    RUN_TEST(test_latch_clears_when_released);
+    RUN_TEST(test_latch_stays_clear_outside);
+    RUN_TEST(test_latch_sets_midway_through_press);
     RUN_TEST(test_zone_center_is_hub);
     RUN_TEST(test_zone_lobes_are_body);
     RUN_TEST(test_zone_far_is_outside);

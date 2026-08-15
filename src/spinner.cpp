@@ -53,6 +53,9 @@ void spinner_update(SpinnerState& s, const SpinnerInput& in) {
     const float dt = clampf(in.dt, 0.0f, kSpMaxDt);
     if (dt <= 0.0f) return;
 
+    // 更新前に「止まっていたか」を覚えておく。回し始めた瞬間に最高記録を切り替えるため。
+    const bool was_stopped = (s.omega == 0.0f);
+
     if (in.braking) {
         // ブレーキ: スピン部に指が乗っている間は強い減衰で止める。
         // held より優先する。両方に指が乗っている状況（軸を持ったままローブを触る）は
@@ -83,11 +86,21 @@ void spinner_update(SpinnerState& s, const SpinnerInput& in) {
     // ── 以下は表示専用の集計。物理には影響しない ──
     const float speed = std::fabs(s.omega);
     s.turns += speed * dt / 360.0f;
+    // 止まった状態から回り出した瞬間に最高記録を捨て、この1回しのベストを取り直す。
+    // 「停止と同時に 0 へ戻す」にすると、一番読みたい止まった直後に消えてしまう。
+    if (was_stopped && s.omega != 0.0f) s.peak_omega = 0.0f;
     if (speed > s.peak_omega) s.peak_omega = speed;
-    // 完全に止まった時だけ最高速をリセットする。次の1回しのベストを独立して見せるため。
-    if (s.omega == 0.0f) s.peak_omega = 0.0f;
 }
 
 float spinner_rpm(const SpinnerState& s) {
     return std::fabs(s.omega) / 6.0f;  // deg/s → rpm は 60/360 = 1/6
+}
+
+float spinner_peak_rpm(const SpinnerState& s) {
+    return s.peak_omega / 6.0f;  // peak_omega は常に 0 以上なので絶対値は要らない
+}
+
+bool spinner_press_latch(bool latched, bool touching, bool on_body) {
+    if (!touching) return false;         // 指が全て離れた＝次の押下に備えてクリア
+    return latched || on_body;           // 押下中は一度でも乗ったら維持
 }
