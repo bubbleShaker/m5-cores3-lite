@@ -119,7 +119,39 @@ void test_still_spinning_after_ten_seconds() {
     TEST_ASSERT_TRUE(s.omega > kSpStopEps);
 }
 
+// カップリングが効く下限はちょうど kSpDriveMin から（仕様は >=）。
+// 境界のすぐ下では効かず、境界ちょうどでは効く。
+void test_drive_min_is_inclusive_boundary() {
+    SpinnerState below;
+    spinner_reset(below);
+    advance(below, kSpDriveMin * 0.999f, /*held=*/true, /*braking=*/false, 10);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, below.omega);  // 完全停止扱い（kSpStopEps 未満）
+
+    SpinnerState at;
+    spinner_reset(at);
+    advance(at, kSpDriveMin, /*held=*/true, /*braking=*/false, 10);
+    TEST_ASSERT_TRUE(at.omega > kSpStopEps);
+}
+
 // ───────── 不変条件と堅牢性 ─────────
+
+// ★契約★ omega が正なら角度は増える（＝画面上の時計回りが正）。
+// これが無いと、符号を逆に実装しても他の全テストが通ってしまう。
+void test_positive_omega_increases_angle() {
+    SpinnerState s;
+    spinner_reset(s);
+    s.omega = 90.0f;  // 4秒で1回転。1フレーム(33ms)では 3度弱しか進まず折り返さない
+    SpinnerInput in;
+    in.dt = 0.033f;
+    spinner_update(s, in);
+    TEST_ASSERT_TRUE(s.angle > 0.0f && s.angle < 90.0f);
+
+    // 負なら 360 側から戻る（0 を下回った角度は畳まれる）。
+    spinner_reset(s);
+    s.omega = -90.0f;
+    spinner_update(s, in);
+    TEST_ASSERT_TRUE(s.angle > 270.0f && s.angle < 360.0f);
+}
 
 // 角度は常に [0, 360) に正規化されている（描画側が畳み直さなくてよい）。
 void test_angle_always_normalized() {
@@ -144,11 +176,13 @@ void test_omega_is_clamped() {
     TEST_ASSERT_TRUE(std::fabs(s.omega) <= kSpMaxOmega + 0.001f);
 }
 
-// 非有限値(NaN/Inf)が来たフレームは丸ごと捨て、状態を汚さない。
+// 非有限値(NaN/Inf)が来たフレームは丸ごと捨て、状態を汚さない（表示用の集計も含む）。
 void test_non_finite_input_is_ignored() {
     SpinnerState s = spun_up(900.0f);
     const float omega = s.omega;
     const float angle = s.angle;
+    const float turns = s.turns;
+    const float peak  = s.peak_omega;
 
     SpinnerInput bad;
     bad.omega_dev = NAN;
@@ -163,12 +197,15 @@ void test_non_finite_input_is_ignored() {
 
     TEST_ASSERT_FLOAT_WITHIN(0.001f, omega, s.omega);
     TEST_ASSERT_FLOAT_WITHIN(0.001f, angle, s.angle);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, turns, s.turns);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, peak, s.peak_omega);
 }
 
 // dt が 0 や負でも状態が動かない（時計の巻き戻りで角度が戻らない）。
 void test_zero_or_negative_dt_is_ignored() {
     SpinnerState s = spun_up(900.0f);
     const float angle = s.angle;
+    const float turns = s.turns;
     advance(s, 900.0f, /*held=*/true, /*braking=*/false, 0);
 
     SpinnerInput in;
@@ -180,6 +217,20 @@ void test_zero_or_negative_dt_is_ignored() {
     spinner_update(s, in);
 
     TEST_ASSERT_FLOAT_WITHIN(0.001f, angle, s.angle);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, turns, s.turns);
+}
+
+// dt のクランプは角度だけでなく減衰にも効く（巨大 dt の1フレームで摩擦が効きすぎない）。
+void test_huge_dt_clamps_decay_too() {
+    SpinnerState s;
+    spinner_reset(s);
+    s.omega = 1000.0f;
+
+    SpinnerInput in;
+    in.dt = 100.0f;  // クランプが無ければ摩擦で完全に消える長さ
+    spinner_update(s, in);
+    // kSpMaxDt(0.05s) ぶんの摩擦しか掛からない＝ほぼ減らない。
+    TEST_ASSERT_TRUE(s.omega > 900.0f);
 }
 
 // 描画が詰まって dt が跳ねても、1フレームで進む角度は上限 dt ぶんに抑えられる。
@@ -218,6 +269,16 @@ void test_turns_accumulate_both_directions() {
     TEST_ASSERT_TRUE(s.turns > forward);
 }
 
+// 最高角速度は「最大値」を保つ。減速しても下がらない。
+void test_peak_holds_maximum_while_slowing() {
+    SpinnerState s = spun_up(2000.0f);
+    const float peak = s.peak_omega;
+    TEST_ASSERT_TRUE(peak > 1000.0f);
+    advance(s, 0.0f, /*held=*/false, /*braking=*/false, 30 * 3);  // 3秒かけて減速
+    TEST_ASSERT_TRUE(s.omega < peak);                             // 実際に遅くなっている
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, peak, s.peak_omega);         // が、最高値は据え置き
+}
+
 // 最高角速度は回している間の最大を保ち、完全停止で 0 に戻る（1回しごとのベストになる）。
 void test_peak_resets_on_full_stop() {
     SpinnerState s = spun_up(2000.0f);
@@ -225,6 +286,49 @@ void test_peak_resets_on_full_stop() {
     advance(s, 0.0f, /*held=*/false, /*braking=*/true, 20);
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, s.omega);
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, s.peak_omega);
+}
+
+// ───────── 触れた場所の区分 ─────────
+
+void test_zone_center_is_hub() {
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Hub),
+                      static_cast<int>(spinner_zone(0.0f, 0.0f)));
+    // 斜めでも距離で決まる（正方形ではなく円で判定している）。
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Hub),
+                      static_cast<int>(spinner_zone(20.0f, 20.0f)));  // 距離 28.3
+}
+
+void test_zone_lobes_are_body() {
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Body),
+                      static_cast<int>(spinner_zone(70.0f, 0.0f)));
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Body),
+                      static_cast<int>(spinner_zone(0.0f, -100.0f)));
+}
+
+void test_zone_far_is_outside() {
+    // 画面の隅（320x240 の角は中心から約200px）は必ず外側＝長押しでメニューへ戻せる。
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Outside),
+                      static_cast<int>(spinner_zone(160.0f, 120.0f)));
+}
+
+// 境界はどちらも「以内」を含む（内側が優先）。
+void test_zone_boundaries_are_inclusive() {
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Hub),
+                      static_cast<int>(spinner_zone(kSpHubTouchR, 0.0f)));
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Body),
+                      static_cast<int>(spinner_zone(kSpHubTouchR + 0.1f, 0.0f)));
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Body),
+                      static_cast<int>(spinner_zone(kSpBodyTouchR, 0.0f)));
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Outside),
+                      static_cast<int>(spinner_zone(kSpBodyTouchR + 0.1f, 0.0f)));
+}
+
+// 壊れた座標は Outside 扱い（誤って「軸を持った」ことにしない安全側）。
+void test_zone_non_finite_is_outside() {
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Outside),
+                      static_cast<int>(spinner_zone(NAN, 0.0f)));
+    TEST_ASSERT_EQUAL(static_cast<int>(SpinnerZone::Outside),
+                      static_cast<int>(spinner_zone(0.0f, INFINITY)));
 }
 
 int main(int, char**) {
@@ -239,13 +343,22 @@ int main(int, char**) {
     RUN_TEST(test_braking_wins_over_hold);
     RUN_TEST(test_friction_eventually_stops);
     RUN_TEST(test_still_spinning_after_ten_seconds);
+    RUN_TEST(test_drive_min_is_inclusive_boundary);
+    RUN_TEST(test_positive_omega_increases_angle);
     RUN_TEST(test_angle_always_normalized);
     RUN_TEST(test_omega_is_clamped);
     RUN_TEST(test_non_finite_input_is_ignored);
     RUN_TEST(test_zero_or_negative_dt_is_ignored);
     RUN_TEST(test_huge_dt_is_clamped);
+    RUN_TEST(test_huge_dt_clamps_decay_too);
     RUN_TEST(test_rpm_conversion);
     RUN_TEST(test_turns_accumulate_both_directions);
+    RUN_TEST(test_peak_holds_maximum_while_slowing);
     RUN_TEST(test_peak_resets_on_full_stop);
+    RUN_TEST(test_zone_center_is_hub);
+    RUN_TEST(test_zone_lobes_are_body);
+    RUN_TEST(test_zone_far_is_outside);
+    RUN_TEST(test_zone_boundaries_are_inclusive);
+    RUN_TEST(test_zone_non_finite_is_outside);
     return UNITY_END();
 }

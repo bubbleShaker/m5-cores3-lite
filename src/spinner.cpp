@@ -29,6 +29,15 @@ bool finite(float v) {
 
 }  // namespace
 
+SpinnerZone spinner_zone(float dx, float dy) {
+    if (!finite(dx) || !finite(dy)) return SpinnerZone::Outside;
+    // sqrt を避けて二乗のまま比べる（毎フレーム、タッチ点の数だけ呼ばれる）。
+    const float d2 = dx * dx + dy * dy;
+    if (d2 <= kSpHubTouchR * kSpHubTouchR) return SpinnerZone::Hub;
+    if (d2 <= kSpBodyTouchR * kSpBodyTouchR) return SpinnerZone::Body;
+    return SpinnerZone::Outside;
+}
+
 void spinner_reset(SpinnerState& s) {
     s.angle      = 0.0f;
     s.omega      = 0.0f;

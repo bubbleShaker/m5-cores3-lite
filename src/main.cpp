@@ -3707,10 +3707,14 @@ constexpr int kSpLobeRad  = 44;  // ローブ（外周の丸い羽根）の半�
 constexpr int kSpLobeHole = 20;  // ローブ中央のベアリング穴の半径
 constexpr int kSpHubRad   = 26;  // 中央ハブの描画半径
 
-// タッチ判定の半径(px)。描画半径より少し大きく取る（指の接地面は点ではないため）。
-constexpr int kSpHubTouchR  = 40;   // これ以内＝ハブを押さえた（＝軸を持った）
-constexpr int kSpBodyTouchR = 108;  // ハブ外〜これ以内＝スピン部（＝ブレーキ）
-// これより外＝スピナーの外。長押しをシーンで消費せず、メニューへ戻す領域。
+// タッチ判定の半径は spinner.h（kSpHubTouchR / kSpBodyTouchR）にある。座標だけで決まる
+// 純粋な判定なので純粋ロジック層に置き、ここは画面中心を引いて渡すだけにしてある。
+
+// ジャイロの直近値をそのまま使い続けてよい時間(ms)。これを過ぎたら 0 とみなす。
+// 角速度は「エネルギー源」なので、IMU がサンプルを返さなくなった状態でハブを押さえ続けると、
+// 古い非ゼロ値が毎フレーム注入され続けて永久に回りっぱなしになる。重力の向きを使い回す
+// squeeze と違い、こちらには賞味期限が要る。
+constexpr uint32_t kSpGyroStaleMs = 200;
 
 // 配色。3枚のローブのうち1枚だけ色を変える。同色だと120度対称で、速く回った時に
 // 回転しているのか止まっているのかが目で追えなくなるため（見た目ではなく可読性の都合）。
@@ -3729,28 +3733,29 @@ static SpinnerState g_spState;                // スピナーの回転状態
 static uint32_t     g_spPrevMs   = 0;         // 前フレームの時刻（dt の算出用）
 static bool         g_spImuOk    = false;     // IMU が載っているか（enter で1回だけ判定）
 static float        g_spOmegaDev = 0.0f;      // 直近に読めた本体角速度（読み取り失敗時に使い回す）
+static uint32_t     g_spGyroMs   = 0;         // その値が取れた時刻（賞味期限の判定用）
 static bool         g_spOnBody   = false;     // 直近フレームで指がスピナー上にあったか（長押し判定用）
+// 現在の押下が始まってから一度でもスピナー上に指が乗ったか。離した瞬間に確定する Tap を
+// 「回転のリセット」に使ってよいかの判定に要る。押下の途中で指がわずかにずれても
+// ラッチが落ちないよう、直近1フレームの値ではなく押下単位で保持する。
+static bool         g_spBodyLatch = false;
 static M5Canvas     g_spCanvas(&M5.Display);  // ちらつき防止のフルスクリーンキャンバス
-
-// 中心からの距離が r 以内か。sqrt を避けて二乗で比べる（毎フレーム最大2点ぶん呼ぶ）。
-static bool spinnerWithin(int x, int y, int r) {
-    const int dx = x - kScreenW / 2;
-    const int dy = y - kScreenH / 2;
-    return dx * dx + dy * dy <= r * r;
-}
 
 // 今フレームの指の状態を読む。CoreS3 のタッチは2点まで取れるので全点を走査し、
 // 「ハブに乗っている指があるか」「スピン部に乗っている指があるか」を別々に立てる。
 // 軸を持ったままもう一方の指でローブを触って止める、という実物どおりの操作を通すため。
+// 区分の判定そのものは純粋ロジック spinner_zone に委ね、ここは画面中心を引くだけ。
 static void spinnerReadTouch(bool& held, bool& braking, bool& on_body) {
     held = braking = on_body = false;
     const int n = M5.Touch.getCount();
     for (int i = 0; i < n; ++i) {
         const auto d = M5.Touch.getDetail(i);
-        if (spinnerWithin(d.x, d.y, kSpHubTouchR)) {
+        const SpinnerZone z = spinner_zone(static_cast<float>(d.x - kScreenW / 2),
+                                           static_cast<float>(d.y - kScreenH / 2));
+        if (z == SpinnerZone::Hub) {
             held    = true;
             on_body = true;
-        } else if (spinnerWithin(d.x, d.y, kSpBodyTouchR)) {
+        } else if (z == SpinnerZone::Body) {
             braking = true;
             on_body = true;
         }
@@ -3761,10 +3766,14 @@ static void spinnerReadTouch(bool& held, bool& braking, bool& on_body) {
 // ⚠ M5.Imu.getGyro() の戻り値は「IMU があるか」ではなく **新しいサンプルが取れたか**。
 //   BMI270 はデータレディが立っていなければ 0 を返すので、正常動作中でも false は普通に
 //   起きる。false を「IMU 無し」と解釈してはいけない（#240 で踏んだのと同じ罠）。
-static float spinnerReadOmegaDev() {
+// 読めなかったフレームは直近値を使い回すが、kSpGyroStaleMs を過ぎたら 0 に倒す（暴走防止）。
+static float spinnerReadOmegaDev(uint32_t now) {
     float gx = 0.0f, gy = 0.0f, gz = 0.0f;
     if (M5.Imu.getGyro(&gx, &gy, &gz)) {
         g_spOmegaDev = kSpImuSign * gz;  // 画面法線まわりは Z 軸
+        g_spGyroMs   = now;
+    } else if (now - g_spGyroMs > kSpGyroStaleMs) {
+        g_spOmegaDev = 0.0f;
     }
     return g_spOmegaDev;
 }
@@ -3819,11 +3828,13 @@ static void spinnerDrawText(LovyanGFX& gfx, const SpinnerState& s) {
     gfx.setTextDatum(textdatum_t::bottom_left);
     gfx.drawString("隅を長押し→メニュー", 4, kScreenH - 2);
 
-    // 回転数と累計回転。止まっている時は出さない（静止画面に 0 が居座るのを避ける）。
+    // 回転数・最高回転数・累計回転。止まっている時は出さない（静止画面に 0 が居座るのを避ける）。
+    // peak_omega は完全停止でリセットされるので、この表示は「今回の回しのベスト」になる。
     if (s.omega != 0.0f) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "%d rpm  %.1f 回転",
-                      static_cast<int>(spinner_rpm(s) + 0.5f), s.turns);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d rpm (最高 %d)  %.1f 回転",
+                      static_cast<int>(spinner_rpm(s) + 0.5f),
+                      static_cast<int>(s.peak_omega / 6.0f + 0.5f), s.turns);
         gfx.setTextDatum(textdatum_t::bottom_right);
         gfx.setTextColor(kColSpValue, kColSpBg);
         gfx.drawString(buf, kScreenW - 4, kScreenH - 2);
@@ -3833,34 +3844,50 @@ static void spinnerDrawText(LovyanGFX& gfx, const SpinnerState& s) {
     gfx.setTextDatum(textdatum_t::top_left);
 }
 
+// キャンバス確保の前後で PSRAM の空きを出す。
+// ⚠ LovyanGFX は PSRAM 確保に失敗すると黙って内蔵RAM(DMA)へ落ちる。内蔵RAMから 150KB を
+//   奪うと Wi-Fi/TTS が窒息するので、確保の「前」と「結果」を必ずログに残す（#240 と同じ作法）。
+static void spinnerLogPsram(const char* tag, size_t want) {
+    Serial.printf("[spinner] %s want=%u psram_free=%u psram_largest=%u\n",
+                  tag,
+                  static_cast<unsigned>(want),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
 static void spinnerEnter() {
     spinner_reset(g_spState);
-    g_spPrevMs   = millis();
-    g_spImuOk    = M5.Imu.isEnabled();
-    g_spOmegaDev = 0.0f;
-    g_spOnBody   = false;
+    g_spPrevMs    = millis();
+    g_spImuOk     = M5.Imu.isEnabled();
+    g_spOmegaDev  = 0.0f;
+    g_spGyroMs    = g_spPrevMs;
+    g_spOnBody    = false;
+    g_spBodyLatch = false;
+
+    M5.Display.fillScreen(kColSpBg);
+
+    if (!g_spImuOk) {
+        // IMU が無い個体では回しようがない。案内だけ出し、キャンバス(150KB)も確保しない。
+        // 長押しの横取りもこの時 false になるので、通常どおり長押しでメニューへ戻れる。
+        M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+        M5.Display.setTextColor(TFT_RED, kColSpBg);
+        M5.Display.setTextDatum(textdatum_t::middle_center);
+        M5.Display.drawString("IMU が使えません", kScreenW / 2, kScreenH / 2 - 12);
+        M5.Display.setTextColor(kColSpHint, kColSpBg);
+        M5.Display.drawString("長押しでメニューへ", kScreenW / 2, kScreenH / 2 + 12);
+        M5.Display.setFont(&fonts::Font0);
+        M5.Display.setTextDatum(textdatum_t::top_left);
+        return;
+    }
 
     // フルスクリーンキャンバスを PSRAM に確保（約150KB）。スクイーズと同じ作法で、
     // exit で必ず返す（動画再生の音声確保を圧迫しないため・#166）。
     if (!g_spCanvas.getBuffer()) {
         constexpr size_t kSpCanvasBytes = static_cast<size_t>(kScreenW) * kScreenH * 2;
-        Serial.printf("[spinner] canvas want=%u psram_free=%u psram_largest=%u\n",
-                      static_cast<unsigned>(kSpCanvasBytes),
-                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+        spinnerLogPsram("canvas-before", kSpCanvasBytes);
         g_spCanvas.setPsram(true);
         g_spCanvas.createSprite(kScreenW, kScreenH);
-    }
-    M5.Display.fillScreen(kColSpBg);
-
-    if (!g_spImuOk) {
-        // IMU が無い個体では回しようがないので、その旨だけ出して静止画のままにする。
-        M5.Display.setFont(&fonts::lgfxJapanGothic_16);
-        M5.Display.setTextColor(TFT_RED, kColSpBg);
-        M5.Display.setTextDatum(textdatum_t::middle_center);
-        M5.Display.drawString("IMU が使えません", kScreenW / 2, kScreenH / 2);
-        M5.Display.setFont(&fonts::Font0);
-        M5.Display.setTextDatum(textdatum_t::top_left);
+        spinnerLogPsram(g_spCanvas.getBuffer() ? "canvas-ok" : "canvas-fail", kSpCanvasBytes);
     }
 }
 
@@ -3872,9 +3899,16 @@ static void spinnerUpdate(uint32_t now) {
 
     SpinnerInput in;
     in.dt        = dt;
-    in.omega_dev = spinnerReadOmegaDev();
+    in.omega_dev = spinnerReadOmegaDev(now);
     spinnerReadTouch(in.held, in.braking, g_spOnBody);
     spinner_update(g_spState, in);
+
+    // 押下単位のラッチを更新する。指が全て離れた時点でクリアし、次の押下に備える。
+    if (M5.Touch.getCount() == 0) {
+        g_spBodyLatch = false;
+    } else if (g_spOnBody) {
+        g_spBodyLatch = true;
+    }
 
     LovyanGFX& gfx = g_spCanvas.getBuffer() ? static_cast<LovyanGFX&>(g_spCanvas)
                                             : static_cast<LovyanGFX&>(M5.Display);
@@ -3886,10 +3920,16 @@ static void spinnerUpdate(uint32_t now) {
     // 回転そのものは同じロジックで見えるため機能は落とさない。
 }
 
-// タップで仕切り直し（角度も回転数もリセット）。
+// スピナーの外側を短タップした時だけ仕切り直す（角度も回転数もリセット）。
+// ⚠ スピナー上のタップでリセットしてはいけない。touch_update は 800ms 未満で離した押下を
+//   Tap として返すので、「ハブを押さえてはじき、すぐ指を離す」という本来の操作がそのまま
+//   Tap になる。ここで無条件にリセットすると、はじいた回転が離した瞬間に消えて
+//   「慣性で回り続ける」が成立しない。ローブへの短タップも同様（ブレーキで減速させたのに
+//   離した瞬間に累計回転まで消える）。押下単位のラッチで「スピナーに触れていたか」を見る。
 // loop は onTap → update に **同じ now** を渡す。ここで millis() を読み直すと now より
 // 進んだ値になり、直後の update で now - g_spPrevMs が uint32 で巻き戻って巨大な dt になる。
 static void spinnerOnTap(uint32_t now, int /*touchX*/) {
+    if (g_spBodyLatch) return;  // スピナーに触れた押下は回転を消さない
     spinner_reset(g_spState);
     g_spPrevMs = now;
 }
@@ -3898,6 +3938,9 @@ static void spinnerOnTap(uint32_t now, int /*touchX*/) {
 // そのままだとメニュー復帰が誤爆して遊べない。スピナーに乗っている指の長押しは消費し、
 // 外側（画面の隅）の長押しだけメニューへ通す。
 static bool spinnerOnLongPress(uint32_t /*now*/) {
+    // IMU が無い個体ではスピナー自体が動かない。ここで消費すると「画面から出られない」
+    // だけになるので、通常どおり長押しでメニューへ戻す。
+    if (!g_spImuOk) return false;
     // 「今」触れている点を優先して見る（loop 先頭の M5.update() 済み）。指が既に離れている
     // 稀なフレームでは直近フレームの判定（g_spOnBody）にフォールバックする。
     if (M5.Touch.getCount() > 0) {
