@@ -21,6 +21,7 @@
 #include "scene.h"    // next_scene（シーン巡回・純粋ロジック）
 #include "menu.h"     // menu_move（メニューのカーソル移動・純粋ロジック・#132）
 #include "squeeze.h"  // squeeze_*（傾け・シェイクで動くぷにぷに玉の物理・純粋ロジック・#240）
+#include "spinner.h"  // spinner_*（ハンドスピナーの回転物理・純粋ロジック・#243）
 #include "voice.h"    // voice_baa_pcm（メェの PCM 合成・純粋ロジック）
 #include "gem.h"      // Gem / gem_count / gem_at（宝石図鑑データ・純粋ロジック）
 #include "gem3d.h"    // gem3d_*（宝石3D回転の純粋数学：回転/投影/カリング/法線/明るさ）
@@ -3685,6 +3686,296 @@ static void squeezeExit() {
     g_sqCanvas.deleteSprite();
 }
 
+// ───────── ハンドスピナーシーン（ジャイロで回し、指で止める / Issue #243） ─────────
+// 物理は spinner.cpp（native テスト済み）が全て持ち、ここは「ジャイロを読む」「指の位置を
+// 見る」「描く」だけを担う。摩擦・ブレーキの効きは spinner.h の定数側にあり、この層には無い。
+//
+// 操作:
+//   中央ハブを押さえたまま本体をはじく → 連動して回り、指を離しても慣性で回り続ける
+//   スピン部（ローブ）を押さえる       → ブレーキ
+//   画面の隅を長押し                   → メニューへ戻る（スピナー上の長押しは消費する）
+
+// ジャイロ Z（画面法線まわり）を「画面上の時計回りが正」へ揃える符号。
+// spinner.h の約束どおり、渡すのは揃えたあとの値であってセンサ生値ではない。
+// ⚠ M5Unified の軸割り当てと setRotation(1) の組み合わせに依存する。実機で「本体を回した
+//   向きにスピナーが回る」ことを目視で確認し、逆ならここの符号だけ反転する（#243 M3）。
+constexpr float kSpImuSign = +1.0f;
+
+// 形状(px)。中心は画面中央。外接半径 = kSpLobeDist + kSpLobeRad = 102 で画面(240)に収まる。
+constexpr int kSpLobeDist = 58;  // 中心からローブ中心までの距離
+constexpr int kSpLobeRad  = 44;  // ローブ（外周の丸い羽根）の半径
+constexpr int kSpLobeHole = 20;  // ローブ中央のベアリング穴の半径
+constexpr int kSpHubRad   = 26;  // 中央ハブの描画半径
+
+// タッチ判定（spinner.h・純粋層）が描画したスピナー全体を覆うことを保証する。
+// 形状を大きくした時にローブの外周が「触れない帯」になるのを、実機で気付く前に止める。
+static_assert(kSpBodyTouchR >= kSpLobeDist + kSpLobeRad,
+              "spinner touch radius must cover the drawn lobes");
+
+// タッチ判定の半径は spinner.h（kSpHubTouchR / kSpBodyTouchR）にある。座標だけで決まる
+// 純粋な判定なので純粋ロジック層に置き、ここは画面中心を引いて渡すだけにしてある。
+
+// ジャイロの直近値をそのまま使い続けてよい時間(ms)。これを過ぎたら 0 とみなす。
+// 角速度は「エネルギー源」なので、IMU がサンプルを返さなくなった状態でハブを押さえ続けると、
+// 古い非ゼロ値が毎フレーム注入され続けて永久に回りっぱなしになる。重力の向きを使い回す
+// squeeze と違い、こちらには賞味期限が要る。
+constexpr uint32_t kSpGyroStaleMs = 200;
+
+// 配色。3枚のローブのうち1枚だけ色を変える。同色だと120度対称で、速く回った時に
+// 回転しているのか止まっているのかが目で追えなくなるため（見た目ではなく可読性の都合）。
+constexpr uint16_t kColSpBg     = 0x10A2;  // 暗いスレート
+constexpr uint16_t kColSpBody   = 0x1C7F;  // 本体（青）
+constexpr uint16_t kColSpEdge   = 0x039F;  // 本体の輪郭（濃い青）
+constexpr uint16_t kColSpMark   = 0xFD20;  // 目印のローブ（オレンジ）
+constexpr uint16_t kColSpBrake  = 0xF986;  // ブレーキ中のローブ（赤）
+constexpr uint16_t kColSpHub    = 0xC618;  // ハブ（銀）
+constexpr uint16_t kColSpHubIn  = 0x632C;  // ハブ内側の窪み
+constexpr uint16_t kColSpHeld   = 0x07E0;  // ハブを押さえている時のリング（緑）
+constexpr uint16_t kColSpHint   = 0x8410;  // 操作ヒントの文字
+constexpr uint16_t kColSpValue  = 0xFFE0;  // 回転数の数字
+
+static SpinnerState g_spState;                // スピナーの回転状態
+static uint32_t     g_spPrevMs   = 0;         // 前フレームの時刻（dt の算出用）
+static bool         g_spImuOk    = false;     // IMU が載っているか（enter で1回だけ判定）
+static float        g_spOmegaDev = 0.0f;      // 直近に読めた本体角速度（読み取り失敗時に使い回す）
+static uint32_t     g_spGyroMs   = 0;         // その値が取れた時刻（賞味期限の判定用）
+static bool         g_spOnBody   = false;     // 直近フレームで指がスピナー上にあったか（長押し判定用）
+// 現在の押下が始まってから一度でもスピナー上に指が乗ったか。離した瞬間に確定する Tap を
+// 「回転のリセット」に使ってよいかの判定に要る。押下の途中で指がわずかにずれても
+// ラッチが落ちないよう、直近1フレームの値ではなく押下単位で保持する。
+static bool         g_spBodyLatch = false;
+static M5Canvas     g_spCanvas(&M5.Display);  // ちらつき防止のフルスクリーンキャンバス
+
+// 今フレームの指の状態を読む。CoreS3 のタッチは2点まで取れるので全点を走査し、
+// 「ハブに乗っている指があるか」「スピン部に乗っている指があるか」を別々に立てる。
+// 軸を持ったままもう一方の指でローブを触って止める、という実物どおりの操作を通すため。
+// 区分の判定そのものは純粋ロジック spinner_zone に委ね、ここは画面中心を引くだけ。
+static void spinnerReadTouch(bool& held, bool& braking, bool& on_body) {
+    held = braking = on_body = false;
+    const int n = M5.Touch.getCount();
+    for (int i = 0; i < n; ++i) {
+        const auto d = M5.Touch.getDetail(i);
+        const SpinnerZone z = spinner_zone(static_cast<float>(d.x - kScreenW / 2),
+                                           static_cast<float>(d.y - kScreenH / 2));
+        if (z == SpinnerZone::Hub) {
+            held    = true;
+            on_body = true;
+        } else if (z == SpinnerZone::Body) {
+            braking = true;
+            on_body = true;
+        }
+    }
+}
+
+// 本体の角速度(deg/s・画面上の時計回りが正)をジャイロから読む。
+// ⚠ M5.Imu.getGyro() の戻り値は「IMU があるか」ではなく **新しいサンプルが取れたか**。
+//   BMI270 はデータレディが立っていなければ 0 を返すので、正常動作中でも false は普通に
+//   起きる。false を「IMU 無し」と解釈してはいけない（#240 で踏んだのと同じ罠）。
+// 読めなかったフレームは直近値を使い回すが、kSpGyroStaleMs を過ぎたら 0 に倒す（暴走防止）。
+static float spinnerReadOmegaDev(uint32_t now) {
+    float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+    if (M5.Imu.getGyro(&gx, &gy, &gz)) {
+        g_spOmegaDev = kSpImuSign * gz;  // 画面法線まわりは Z 軸
+        g_spGyroMs   = now;
+    } else if (now - g_spGyroMs > kSpGyroStaleMs) {
+        g_spOmegaDev = 0.0f;
+    }
+    return g_spOmegaDev;
+}
+
+// スピナー本体を描く。三角の胴 → ローブ（穴あき）→ ハブ の順で重ねる。
+static void spinnerDrawBody(LovyanGFX& gfx, const SpinnerState& s, bool held, bool braking) {
+    const float cx  = kScreenW / 2.0f;
+    const float cy  = kScreenH / 2.0f;
+    const float rad = s.angle * 3.14159265f / 180.0f;
+
+    // 3枚のローブ中心。120度ずつずらす。
+    int lx[3], ly[3];
+    for (int i = 0; i < 3; ++i) {
+        const float a = rad + i * (2.0f * 3.14159265f / 3.0f);
+        lx[i] = static_cast<int>(cx + kSpLobeDist * cosf(a));
+        ly[i] = static_cast<int>(cy + kSpLobeDist * sinf(a));
+    }
+
+    // 胴（ローブ中心を結ぶ三角）。先に描いてからローブを重ねないと、穴が胴で埋まる。
+    gfx.fillTriangle(lx[0], ly[0], lx[1], ly[1], lx[2], ly[2],
+                     braking ? kColSpBrake : kColSpBody);
+
+    for (int i = 0; i < 3; ++i) {
+        const uint16_t fill = braking ? kColSpBrake : (i == 0 ? kColSpMark : kColSpBody);
+        gfx.fillCircle(lx[i], ly[i], kSpLobeRad, fill);
+        gfx.drawCircle(lx[i], ly[i], kSpLobeRad, kColSpEdge);
+        // ベアリング穴。背景色で抜くことで、速く回った時に「向こう側が透けて見える」感じが出る。
+        gfx.fillCircle(lx[i], ly[i], kSpLobeHole, kColSpBg);
+        gfx.drawCircle(lx[i], ly[i], kSpLobeHole, kColSpEdge);
+    }
+
+    // 中央ハブ。押さえている間は緑のリングを出し、「軸を持てている」ことを目で確認できるようにする
+    // （押さえたつもりで外していると、いくらはじいても回らないため）。
+    const int icx = static_cast<int>(cx);
+    const int icy = static_cast<int>(cy);
+    gfx.fillCircle(icx, icy, kSpHubRad, kColSpHub);
+    gfx.drawCircle(icx, icy, kSpHubRad, kColSpEdge);
+    gfx.fillCircle(icx, icy, kSpHubRad / 2, kColSpHubIn);
+    if (held) {
+        gfx.drawCircle(icx, icy, kSpHubRad + 2, kColSpHeld);
+        gfx.drawCircle(icx, icy, kSpHubRad + 3, kColSpHeld);
+    }
+}
+
+// 文字まわり（操作ヒントと回転数）。スピナーの外側だけに描く。
+// ⚠ 4隅に振り分けている。lgfxJapanGothic_16 は全角16px・半角8px なので、左右で同じ行を
+//   使う時は「左の文字数×16 + 右の文字数×16 < 320」を守ること。右側は背景ごと塗るため、
+//   はみ出すと左のヒントが黙って消える（最高rpm を足した時に実際にやった）。
+static void spinnerDrawText(LovyanGFX& gfx, const SpinnerState& s) {
+    gfx.setFont(&fonts::lgfxJapanGothic_16);
+    gfx.setTextColor(kColSpHint, kColSpBg);
+
+    // 左上と左下は常時（全角10文字=160px ≒ 画面の半分に収まる長さにしてある）。
+    gfx.setTextDatum(textdatum_t::top_left);
+    gfx.drawString("中央を押さえてはじく", 4, 2);
+    gfx.setTextDatum(textdatum_t::bottom_left);
+    gfx.drawString("長押し→メニュー", 4, kScreenH - 2);
+
+    // 右上: 回転中は今回のベスト、止まっている時は仕切り直しの案内。
+    // peak は停止後も残るので、止まった直後にベストを読める。
+    gfx.setTextDatum(textdatum_t::top_right);
+    if (s.peak_omega > 0.0f) {
+        char peak[24];
+        snprintf(peak, sizeof(peak), "最高 %d rpm",
+                 static_cast<int>(spinner_peak_rpm(s) + 0.5f));
+        gfx.setTextColor(kColSpValue, kColSpBg);
+        gfx.drawString(peak, kScreenW - 4, 2);
+    } else {
+        gfx.drawString("外側タップで初期化", kScreenW - 4, 2);
+    }
+
+    // 右下: 現在の回転数と累計。止まっている時は出さない（静止画面に 0 が居座るのを避ける）。
+    if (s.omega != 0.0f) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d rpm  %.1f 回転",
+                      static_cast<int>(spinner_rpm(s) + 0.5f), s.turns);
+        gfx.setTextDatum(textdatum_t::bottom_right);
+        gfx.setTextColor(kColSpValue, kColSpBg);
+        gfx.drawString(buf, kScreenW - 4, kScreenH - 2);
+    }
+
+    gfx.setFont(&fonts::Font0);
+    gfx.setTextDatum(textdatum_t::top_left);
+}
+
+// キャンバス確保の前後で PSRAM の空きを出す。
+// ⚠ LovyanGFX は PSRAM 確保に失敗すると黙って内蔵RAM(DMA)へ落ちる。内蔵RAMから 150KB を
+//   奪うと Wi-Fi/TTS が窒息するので、確保の「前」と「結果」を必ずログに残す（#240 と同じ作法）。
+static void spinnerLogPsram(const char* tag, size_t want) {
+    Serial.printf("[spinner] %s want=%u psram_free=%u psram_largest=%u\n",
+                  tag,
+                  static_cast<unsigned>(want),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
+static void spinnerEnter() {
+    spinner_reset(g_spState);
+    g_spPrevMs    = millis();
+    g_spImuOk     = M5.Imu.isEnabled();
+    g_spOmegaDev  = 0.0f;
+    g_spGyroMs    = g_spPrevMs;
+    g_spOnBody    = false;
+    g_spBodyLatch = false;
+
+    M5.Display.fillScreen(kColSpBg);
+
+    if (!g_spImuOk) {
+        // IMU が無い個体では回しようがない。案内だけ出し、キャンバス(150KB)も確保しない。
+        // 長押しの横取りもこの時 false になるので、通常どおり長押しでメニューへ戻れる。
+        M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+        M5.Display.setTextColor(TFT_RED, kColSpBg);
+        M5.Display.setTextDatum(textdatum_t::middle_center);
+        M5.Display.drawString("IMU が使えません", kScreenW / 2, kScreenH / 2 - 12);
+        M5.Display.setTextColor(kColSpHint, kColSpBg);
+        M5.Display.drawString("長押しでメニューへ", kScreenW / 2, kScreenH / 2 + 12);
+        M5.Display.setFont(&fonts::Font0);
+        M5.Display.setTextDatum(textdatum_t::top_left);
+        return;
+    }
+
+    // フルスクリーンキャンバスを PSRAM に確保（約150KB）。スクイーズと同じ作法で、
+    // exit で必ず返す（動画再生の音声確保を圧迫しないため・#166）。
+    if (!g_spCanvas.getBuffer()) {
+        constexpr size_t kSpCanvasBytes = static_cast<size_t>(kScreenW) * kScreenH * 2;
+        spinnerLogPsram("canvas-before", kSpCanvasBytes);
+        g_spCanvas.setPsram(true);
+        g_spCanvas.createSprite(kScreenW, kScreenH);
+        spinnerLogPsram(g_spCanvas.getBuffer() ? "canvas-ok" : "canvas-fail", kSpCanvasBytes);
+    }
+}
+
+// ⚠ 前提: シーン表示中は毎フレーム呼ばれること。押下ラッチ（g_spBodyLatch）の更新をここで
+//   行っているため、条件付きで早期 return を足すとタップ判定が壊れる（「はじいて指を離した
+//   瞬間に回転が消える」バグの再発）。IMU 無しの分岐だけは、そもそも回らず onLongPress も
+//   消費しない＝タップ判定に依存しないので例外にしてある。
+static void spinnerUpdate(uint32_t now) {
+    if (!g_spImuOk) return;  // enter で出した案内をそのまま残す
+
+    const float dt = (now - g_spPrevMs) / 1000.0f;
+    g_spPrevMs = now;
+
+    SpinnerInput in;
+    in.dt        = dt;
+    in.omega_dev = spinnerReadOmegaDev(now);
+    spinnerReadTouch(in.held, in.braking, g_spOnBody);
+    spinner_update(g_spState, in);
+
+    // 押下単位のラッチを更新する（判定そのものは純粋ロジック spinner_press_latch）。
+    g_spBodyLatch = spinner_press_latch(g_spBodyLatch, M5.Touch.getCount() > 0, g_spOnBody);
+
+    LovyanGFX& gfx = g_spCanvas.getBuffer() ? static_cast<LovyanGFX&>(g_spCanvas)
+                                            : static_cast<LovyanGFX&>(M5.Display);
+    gfx.fillScreen(kColSpBg);
+    spinnerDrawBody(gfx, g_spState, in.held, in.braking);
+    spinnerDrawText(gfx, g_spState);
+    if (g_spCanvas.getBuffer()) g_spCanvas.pushSprite(&M5.Display, 0, 0);
+    // キャンバス確保に失敗した時は直描き。全面書き換えなのでちらつくが、
+    // 回転そのものは同じロジックで見えるため機能は落とさない。
+}
+
+// スピナーの外側を短タップした時だけ仕切り直す（角度も回転数もリセット）。
+// ⚠ スピナー上のタップでリセットしてはいけない。touch_update は 800ms 未満で離した押下を
+//   Tap として返すので、「ハブを押さえてはじき、すぐ指を離す」という本来の操作がそのまま
+//   Tap になる。ここで無条件にリセットすると、はじいた回転が離した瞬間に消えて
+//   「慣性で回り続ける」が成立しない。ローブへの短タップも同様（ブレーキで減速させたのに
+//   離した瞬間に累計回転まで消える）。押下単位のラッチで「スピナーに触れていたか」を見る。
+// loop は onTap → update に **同じ now** を渡す。ここで millis() を読み直すと now より
+// 進んだ値になり、直後の update で now - g_spPrevMs が uint32 で巻き戻って巨大な dt になる。
+static void spinnerOnTap(uint32_t now, int /*touchX*/) {
+    if (g_spBodyLatch) return;  // スピナーに触れた押下は回転を消さない
+    spinner_reset(g_spState);
+    g_spPrevMs = now;
+}
+
+// 長押しの横取り（#198 の口を使う）。中央を押さえ続ける操作が 800ms を超えるのは当たり前なので、
+// そのままだとメニュー復帰が誤爆して遊べない。スピナーに乗っている指の長押しは消費し、
+// 外側（画面の隅）の長押しだけメニューへ通す。
+static bool spinnerOnLongPress(uint32_t /*now*/) {
+    // IMU が無い個体ではスピナー自体が動かない。ここで消費すると「画面から出られない」
+    // だけになるので、通常どおり長押しでメニューへ戻す。
+    if (!g_spImuOk) return false;
+    // 「今」触れている点を優先して見る（loop 先頭の M5.update() 済み）。指が既に離れている
+    // 稀なフレームでは直近フレームの判定（g_spOnBody）にフォールバックする。
+    if (M5.Touch.getCount() > 0) {
+        bool held = false, braking = false, on_body = false;
+        spinnerReadTouch(held, braking, on_body);
+        return on_body;
+    }
+    return g_spOnBody;
+}
+
+// 退場時にキャンバス(約150KB)を返す。
+static void spinnerExit() {
+    g_spCanvas.deleteSprite();
+}
+
 // シーン表（巡回順）。ここに1要素足すだけで新テーマを増やせる。
 // exit を持たないシーンは4要素目を省略する（aggregate 初期化で nullptr になる）。
 const SceneDef kScenes[] = {
@@ -3698,6 +3989,9 @@ const SceneDef kScenes[] = {
     { "パックマン",   pacEnter,    pacUpdate,    pacOnTap    },  // 自作パックマン（#134 Step2）
     { "動画再生",     videoEnter,  videoUpdate,  videoOnTap,  videoExit, videoOnSwipe, videoOnLongPress, videoPaceLimitMs },  // CDカルーセルで選んで再生（#142/#148/#150/#152/#170/#175/#193/#198/#207）
     { "スクイーズ",   squeezeEnter, squeezeUpdate, squeezeOnTap, squeezeExit },  // 傾け・シェイクで動くぷにぷに玉（#240）
+    // 長押しを横取りする（#198 の口）。中央を押さえ続ける操作が 800ms を超えるのは当たり前で、
+    // 消費しないとメニュー復帰が誤爆して遊べない。onSwipe は使わないので nullptr を明示する。
+    { "ハンドスピナー", spinnerEnter, spinnerUpdate, spinnerOnTap, spinnerExit, nullptr, spinnerOnLongPress },  // ジャイロで回して指で止める（#243）
 };
 constexpr int kSceneCount = static_cast<int>(sizeof(kScenes) / sizeof(kScenes[0]));
 int g_sceneIdx = 0;  // 現在のシーン番号
@@ -3714,7 +4008,7 @@ constexpr int kMenuItemCount = kSceneCount + 1;  // 先頭の音声トグル + �
 
 // メニュー行のレイアウト（1行目Y・行間・行の文字高）。static_assert で使うためファイルスコープに置く。
 constexpr int kMenuRowY0    = 28;  // 1行目のY
-constexpr int kMenuRowH     = 19;  // 行間（シーン増加に合わせ 26→24→21→19 と詰めた・#134/#142/#240）
+constexpr int kMenuRowH     = 17;  // 行間（シーン増加に合わせ 26→24→21→19→17 と詰めた・#134/#142/#240/#243）
 constexpr int kMenuRowGlyphH = 16;  // lgfxJapanGothic_16 の文字高（下端計算用）
 // 全項目が画面(kScreenH)に収まることをコンパイル時に保証する。シーンを増やして溢れたらここで失敗し、
 // 実機で気付く前にビルドで止まる（開放閉鎖：シーン追加でレイアウトが黙って壊れないための安全網・#132）。
