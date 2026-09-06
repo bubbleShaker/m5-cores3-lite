@@ -88,6 +88,20 @@ MSC 転送は 21.6MB を 115 秒（**188KB/s**・#170 の 204KB/s と同水準�
 → **#191（2026-07-25）でログを採り直し、`audio-alloc-ok` を確認済み**（`aaa` で 6.78MB が載った）。
 ただし起動直後の経路のみなので **#168（他シーンを経由した後）は依然として未消化**。
 
+### ⚠ 動画素材「hyperventilation」を追加（#247・2026-09-07 変換のみ・**実機未確認**）
+ユーザー指定の「ハイパーベンチレイション / RADWIMPS ｜ yoei.」（https://youtu.be/dpJbGBAhfI0 ・**242 秒**）を
+`video/hyperventilation/` に変換した。**242 秒は 16kHz の実運用目安 233 秒を超える**ので
+`--sample-rate 8000` を付けた（下の「音声の尺の上限」の表）。ファーム側の実装は不要（the1 と同じ）。
+
+| ファイル | サイズ | 備考 |
+|---|---|---|
+| `frames.bin` | 14,710,635B | 2,420 フレーム / 10fps |
+| `audio.wav` | 3,872,424B | **8kHz** mono（`psram_largest` 8,257,524 に対し余裕 4.4MB） |
+| `meta.txt` | 91B | `fps=10 / frames=2420 / sample_rate=8000 / pack=frames.bin` |
+
+合計 19MB（207KB/s なら転送 約 1 分 35 秒）。**SD へ未転送・実機再生も未確認**（#247 に残タスクあり）。
+変換時に URL 直渡しが 403 で落ちたため、上の「アセットを変換」の回避策で通した。
+
 ### 🔴 実機ログを採るときの順序（今回ハマった・必ず守る）
 **USB CDC はモニタを繋いだ後に本体をリセットしないとログが 1 バイトも流れない**
 （`summary/260625/16-runtime-stack.md:82` に既出だったのに踏んで、ログ 2 本を 0 バイトで無駄にした）。
@@ -357,6 +371,30 @@ Get-PnpDevice | Where-Object InstanceId -like '*VID_303A*' | Select-Object Statu
    - #175 以降、名前は自由（`/video/<素材名>/` として選択画面に出る）。素材の実体が分かる名前にする。
    - 既定でパック方式（`frames.bin` 1 本 + `audio.wav` + `meta.txt` の計 3 ファイル）。
      `--no-pack` で従来の連番も出せるが、端末では遅い経路になるので通常は使わない。
+   - ⚠ **URL 直渡しは 2026-09-07 時点で 403 になる**（#247 で踏んだ・恒久対応は **#248**）。
+     `video2frames.py` は `yt-dlp -f bestvideo+bestaudio/best` を**固定で**叩く（`--extractor-args` を
+     外から差せない）が、これが `ERROR: unable to download video data: HTTP Error 403: Forbidden` で落ちる
+     （yt-dlp **2026.07.04** で観測）。同時に
+     `WARNING: [youtube] No supported JavaScript runtime could be found` が出るが、**原因は未確定**
+     （yt-dlp は自前の JS インタプリタを持つので「ランタイムが無い＝nsig を解けない」とは限らず、
+     「progressive は通るが DASH だけ 403」は GVS PO Token 要求でも同じ症状になる）。
+     クライアント別の実測: yt-dlp 既定の `tv` は `ERROR: [youtube] <id>: The page needs to be reloaded.`、
+     `ios` / `web_safari` / `mweb` は `Only images are available for download`。
+     **通ったのは `android` クライアントの muxed format 18 だけ**。
+     回避策は **先にローカルへ落として、そのファイルパスを渡す**（`video2frames.py:205` は `http(s)://`
+     以外をローカルファイルとして扱う）:
+     ```powershell
+     yt-dlp --extractor-args "youtube:player_client=android" -f 18/best -o "$env:TEMP\<素材名>.mp4" <URL>
+     python tools/video2frames.py "$env:TEMP\<素材名>.mp4" --name <素材名>
+     # 尺が目安を超えるなら --sample-rate 8000 を足す（下の 🔴 を読んでから決める）
+     Remove-Item "$env:TEMP\<素材名>.mp4"   # 生動画は変換後に消す（下記）
+     ```
+     format 18 は 360p H.264 + AAC だが、**出力は 320x240 / mono なので画質・音質とも十分**。
+     `-f 18` が無い動画もあるので `18/best` にしてある（`best` に落ちた場合は 403 が再発しうる）。
+     🔴 **生動画はリポジトリ配下に置かず、変換後に消す**。ツール本体は一時領域に落として自動で消す設計
+     （`tools/video2frames.py:265`「生動画はコミットも常駐もさせない」）だが、この回避策はそれを迂回して
+     手元にフル尺の生動画を残す。`.gitignore` が無視するのは `video/` だけなので、
+     **リポジトリ配下に置くとコミット候補に載る**。
    - 尺を絞りたい場合は先に `ffmpeg -y -i source.webm -t 30 -c:v libx264 -preset veryfast -c:a aac clip30.mp4`
      で切り出してから渡す（tools には `--duration` が無い）。**検証ループを速く回すには短尺が有利**。
    - 🔴 **長尺（目安 4 分超）は `--sample-rate 8000` を付ける**（#234 で踏んだ）。音声は再生開始時に
