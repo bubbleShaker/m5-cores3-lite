@@ -65,6 +65,9 @@ python tools/video2frames.py https://youtu.be/Xbt0EqXOAjw --name sample
 # 既定で ./video/sample/ に出力。--fps / --sample-rate / --quality で調整可
 ```
 
+⚠ URL 直渡しが `HTTP Error 403: Forbidden` になる場合は、先に yt-dlp で落としてローカルファイルを渡す。
+手順は PLAN.md「アセットの転送手順」の 1.（#247 / 恒久対応は #248）。
+
 出力レイアウト（この `<name>/` ごと microSD の `/video/` 下へ置く）:
 
 | ファイル | 内容 |
